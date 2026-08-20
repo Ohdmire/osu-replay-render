@@ -579,7 +579,8 @@ impl SceneState {
             // ArgonSliderBody: the whole path fades with the slider; the
             // BORDER colour is the plain accent while only the body accent
             // gets BodyAlpha (0.92 pro / 0.98 normal, applied to
-            // AccentColour.Darken(4) = the near-black interior).
+            // AccentColour.Darken(4) = the accent at 20% - a dark TINT,
+            // not black).
             let mut fade = alpha as f32;
             if body_judged && body_hit && head_hit && t > bt {
                 fade *= value_at(t, bt, bt + 40.0, 1.0, 0.0, Easing::Linear) as f32;
@@ -1871,8 +1872,9 @@ fn draw_follow_points(game: &GameData, m: &Mapper, list: &mut DrawList, t: f64) 
                     // ArgonFollowPoint: GradientVertical FC618F -> BB1A41 on
                     // the rotated drawable; the shadow chevron's explicit
                     // Gray(0.2) MULTIPLIES into the inherited gradient
-                    // (ColourInfo.ApplyChild), so it renders as a 20%-pink
-                    // echo, not flat gray. Additive blending.
+                    // (ColourInfo.ApplyChild), so it renders as a ~56%-pink
+                    // echo (Darken(0.8) = 1/1.8), not flat gray. Additive
+                    // blending.
                     let top = Colour::from_hex(0xFC618F).opacity(alpha as f32);
                     let bottom = Colour::from_hex(0xBB1A41).opacity(alpha as f32);
                     let shadow_top = top.darken(0.8);
