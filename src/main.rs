@@ -14,7 +14,7 @@
 //!   --score classic        Show classic (stable-style) score
 //!   --limit <n>            Render at most n frames (testing)
 
-use osu_replay_render::{build_atlas, decode_image_file, game, osu_background_file, osu_general_value, render::Renderer, scene, draw};
+use osu_replay_render::{build_atlas, decode_image_file, draw, draw::Image, game, osu_background_file, osu_general_value, render::Renderer, scene};
 
 use scene::{Assets, SceneState};
 use std::io::Write;
@@ -29,7 +29,7 @@ struct Options {
     end: Option<f64>,
     classic_score: bool,
     skin: String,
-    /// x264 (default) | x265 | nvenc (hardware, fastest).
+    /// auto (default: probe NVENC, fall back to x264) | x264 | x265 | nvenc.
     encoder: String,
     /// crf; 18 by default.
     quality: u32,
@@ -71,7 +71,7 @@ fn parse_args() -> Result<Options, String> {
         end: None,
         classic_score: false,
         skin: "argon-pro".to_string(),
-        encoder: "x264".to_string(),
+        encoder: "auto".to_string(),
         quality: 18,
         probe: None,
         limit: None,
@@ -132,8 +132,8 @@ fn parse_args() -> Result<Options, String> {
             "--encoder" => {
                 i += 1;
                 let enc = args.get(i).cloned().ok_or("--encoder needs a value")?;
-                if !matches!(enc.as_str(), "x264" | "x265" | "nvenc") {
-                    return Err("--encoder must be x264, x265 or nvenc".into());
+                if !matches!(enc.as_str(), "auto" | "x264" | "x265" | "nvenc") {
+                    return Err("--encoder must be auto, x264, x265 or nvenc".into());
                 }
                 opts.encoder = enc;
             }
@@ -400,7 +400,18 @@ fn main() {
         std::process::exit(1);
     }
 
-    let encoder = opts.encoder.as_str();
+    // auto: probe NVENC with a tiny test encode, fall back to x264.
+    let encoder = if opts.encoder == "auto" {
+        let probe = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-v", "error", "-f", "lavfi", "-i", "nullsrc=s=256x256:d=0.04",
+                   "-c:v", "h264_nvenc", "-f", "null", "-"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if probe.map(|st| st.success()).unwrap_or(false) { "nvenc" } else { "x264" }
+    } else {
+        opts.encoder.as_str()
+    };
     eprintln!("encoder: {}", encoder);
 
     // Output setup.

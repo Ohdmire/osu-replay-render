@@ -83,7 +83,12 @@ impl SurfaceRenderer {
         );
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let surface = unsafe {
-            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawWindowHandle(raw))
+            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle: raw_window_handle::RawDisplayHandle::Windows(
+                    raw_window_handle::WindowsDisplayHandle::new(),
+                ),
+                raw_window_handle: raw,
+            })
         }
         .map_err(|e| format!("create surface: {e:?}"))?;
 
@@ -255,7 +260,7 @@ impl SurfaceRenderer {
         if w == 0 || h == 0 {
             return false;
         }
-        let encoder = self.renderer.encode_scene(list, clear);
+        let mut encoder = self.renderer.encode_scene(list, clear);
         let Ok(frame) = self.surface.get_current_texture() else { return false };
         let view = frame.texture.create_view(&Default::default());
         {

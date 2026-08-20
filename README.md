@@ -19,7 +19,7 @@ osu_replay_render <beatmap.osu> <replay.osr> [options]
 | `--start <ms>` / `--end <ms>` | 渲染回放时间区间（毫秒） |
 | `--score classic` | HUD 显示经典分（默认 standardised） |
 | `--skin <argon\|argon-pro>` | 皮肤变体，默认 `argon-pro`（无 GREAT/PERFECT 判定文字、滑条身体透明度 0.92） |
-| `--encoder <x264\|x265\|nvenc>` | 视频编码器：libx264（默认）/ libx265（preset medium + crf）或 NVENC 硬件编码（bgr0 直喂 + p5/hq/vbr/cq，**端到端约比 x264 快 1.7×、比 x265 快 3.2×**） |
+| `--encoder <auto\|x264\|x265\|nvenc>` | 视频编码器：默认 `auto`（探测 NVENC 可用则用之，否则回退 x264）；NVENC 硬件编码（bgr0 直喂 + p5/hq/vbr/cq，**端到端约比 x264 快 1.7×、比 x265 快 3.2×**）；libx264 / libx265（preset medium + crf） |
 | `--quality <n>` | crf（软件）/ cq（nvenc），默认 18 |
 | `--no-guides` | 关闭 UR 条的窗口引导线（判定色色轴），默认开启渲染 |
 | `--audio [file]` | 输出混入 BGM（AAC 192k）：带路径用指定文件；不带值自动取谱面 `[General] AudioFilename`（相对谱面目录）。音频位置按 lazer 时钟链换算：音频位置 = 回放时间 − 总偏移 |
