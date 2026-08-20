@@ -380,22 +380,39 @@ fn parse_args() -> Result<Options, String> {
 }
 
 enum Output {
-    Ffmpeg(std::process::Child),
+    /// Frames are sent to a dedicated writer thread through a bounded
+    /// channel (backpressure); the thread owns the ffmpeg child, writes
+    /// each frame with ONE write (contiguous at typical widths, else a
+    /// single repack), and joins at `finish`.
+    Ffmpeg {
+        tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+        handle: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    },
     PngDir(String),
     None,
 }
 
 impl Output {
-    fn write_frame(&mut self, bgra: &[u8], width: u32, height: u32, stride: u32, index: usize) -> std::io::Result<()> {
+    /// Queues one frame to the writer thread. Cheap unless the writer is
+    /// more than `BOUND` frames behind (natural backpressure).
+    fn write_frame(&mut self, data: &[u8], width: u32, height: u32, stride: u32, index: usize) -> std::io::Result<()> {
         match self {
-            Output::Ffmpeg(child) => {
-                let stdin = child.stdin.as_mut().expect("ffmpeg stdin");
-                for row in 0..height {
-                    let start = (row * stride) as usize;
-                    let end = start + (width * 4) as usize;
-                    stdin.write_all(&bgra[start..end])?;
-                }
-                Ok(())
+            Output::Ffmpeg { tx, .. } => {
+                let tx = tx.as_ref().expect("writer channel");
+                let owned = if stride == width * 4 {
+                    data.to_vec()
+                } else {
+                    // Repack padded rows into one contiguous buffer so the
+                    // writer thread does a single write per frame.
+                    let mut tight = Vec::with_capacity((width * height * 4) as usize);
+                    for row in 0..height as usize {
+                        let start = row * stride as usize;
+                        tight.extend_from_slice(&data[start..start + width as usize * 4]);
+                    }
+                    tight
+                };
+                let _ = index;
+                tx.send(owned).map_err(|_| std::io::Error::other("ffmpeg writer exited"))
             }
             Output::PngDir(dir) => {
                 let path = format!("{}/frame_{:06}.png", dir, index);
@@ -411,10 +428,10 @@ impl Output {
                     for x in 0..width {
                         let s = src + (x * 4) as usize;
                         let d = ((row * width + x) * 4) as usize;
-                        rgba[d] = bgra[s + 2];
-                        rgba[d + 1] = bgra[s + 1];
-                        rgba[d + 2] = bgra[s];
-                        rgba[d + 3] = bgra[s + 3];
+                        rgba[d] = data[s + 2];
+                        rgba[d + 1] = data[s + 1];
+                        rgba[d + 2] = data[s];
+                        rgba[d + 3] = data[s + 3];
                     }
                 }
                 writer.write_image_data(&rgba)?;
@@ -424,13 +441,23 @@ impl Output {
         }
     }
 
-    fn finish(&mut self) {
-        if let Output::Ffmpeg(child) = self {
-            drop(child.stdin.take());
-            let _ = child.wait();
+    /// Drops the sender (EOF for the writer thread), then joins it: the
+    /// thread drains the queue, closes ffmpeg's stdin and waits for the
+    /// encode to finish.
+    fn finish(mut self) {
+        if let Output::Ffmpeg { tx, handle } = &mut self {
+            drop(tx.take());
+            match handle.take().unwrap().join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("ffmpeg writer error: {}", e),
+                Err(_) => eprintln!("ffmpeg writer panicked"),
+            }
         }
     }
 }
+
+/// Bound of the frame queue to the ffmpeg writer thread (frames).
+const WRITER_QUEUE: usize = 3;
 
 fn main() {
     let opts = match parse_args() {
@@ -616,14 +643,29 @@ fn main() {
         if audio_path.is_some() {
             cmd.args(["-map", "0:v", "-map", "1:a", "-c:a", "aac", "-b:a", "192k", "-shortest"]);
         }
-        let child = cmd
+        let mut child = cmd
             .arg(out)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::fs::File::create("ffmpeg_err.log").unwrap())
             .spawn()
             .expect("failed to spawn ffmpeg (is it on PATH? or use --png-dir)");
-        Output::Ffmpeg(child)
+        // Dedicated writer thread: owns ffmpeg's stdin, one write per
+        // frame, decoupled from the render loop by a bounded channel.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(WRITER_QUEUE);
+        let handle = std::thread::spawn(move || {
+            let mut stdin = child.stdin.take().expect("ffmpeg stdin");
+            for frame in rx {
+                stdin.write_all(&frame)?;
+            }
+            drop(stdin); // EOF -> ffmpeg finishes the encode
+            let status = child.wait()?;
+            if !status.success() {
+                return Err(std::io::Error::other(format!("ffmpeg exited with {:?}", status.code())));
+            }
+            Ok(())
+        });
+        Output::Ffmpeg { tx: Some(tx), handle: Some(handle) }
     } else {
         eprintln!("no output specified; use --out <file.mp4> or --png-dir <dir>");
         std::process::exit(2);
@@ -648,7 +690,12 @@ fn main() {
             }
         }
         let tb = std::time::Instant::now();
-        let bgra = renderer.render(&list, [0.055, 0.055, 0.075, 1.0]);
+        // Pipelined: submit this frame WITHOUT waiting for the GPU; the
+        // previous frame's readback (already done or nearly so by now) is
+        // mapped out and queued to the writer thread. The GPU always has a
+        // frame of work queued while the CPU builds the next one.
+        renderer.render_deferred(&list, [0.055, 0.055, 0.075, 1.0]);
+        let bgra = renderer.read_oldest();
         let tc = std::time::Instant::now();
         if let Err(e) = output.write_frame(&bgra, opts.width, opts.height, renderer.padded_row, n) {
             eprintln!("error writing frame {}: {}", n, e);
