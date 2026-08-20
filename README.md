@@ -1,8 +1,10 @@
 # osu-replay-render
 
-用 wgpu 离屏渲染 osu!standard 回放的命令行工具，皮肤实现 osu!lazer 的
-**Argon** 默认皮肤。判定与游戏状态来自
-[osu-replay-judge](../osu-replay-judge)（逐事件与 lazer 全等的判定模拟器）。
+用 wgpu 渲染 osu!standard 回放的 **lib + CLI** 二合一 crate,皮肤实现
+osu!lazer 的 **Argon** 默认皮肤。判定与游戏状态来自
+[osu-replay-judge](../osu-replay-judge)(逐事件与 lazer 全等的判定模拟器)。
+支持两种使用方式:CLI 离屏渲染出视频/PNG;作为库嵌入其他程序做**窗口
+surface 实时预览**(如 OPP 的回放实时预览页,`SurfaceRenderer`)。
 
 ## 用法
 
@@ -36,8 +38,45 @@ osu_replay_render map.osu replay.osr --png-dir frames --size 1280x720 --fps 30 -
 ```
 
 帧时间轴与游戏内一致：60fps 时逐帧对应 lazer 的 FrameStability 游戏帧；
-DT/HT 等 rate mod 的回放按真实游戏速度输出。渲染速度约 180fps（1080p,
-含 ffmpeg 编码约取决于 CPU）。
+DT/HT 等 rate mod 的回放按真实游戏速度输出。渲染速度约 240fps（1080p
+x264,瓶颈在 ffmpeg 编码；渲染管线本身约 0.6ms/帧,见下文「渲染流水线」）。
+
+## 作为库使用（实时预览）
+
+crate 同时提供 `[lib]`,渲染是**任意时刻 t 的纯函数**（`game::snapshot_at`
+二分查找 + 光标插值），因此 seek/暂停/逐帧/倍速都是 O(1) 操作,天然适合
+实时回放查看器:
+
+```rust
+use osu_replay_render::{build_atlas, draw, game, scene, surface};
+
+// 一次性加载:判定引擎跑完整回放,得到逐帧快照时间轴。
+let game = game::load("map.osu", "replay.osr")?;
+let (atlas, bold, semibold) = build_atlas(None); // 可选背景图
+
+// 窗口直渲:传 Win32 HWND,内部 1280x720 渲染后 letterbox 上屏。
+let mut renderer = surface::SurfaceRenderer::new(1280, 720, &atlas, hwnd)?;
+renderer.resize(w, h); // 窗口尺寸变化时重新配置 surface
+
+let mut state = scene::SceneState::new(&game, 1280, 720);
+let mut list = draw::DrawList::new();
+let t = 12345.0; // 任意时刻,毫秒
+let snap = game::snapshot_at(&game, t);
+let assets = scene::Assets { atlas: &atlas, bold: &bold, semibold: &semibold };
+list.clear();
+state.build_frame(&game, &assets, &snap, &mut list);
+list.finish();
+renderer.render(&list, [0.055, 0.055, 0.075, 1.0]); // 呈现一帧
+```
+
+- `SurfaceRenderer`（`src/surface.rs`）：复用离屏管线渲染到内部纹理,再用
+  letterbox blit 上屏 + `present(Fifo)` vsync;支持任意窗口尺寸,与宿主
+  WebView UI 共存（OPP 中配合 `WS_EX_TRANSPARENT` 原生子窗口实现点击穿透）。
+- 帧间无状态依赖:每帧独立由 t 决定,可乱序/跳跃求值,无需快进模拟。
+- `duration = snapshots.last().time`、起点 `snapshots.first().time`,
+  seek 时 clamp 到该区间即可。
+- 离屏读回路径（`Renderer::render` / `render_deferred` + `read_oldest`
+  三缓冲流水线）保持不变,CLI 与嵌入式逐帧导出均可用。
 
 ## 已实现（Argon）
 
@@ -88,7 +127,8 @@ DT/HT 等 rate mod 的回放按真实游戏速度输出。渲染速度约 180fps
 
 ## 资产
 
-`assets/`：
+`assets/`(全部经 `include_bytes!` 内嵌进二进制,**运行时不依赖 CWD**,
+可直接被其他程序作为库调用):
 - `fonts/TorusPro-*.ttf` — 文字渲染（ab_glyph 启动时按 24/48/96 三档
   em 栅格化进图集）。
 - `counter/argon-counter-*.png` — lazer 官方 HUD 计数器纹理数字
@@ -112,7 +152,8 @@ DT/HT 等 rate mod 的回放按真实游戏速度输出。渲染速度约 180fps
 ## 渲染架构
 
 - wgpu 离屏（无窗口），DX12/Vulkan，4x MSAA；BGRA8 读回后喂给
-  ffmpeg rawvideo 管道或写成 PNG。
+  ffmpeg rawvideo 管道或写成 PNG;或经 `SurfaceRenderer` letterbox
+  blit 到窗口 surface 直渲（present Fifo vsync）。
 - 编码：BGRA 管道喂 ffmpeg。`nvenc` 以 bgr0 直喂 NVENC（硬件色彩转换，
   无 CPU swscale）；`x264`/`x265` 走 CPU swscale 转 yuv420p。
 - 每帧 CPU 侧构建 `DrawList`：SDF 圆环/圆盘/辉光/胶囊/圆弧、纹理
@@ -123,19 +164,46 @@ DT/HT 等 rate mod 的回放按真实游戏速度输出。渲染速度约 180fps
   slider tracking、spinner 旋转/进度）+ 判定事件时间轴，渲染端据此
   求值任意时刻的视觉状态（`game::snapshot_at` 支持任意输出帧率）。
 
+## 渲染流水线（离屏 CLI 路径）
+
+渲染与编码三级重叠，CPU 与 GPU 互不空等（`main.rs` 主循环 +
+`render.rs` 的 `render_deferred`/`read_oldest_into`）：
+
+1. **GPU 回读环形缓冲**（3 个 readback buffer）：每帧 `render_deferred`
+   只提交不等待；积压达到深度 2 才 `read_oldest_into` 映射最老的一帧。
+   CPU 建下一帧场景时 GPU 手里始终有已排队的渲染工作。
+2. **独立写出线程 + 有界通道**（深度 3,天然背压）：帧数据经
+   `SyncSender` 发给拥有 ffmpeg stdin 的写出线程,每帧单次
+   `write_all`;编码慢时阻塞在 `send` 而不是拖慢渲染。
+3. **帧缓冲复用**：写出线程用完的 `Vec<u8>`（1080p 约 8MB）经回传
+   通道还回渲染线程,`read_oldest_into` 直接从 GPU 映射区拷入,
+   每帧零大分配、单次拷贝。
+
+实测（1080p60, x264 medium crf18, 1800 帧）：流水线化前 ~165fps,
+之后 ~245fps,基本贴住 ffmpeg 单独编码的上限（~255fps）;渲染管线
+本身（提交+回读）仅 ~0.6ms/帧。输出与流水线化前逐字节一致。
+PNG 模式不走流水线（`Renderer::render` 同步路径）。
+
 ## 依赖
 
 - Rust (`cargo build --release`)
-- ffmpeg 在 PATH（`--out` 模式需要）
+- ffmpeg 在 PATH（`--out` 模式需要;库/surface 路径不需要）
 - 判定引擎：`../osu-replay-judge`（path dependency，已加入逐帧快照、
   combo 信息输出与 `Engine::windows()` OD 窗口 getter 的修改）
+- 作为库嵌入时:宿主窗口需提供原生窗口句柄(当前为 Win32 HWND;
+  `raw-window-handle` 0.6)
 
 ## 开发
 
-- 源码结构：`main.rs`（CLI/编码管线）、`game.rs`（judge 输出 → 渲染
+- 源码结构：`lib.rs`（库入口:图集构建/资产解码,全部贴图内嵌）、
+  `main.rs`（CLI/编码管线）、`surface.rs`（窗口 surface 直渲 +
+  letterbox blit,实时预览用）、`game.rs`（judge 输出 → 渲染
   视图 + UR/HP 时间轴）、`scene.rs`（Argon 皮肤全部视觉逻辑）、
   `hud.rs`（计数器/血条/UR 条）、`draw.rs`（SDF 图元/缓动/字体/图集）、
-  `render.rs`（wgpu 离屏渲染器 + WGSL shader）。
+  `render.rs`（wgpu 离屏渲染器 + WGSL shader + readback 流水线）。
 - 所有动画时序均以 osu!lazer 源码（`osu.Game.Rulesets.Osu/Skinning/Argon/`
   等）与 osu-framework（`Interpolation.Damp` 系列为**毫秒指数**语义）
   为准；调参前先对照源文件注释。
+- 实际嵌入示例：[OPP](../OPP) 的 `src-tauri/src/live_render.rs`
+  （Tauri 原生子窗口 + 播放线程 + seek/play/pause 命令,前端配合
+  DOM 位置上报与可拖动进度条）。

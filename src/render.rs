@@ -721,11 +721,13 @@ impl Renderer {
 
     /// Renders one frame and returns the BGRA pixels (with row padding).
     /// Synchronous convenience (PNG mode); the ffmpeg path uses
-    /// `render_deferred` + `read_oldest` for pipelining.
+    /// `render_deferred` + `read_oldest_into` for pipelining.
     pub fn render(&mut self, list: &DrawList, clear: [f64; 4]) -> Vec<u8> {
         let encoder = self.encode_scene(list, clear);
         self.submit_frame_with(encoder);
-        self.read_oldest()
+        let mut out = Vec::new();
+        self.read_oldest_into(&mut out);
+        out
     }
 
     /// Builds the full scene command encoder (slider-body prepasses +
@@ -1074,10 +1076,11 @@ impl Renderer {
         self.readback_pending.push_back(slot);
     }
 
-    /// Maps and returns the OLDEST pending frame. With a frame or two of GPU
-    /// work already queued this returns almost immediately; the GPU never
-    /// starves while the CPU builds the next frame.
-    pub fn read_oldest(&mut self) -> Vec<u8> {
+    /// Maps the OLDEST pending frame and copies it into `out` (reused
+    /// between frames to avoid a per-frame allocation). With a frame or two
+    /// of GPU work already queued this returns almost immediately; the GPU
+    /// never starves while the CPU builds the next frame.
+    pub fn read_oldest_into(&mut self, out: &mut Vec<u8>) {
         let slot = self
             .readback_pending
             .pop_front()
@@ -1086,9 +1089,11 @@ impl Renderer {
         let slice = buffer.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         self.device.poll(wgpu::Maintain::Wait);
-        let data = slice.get_mapped_range().to_vec();
+        let data = slice.get_mapped_range();
+        out.clear();
+        out.extend_from_slice(&data);
+        drop(data);
         buffer.unmap();
-        data
     }
 }
 
