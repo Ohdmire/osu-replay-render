@@ -866,14 +866,19 @@ impl SceneState {
         let side_progress_target = if progress >= 1.0 { 0.0 } else { 0.15 * progress };
         anim.side_progress = damp_half(anim.side_progress, side_progress_target, 40.0, dt);
 
-        // SPM over a 595ms window.
-        anim.spm_history.push((t, frame.visual_rotation));
-        anim.spm_history.retain(|(ht, _)| t - ht <= 595.0);
-        if let Some(first) = anim.spm_history.first() {
-            let dtm = t - first.0;
-            if dtm > 250.0 {
-                let drot = frame.visual_rotation - first.1;
-                anim.spm = (drot as f64 / dtm) * 1000.0 * 60.0 / 360.0;
+        // SPM (`SpinnerSpmCalculator`): records accumulate every frame while
+        // t <= EndTime (score-side `Result.TotalRotation`, NOT the visual
+        // rotation), over a 595ms window; the value FREEZES at EndTime so
+        // it doesn't drop during the fade out.
+        if t <= obj.end_time {
+            anim.spm_history.push((t, frame.total_rotation));
+            anim.spm_history.retain(|(ht, _)| t - ht <= 595.0);
+            if let Some(first) = anim.spm_history.first() {
+                let dtm = t - first.0;
+                if dtm > 0.0 {
+                    let drot = frame.total_rotation - first.1;
+                    anim.spm = (drot as f64 / dtm) * 1000.0 * 60.0 / 360.0;
+                }
             }
         }
 
@@ -976,14 +981,17 @@ impl SceneState {
         }
 
         // Tick marks ring (rotates with the damped display rotation, inside
-        // the ambient-rotating container; +180 on hit).
+        // the ambient-rotating container; +180 on hit). Lazer places the
+        // marks at relative (0.5 + sin(t)/2*0.75, 0.5 + cos(t)/2*0.75) and
+        // a POSITIVE (clockwise) container rotation moves them to angle
+        // (t - rot) - so the ring spins the same direction as the cursor.
         let tick_ring_rot = (ambient + end_spin + anim.display_rotation) as f32;
         let tick_radius = unit * 0.375 * disc_scale as f32;
         for i in 0..25u32 {
             let ang = (i as f32 / 25.0) * std::f32::consts::TAU;
-            let rot = ang + tick_ring_rot.to_radians();
+            let rot = ang - tick_ring_rot.to_radians();
             let (sin_a, cos_a) = rot.sin_cos();
-            let pos = [centre[0] + sin_a * tick_radius, centre[1] - cos_a * tick_radius];
+            let pos = [centre[0] + sin_a * tick_radius, centre[1] + cos_a * tick_radius];
             let mark_rot = -(i as f32 / 25.0) * 360.0 - 120.0 + tick_ring_rot;
             let half_l = 15.0 * s;
             let (sr, cr) = mark_rot.to_radians().sin_cos();
@@ -992,17 +1000,21 @@ impl SceneState {
             list.capsule(p0, p1, 2.5 * s, Colour::WHITE.opacity(0.85 * a), Blend::Alpha);
         }
 
-        // Ring arcs (top / bottom).
-        let ring_r = (unit * 0.5 - 8.0 * s) * 1.0;
-        let ring_span = anim.ring_progress * 360.0;
+        // Ring arcs (top / bottom), scaling with the disc pop-in (they live
+        // inside the disc container in lazer).
+        let disc = disc_scale as f32;
+        let ring_r = (unit * 0.5 - 8.0 * s) * disc;
+        let ring_span = (anim.ring_progress * 360.0) as f32;
         let half = ring_span * 0.5;
-        list.arc(centre, ring_r, anim.ring_inner as f32 * unit * 0.5, -90.0 - half as f32, -90.0 + half as f32, Colour::WHITE.opacity(0.9 * a), Blend::Alpha);
-        list.arc(centre, ring_r, anim.ring_inner as f32 * unit * 0.5, 90.0 - half as f32, 90.0 + half as f32, Colour::WHITE.opacity(0.9 * a), Blend::Alpha);
+        let ring_t = anim.ring_inner as f32 * unit * 0.5 * disc;
+        list.arc(centre, ring_r, ring_t, -90.0 - half, -90.0 + half, Colour::WHITE.opacity(0.9 * a), Blend::Alpha);
+        list.arc(centre, ring_r, ring_t, 90.0 - half, 90.0 + half, Colour::WHITE.opacity(0.9 * a), Blend::Alpha);
 
-        // Side progress arcs. The static background switches off INSTANTLY
-        // when the spinner completes (background.Alpha = progress >= 1 ? 0 : 1).
-        let thickness = 0.12 * (unit * 0.5);
-        let r = unit * 0.5 - thickness * 0.5;
+        // Side progress arcs (also inside the disc). The static background
+        // switches off INSTANTLY when the spinner completes
+        // (background.Alpha = progress >= 1 ? 0 : 1).
+        let thickness = 0.12 * (unit * 0.5) * disc;
+        let r = unit * 0.5 * disc - thickness * 0.5;
         let bg_half = 0.15 * 360.0 * 0.5;
         if progress < 1.0 {
             list.arc(centre, r, thickness, 180.0 - bg_half, 180.0 + bg_half, Colour::WHITE.opacity(0.25 * a), Blend::Alpha);

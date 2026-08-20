@@ -539,7 +539,10 @@ impl DrawList {
     }
 
     /// Arc of a ring between two angles (degrees, screen space, 0 = +x, y down).
-    /// `thickness` measured inward from `radius`. Square caps.
+    /// `thickness` is a band CENTRED on `radius` (the fragment test is
+    /// `|d - radius| <= thickness / 2`), so the quad must extend to
+    /// `radius + thickness / 2` - not just the radius - or the outer half
+    /// of the band gets clipped away. Square caps.
     pub fn arc(
         &mut self,
         center: [f32; 2],
@@ -550,7 +553,7 @@ impl DrawList {
         colour: Colour,
         blend: Blend,
     ) {
-        let r_out = radius + 1.5;
+        let r_out = radius + thickness * 0.5 + 1.5;
         let mk = |p: [f32; 2]| Vertex {
             pos: [center[0] + p[0], center[1] + p[1]],
             local: p,
