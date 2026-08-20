@@ -236,6 +236,13 @@ struct Options {
     bg: bool,
     /// Background opacity 0..1 (lazer: 1 - DimLevel, default DimLevel 0.7).
     bg_opacity: f32,
+    /// Total lazer audio offset in ms subtracted from replay time to get
+    /// the audio file position. The gameplay clock ADDS the platform
+    /// offset (Windows non-experimental +15, `WINDOWS_BASE_AUDIO_OFFSET`),
+    /// `OsuSetting.AudioOffset` and the per-beatmap offset to the track
+    /// position (FramedBeatmapClock's OffsetCorrectionClock chain), so
+    /// audio_pos = replay_time - total_offset.
+    audio_offset: f64,
 }
 
 fn parse_args() -> Result<Options, String> {
@@ -262,6 +269,7 @@ fn parse_args() -> Result<Options, String> {
         audio: None,
         bg: false,
         bg_opacity: 0.3,
+        audio_offset: 15.0,
     };
     let mut i = 3;
     while i < args.len() {
@@ -356,6 +364,13 @@ fn parse_args() -> Result<Options, String> {
                 if !(0.0..=1.0).contains(&opts.bg_opacity) {
                     return Err("--bg-opacity must be within 0..1".into());
                 }
+            }
+            "--audio-offset" => {
+                i += 1;
+                opts.audio_offset = args
+                    .get(i)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("bad --audio-offset (expected milliseconds)")?;
             }
             other => return Err(format!("unknown argument: {}", other)),
         }
@@ -591,8 +606,11 @@ fn main() {
             )
         };
         // The video timeline starts at the first rendered frame's replay
-        // time; the BGM input is seeked to the same instant.
-        let audio_start = frame_times.first().map(|t| t / 1000.0).unwrap_or(0.0);
+        // time. Lazer's gameplay clock = audio file position + platform
+        // (+15ms Windows) + user AudioOffset + per-beatmap offset, so the
+        // audio position for replay time T is T - total offset
+        // (--audio-offset, default the +15ms Windows platform base).
+        let audio_start = (frame_times.first().map(|t| *t).unwrap_or(0.0) - opts.audio_offset) / 1000.0;
         let mut cmd = std::process::Command::new("ffmpeg");
         cmd.arg("-y")
             .arg("-f").arg("rawvideo")
