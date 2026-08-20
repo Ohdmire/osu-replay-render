@@ -242,7 +242,13 @@ impl HudState {
 
         // Score digits right edge at virtual (250, 55): centre y = 55 + h/2.
         let cd = CounterDraw { atlas: assets.atlas, digit_h: 36.0 * m.virt };
-        let right = m.virt([250.0, 0.0])[0];
+        // Lazer aligns the glyph BOX right edge at virtual x=250
+        // (`score.Position = (components_x_offset + 200, ...)` with Origin
+        // TopRight); the digit textures carry a ~32/240 right margin, so
+        // the visible ink edge reads ~6 units left of it. Nudge the whole
+        // assembly (wireframes included) right by that margin so the ink
+        // right edge lands on 250.
+        let right = m.virt([250.0, 0.0])[0] + 32.0 * cd.k();
         let cy = m.virt([0.0, 55.0 + 20.0])[1];
         let score_text = format!("{}", self.score.display.round() as i64);
         // Wireframe background: fixed digit count.
