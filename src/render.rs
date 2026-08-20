@@ -228,7 +228,13 @@ pub struct Renderer {
     msaa: wgpu::Texture,
     vbo: wgpu::Buffer,
     ibo: wgpu::Buffer,
-    readback: wgpu::Buffer,
+    /// Ring of readback buffers: frames are submitted and copied into the
+    /// next slot WITHOUT waiting; the oldest pending slot is mapped one or
+    /// more frames later, so the GPU keeps a queue of work (no per-frame
+    /// pipeline stall).
+    readback_ring: Vec<wgpu::Buffer>,
+    readback_next: usize,
+    readback_pending: std::collections::VecDeque<usize>,
     pub width: u32,
     pub height: u32,
     pub padded_row: u32,
@@ -636,12 +642,17 @@ impl Renderer {
 
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT; // 256
         let padded_row = ((width * 4 + align - 1) / align) * align;
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size: (padded_row * height) as u64,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+
+        let readback_ring: Vec<wgpu::Buffer> = (0..3)
+            .map(|i| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("readback {i}")),
+                    size: (padded_row * height) as u64,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
 
         Renderer {
             device,
@@ -660,7 +671,9 @@ impl Renderer {
             msaa,
             vbo,
             ibo,
-            readback,
+            readback_ring,
+            readback_next: 0,
+            readback_pending: std::collections::VecDeque::new(),
             width,
             height,
             padded_row,
@@ -668,7 +681,17 @@ impl Renderer {
     }
 
     /// Renders one frame and returns the BGRA pixels (with row padding).
+    /// Synchronous convenience (PNG mode); the ffmpeg path uses
+    /// `render_deferred` + `read_oldest` for pipelining.
     pub fn render(&mut self, list: &DrawList, clear: [f64; 4]) -> Vec<u8> {
+        let encoder = self.encode_scene(list, clear);
+        self.submit_frame_with(encoder);
+        self.read_oldest()
+    }
+
+    /// Builds the full scene command encoder (slider-body prepasses +
+    /// composites + scene runs + MSAA resolve).
+    fn encode_scene(&mut self, list: &DrawList, clear: [f64; 4]) -> wgpu::CommandEncoder {
         let vbytes = list.vertices.len() * std::mem::size_of::<Vertex>();
         let ibytes = list.indices.len() * 4;
         assert!(vbytes as u64 <= self.vbo.size(), "vertex buffer overflow: {}", vbytes);
@@ -977,14 +1000,29 @@ impl Renderer {
             }
         }
 
-        self.readback_after_submit(encoder)
+        encoder
     }
 
-    fn readback_after_submit(&mut self, mut encoder: wgpu::CommandEncoder) -> Vec<u8> {
+    /// Renders one frame and SUBMITS it without waiting for the GPU; the
+    /// copied-out frame data is retrieved later with `read_oldest` once
+    /// `pending_len` frames are in flight.
+    pub fn render_deferred(&mut self, list: &DrawList, clear: [f64; 4]) {
+        let encoder = self.encode_scene(list, clear);
+        self.submit_frame_with(encoder);
+    }
+
+    /// Number of submitted-but-not-yet-read frames.
+    pub fn pending_len(&self) -> usize {
+        self.readback_pending.len()
+    }
+
+    fn submit_frame_with(&mut self, mut encoder: wgpu::CommandEncoder) {
+        let slot = self.readback_next;
+        self.readback_next = (self.readback_next + 1) % self.readback_ring.len();
         encoder.copy_texture_to_buffer(
             self.target.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
-                buffer: &self.readback,
+                buffer: &self.readback_ring[slot],
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(self.padded_row),
@@ -994,11 +1032,23 @@ impl Renderer {
             wgpu::Extent3d { width: self.width, height: self.height, depth_or_array_layers: 1 },
         );
         self.queue.submit(Some(encoder.finish()));
-        let slice = self.readback.slice(..);
+        self.readback_pending.push_back(slot);
+    }
+
+    /// Maps and returns the OLDEST pending frame. With a frame or two of GPU
+    /// work already queued this returns almost immediately; the GPU never
+    /// starves while the CPU builds the next frame.
+    pub fn read_oldest(&mut self) -> Vec<u8> {
+        let slot = self
+            .readback_pending
+            .pop_front()
+            .expect("read_oldest with empty pipeline");
+        let buffer = &self.readback_ring[slot];
+        let slice = buffer.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         self.device.poll(wgpu::Maintain::Wait);
         let data = slice.get_mapped_range().to_vec();
-        self.readback.unmap();
+        buffer.unmap();
         data
     }
 }
