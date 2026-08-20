@@ -3,17 +3,20 @@
 用 wgpu 渲染 osu!standard 回放的 **lib + CLI** 二合一 crate,皮肤实现
 osu!lazer 的 **Argon** 默认皮肤。判定与游戏状态来自
 [osu-replay-judge](../osu-replay-judge)(逐事件与 lazer 全等的判定模拟器)。
-支持两种使用方式:CLI 离屏渲染出视频/PNG;作为库嵌入其他程序做**窗口
-surface 实时预览**(如 OPP 的回放实时预览页,`SurfaceRenderer`)。
+支持两种使用方式:CLI 离屏渲染出视频/PNG;作为库嵌入其他程序做
+**实时预览**——离屏读回(`Renderer::render_deferred` + `read_oldest_into`)
+跨平台,由宿主把 RGBA 帧送到自己的展示层(如 OPP 的 canvas);Windows
+下另有可选的 `SurfaceRenderer` 窗口直渲。
 
 ## 用法
 
 ```
-osu_replay_render <beatmap.osu> <replay.osr> [options]
+osu_replay_render <beatmap.osu> [replay.osr] [options]
 ```
 
 | 选项 | 说明 |
 | --- | --- |
+| `--autoplay` | **Autoplay mod**：不输入 .osr,由谱面直接生成回放（本地移植 lazer `OsuAutoGenerator`），作为谱面预览。判定引擎照常判定生成帧（SS/满血/UR 0） |
 | `--out <file.mp4>` | 管道输出到 ffmpeg 编码为 mp4 (h264, crf 18) |
 | `--png-dir <dir>` | 输出 PNG 帧序列到目录 |
 | `--size <WxH>` | 输出分辨率，默认 1920x1080 |
@@ -35,6 +38,7 @@ osu_replay_render <beatmap.osu> <replay.osr> [options]
 ```
 osu_replay_render map.osu replay.osr --out out.mp4
 osu_replay_render map.osu replay.osr --png-dir frames --size 1280x720 --fps 30 --start 10000 --end 20000
+osu_replay_render map.osu --autoplay --audio --out preview.mp4   # 谱面预览（无需回放文件）
 ```
 
 帧时间轴与游戏内一致：60fps 时逐帧对应 lazer 的 FrameStability 游戏帧；
@@ -54,9 +58,12 @@ use osu_replay_render::{build_atlas, draw, game, scene, surface};
 let game = game::load("map.osu", "replay.osr")?;
 let (atlas, bold, semibold) = build_atlas(None); // 可选背景图
 
-// 窗口直渲:传 Win32 HWND,内部 1280x720 渲染后 letterbox 上屏。
-let mut renderer = surface::SurfaceRenderer::new(1280, 720, &atlas, hwnd)?;
-renderer.resize(w, h); // 窗口尺寸变化时重新配置 surface
+// 方式一(跨平台,推荐):离屏渲染 + 读回 RGBA,宿主送到自己的展示层。
+let mut renderer = render::Renderer::new(1280, 720, &atlas);
+
+// 方式二(仅 Windows):窗口直渲,传 Win32 HWND,letterbox 上屏。
+// let mut renderer = surface::SurfaceRenderer::new(1280, 720, &atlas, hwnd)?;
+// renderer.resize(w, h);
 
 let mut state = scene::SceneState::new(&game, 1280, 720);
 let mut list = draw::DrawList::new();
@@ -66,7 +73,12 @@ let assets = scene::Assets { atlas: &atlas, bold: &bold, semibold: &semibold };
 list.clear();
 state.build_frame(&game, &assets, &snap, &mut list);
 list.finish();
-renderer.render(&list, [0.055, 0.055, 0.075, 1.0]); // 呈现一帧
+renderer.render_deferred(&list, [0.055, 0.055, 0.075, 1.0]); // 提交本帧
+if renderer.pending_len() > 0 {
+    let mut bgra = Vec::new();
+    renderer.read_oldest_into(&mut bgra); // 取上一帧读回(流水线,GPU 不空转)
+    // BGRA(padded_row 对齐)→ RGBA(tight)后交给宿主,如 OPP 的 canvas。
+}
 ```
 
 - `SurfaceRenderer`（`src/surface.rs`）：复用离屏管线渲染到内部纹理,再用
@@ -184,6 +196,35 @@ renderer.render(&list, [0.055, 0.055, 0.075, 1.0]); // 呈现一帧
 本身（提交+回读）仅 ~0.6ms/帧。输出与流水线化前逐字节一致。
 PNG 模式不走流水线（`Renderer::render` 同步路径）。
 
+## Autoplay 谱面预览（`--autoplay`）
+
+`src/autoplay.rs` 是 lazer `OsuAutoGenerator` 的逐行移植
+（`osu.Game.Rulesets.Osu/Replays/OsuAutoGenerator.cs`、
+`OsuAutoGeneratorBase.cs`、`HasPathWithRepeatsExtensions.cs`）,
+按谱面直接生成 `ReplayFrame` 序列喂给判定引擎——判定、HP、combo、
+UR、光标轨迹、按键显示全部走既有回放路径,无需 .osr 文件。
+
+保真细节:
+
+- 移动 `Easing.Out`（框架语义 = OutQuad `t(2−t)`）,帧间隔
+  `1000/60ms`;反应等待 `preempt − 100ms`（`getReactionTime`）。
+- 双键交替:间隔 < 266ms（约快于 225BPM 单双）时递增
+  `buttonIndex` 交替左右键;与前一帧按键冲突时强制换手并重写
+  后续帧（`addHitObjectClickFrames` 的索引操作全部照抄）。
+- 滑条跟随走 span 折返进度（`ProgressAt`/`SpanAt`:奇数 span 反向）,
+  非简单 `position_at(j/duration)`。
+- 转盘:切线入场（含原版"Y 旋转读已更新 X"的语句顺序怪癖）,
+  0.05 rad/ms（≈477 RPM）,入场方向决定旋转方向,外部进入时
+  改 `Easing.In` 立即起转。
+- 松键帧 = 物件结束 + `KEY_UP_DELAY` 50ms（转盘再 +1ms）;
+  0 spins 转盘整物件跳过;时间戳插值保序（`FindInsertionIndex`
+  跳过相等时间的语义用 `partition_point` 等价实现）。
+- 键位帧在游戏内表示为 `OsuAction.LeftButton/RightButton`,这里
+  映射到 `ReplayFrame` 的 `left`/`right` 位。
+
+验证:ReI [Rain]（1111 物件）autoplay 全图 = 满连 1432x、
+100.00%、满血,HUD/判定特效与真回放渲染无差异。
+
 ## 依赖
 
 - Rust (`cargo build --release`)
@@ -198,9 +239,11 @@ PNG 模式不走流水线（`Renderer::render` 同步路径）。
 - 源码结构：`lib.rs`（库入口:图集构建/资产解码,全部贴图内嵌）、
   `main.rs`（CLI/编码管线）、`surface.rs`（窗口 surface 直渲 +
   letterbox blit,实时预览用）、`game.rs`（judge 输出 → 渲染
-  视图 + UR/HP 时间轴）、`scene.rs`（Argon 皮肤全部视觉逻辑）、
-  `hud.rs`（计数器/血条/UR 条）、`draw.rs`（SDF 图元/缓动/字体/图集）、
-  `render.rs`（wgpu 离屏渲染器 + WGSL shader + readback 流水线）。
+  视图 + UR/HP 时间轴）、`autoplay.rs`（lazer `OsuAutoGenerator`
+  的逐行移植,`--autoplay` 谱面预览）、`scene.rs`（Argon 皮肤全部
+  视觉逻辑）、`hud.rs`（计数器/血条/UR 条）、`draw.rs`（SDF
+  图元/缓动/字体/图集）、`render.rs`（wgpu 离屏渲染器 + WGSL
+  shader + readback 流水线）。
 - 所有动画时序均以 osu!lazer 源码（`osu.Game.Rulesets.Osu/Skinning/Argon/`
   等）与 osu-framework（`Interpolation.Damp` 系列为**毫秒指数**语义）
   为准；调参前先对照源文件注释。

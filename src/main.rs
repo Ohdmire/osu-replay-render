@@ -1,9 +1,12 @@
 //! osu_replay_render: offscreen osu! replay renderer (wgpu + Argon skin).
 //!
 //! Usage:
-//!   osu_replay_render <beatmap.osu> <replay.osr> [options]
+//!   osu_replay_render <beatmap.osu> [replay.osr] [options]
 //!
 //! Options:
+//!   --autoplay             Generate the replay from the beatmap (lazer
+//!                          OsuAutoGenerator port) - beatmap preview, no
+//!                          .osr needed
 //!   --out <file.mp4>       Pipe frames to ffmpeg and encode (default if given)
 //!   --png-dir <dir>        Write PNG frames to a directory instead
 //!   --size <WxH>           Output size (default 1920x1080)
@@ -54,13 +57,23 @@ struct Options {
     /// position (FramedBeatmapClock's OffsetCorrectionClock chain), so
     /// audio_pos = replay_time - total_offset.
     audio_offset: f64,
+    /// Autoplay mod: generate the replay from the beatmap itself (lazer
+    /// `OsuAutoGenerator` port) instead of reading an .osr — beatmap
+    /// preview without a replay file.
+    autoplay: bool,
 }
 
-fn parse_args() -> Result<Options, String> {
+fn parse_args() -> Result<(Options, String, Option<String>), String> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        return Err(format!("usage: {} <beatmap.osu> <replay.osr> [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro] [--no-guides] [--audio [file.mp3]] [--bg] [--bg-opacity 0..1] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
+    // `--autoplay` (Autoplay mod, beatmap preview) makes the replay file
+    // optional; positionals stay "map first, replay second, then flags".
+    let autoplay = args.iter().any(|a| a == "--autoplay");
+    let min_args = if autoplay { 2 } else { 3 };
+    if args.len() < min_args {
+        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro] [--no-guides] [--audio [file.mp3]] [--bg] [--bg-opacity 0..1] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
     }
+    let map_path = args[1].clone();
+    let replay_path = if autoplay { None } else { Some(args[2].clone()) };
     let mut opts = Options {
         out: None,
         png_dir: None,
@@ -81,8 +94,9 @@ fn parse_args() -> Result<Options, String> {
         bg: false,
         bg_opacity: 0.3,
         audio_offset: 15.0,
+        autoplay,
     };
-    let mut i = 3;
+    let mut i = min_args;
     while i < args.len() {
         match args[i].as_str() {
             "--out" => {
@@ -183,11 +197,14 @@ fn parse_args() -> Result<Options, String> {
                     .and_then(|v| v.parse().ok())
                     .ok_or("bad --audio-offset (expected milliseconds)")?;
             }
+            "--autoplay" => {
+                opts.autoplay = true;
+            }
             other => return Err(format!("unknown argument: {}", other)),
         }
         i += 1;
     }
-    Ok(opts)
+    Ok((opts, map_path, replay_path))
 }
 
 enum Output {
@@ -293,7 +310,7 @@ impl Output {
 const WRITER_QUEUE: usize = 3;
 
 fn main() {
-    let opts = match parse_args() {
+    let (opts, map_path, replay_path) = match parse_args() {
         Ok(o) => o,
         Err(e) => {
             eprintln!("error: {}", e);
@@ -301,11 +318,17 @@ fn main() {
         }
     };
 
-    let map_path = std::env::args().nth(1).unwrap();
-    let replay_path = std::env::args().nth(2).unwrap();
-
-    eprintln!("loading {} + {}", map_path, replay_path);
-    let game = match game::load(&map_path, &replay_path) {
+    let game = match &replay_path {
+        Some(rp) => {
+            eprintln!("loading {} + {}", map_path, rp);
+            game::load(&map_path, rp)
+        }
+        None => {
+            eprintln!("loading {} (autoplay preview)", map_path);
+            game::load_autoplay(&map_path)
+        }
+    };
+    let game = match game {
         Ok(g) => g,
         Err(e) => {
             eprintln!("error: {}", e);
