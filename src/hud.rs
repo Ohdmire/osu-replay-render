@@ -35,12 +35,27 @@ impl Rolling {
 }
 
 /// A number rendered with the argon-counter texture digits.
+///
+/// Lazer's `ArgonCounterSpriteText` advances each glyph by its FULL
+/// TEXTURE width minus 2 (`Spacing = (-2, 0)`) - the textures carry their
+/// own side padding (digits: a 240-unit box with ~31-unit margins around a
+/// 178-unit ink), which is what produces the airy digit spacing. Digits
+/// are monospaced to '5' (`FixedWidthReferenceCharacter`) and centred in
+/// that slot; the dot's ink sits near the box bottom, so baseline
+/// alignment falls out of the box layout. This port lays out the same
+/// way: slots are texture-relative, NOT ink-relative.
 struct CounterDraw<'a> {
     atlas: &'a crate::draw::Atlas,
-    /// Digit ink height in px (integer digits).
+    /// Digit INK height in px (the visual digit height).
     digit_h: f32,
-    spacing: f32,
 }
+
+/// Argon counter digit metrics, in texture pixels (all textures are
+/// TEX_BOX tall; digits and wireframes share the 240-wide slot box).
+const TEX_BOX: f32 = 240.0;
+const DIGIT_INK: f32 = 178.0;
+/// `ArgonCounterSpriteText.Spacing = (-2, 0)`.
+const COUNTER_SPACING: f32 = -2.0;
 
 impl<'a> CounterDraw<'a> {
     fn region_for(c: char) -> Region {
@@ -52,60 +67,59 @@ impl<'a> CounterDraw<'a> {
         }
     }
 
-    /// Places one glyph so its ink box (from the alpha coverage bbox) is
-    /// centred at `(cx, cy)` with ink height `h * scale`; returns the ink
-    /// width.
-    fn place(
+    /// Scale from texture px to screen px.
+    fn k(&self) -> f32 {
+        self.digit_h / DIGIT_INK
+    }
+
+    fn tex_w(&self, c: char) -> f32 {
+        let r = self.atlas.region_rect(Self::region_for(c));
+        r.x1 - r.x0
+    }
+
+    /// Layout slot for a char at `scale`: texture width - 2, digits
+    /// monospaced to the '5' texture.
+    fn slot_w(&self, c: char, scale: f32) -> f32 {
+        let base = if c.is_ascii_digit() { self.tex_w('5') } else { self.tex_w(c) };
+        (base + COUNTER_SPACING) * self.k() * scale
+    }
+
+    fn run_width(&self, text: &str, scale: f32) -> f32 {
+        text.chars().map(|c| self.slot_w(c, scale)).sum()
+    }
+
+    /// Draws one glyph's full texture with its TOP-LEFT at (pen_x, top_y)
+    /// (`scale` shrinks the glyph, e.g. accuracy decimals). Digits are
+    /// centred in their monospaced slot. Returns the slot width.
+    fn place_top(
         &self,
         list: &mut DrawList,
-        c: char,
-        cx: f32,
-        cy: f32,
-        h: f32,
+        region: Region,
+        pen_x: f32,
+        top_y: f32,
         scale: f32,
         colour: Colour,
         blend: Blend,
+        centre_in_slot: bool,
     ) -> f32 {
-        let region = Self::region_for(c);
         let rect = self.atlas.region_rect(region);
-        let ink = self.atlas.ink(region);
-        let tex_w = rect.x1 - rect.x0;
-        let tex_h = rect.y1 - rect.y0;
-        let ink_w = (ink[2] - ink[0]).max(1.0);
-        let ink_h = (ink[3] - ink[1]).max(1.0);
-        let target_h = h * scale;
-        let s = target_h / ink_h;
-        let img_w = tex_w * s;
-        let img_h = tex_h * s;
-        // Image position so that the ink centre lands on (cx, cy).
-        let ink_cx = (ink[0] + ink[2]) * 0.5 * s;
-        let ink_cy = (ink[1] + ink[3]) * 0.5 * s;
-        let centre = [cx - ink_cx + img_w * 0.5, cy - ink_cy + img_h * 0.5];
-        crate::draw::DrawList::image(list, self.atlas, region, centre, [img_w, img_h], 0.0, colour, blend);
-        ink_w * s
+        let k = self.k() * scale;
+        let tw = (rect.x1 - rect.x0) * k;
+        let th = (rect.y1 - rect.y0) * k;
+        let slot = if centre_in_slot {
+            (self.tex_w('5') + COUNTER_SPACING) * self.k() * scale
+        } else {
+            tw - COUNTER_SPACING * self.k() * scale
+        };
+        let x = if centre_in_slot { pen_x + (slot - tw) * 0.5 } else { pen_x };
+        let centre = [x + tw * 0.5, top_y + th * 0.5];
+        crate::draw::DrawList::image(list, self.atlas, region, centre, [tw, th], 0.0, colour, blend);
+        slot
     }
 
-    /// Ink width of a char at `scale` (uses the digit_h ink calibration).
-    /// Digits are monospaced to the width of '5' (lazer's
-    /// `FixedWidthReferenceCharacter`), so rolling numbers never jitter.
-    fn ink_w(&self, c: char, scale: f32) -> f32 {
-        if c.is_ascii_digit() {
-            return self.raw_ink_w('5', scale);
-        }
-        self.raw_ink_w(c, scale)
-    }
-
-    fn raw_ink_w(&self, c: char, scale: f32) -> f32 {
-        let region = Self::region_for(c);
-        let ink = self.atlas.ink(region);
-        let w = (ink[2] - ink[0]).max(1.0);
-        let h = (ink[3] - ink[1]).max(1.0);
-        w * (self.digit_h * scale / h)
-    }
-
-    /// Draw right-aligned with the ink TOP edge at `top_y` (FillFlow
-    /// top-aligned components, like ArgonAccuracyCounter). Returns total
-    /// ink width.
+    /// Draw right-aligned with the run's slot box ending at `right_x`,
+    /// texture TOP edges at `top_y` (FillFlow top-aligned components,
+    /// like ArgonAccuracyCounter). Returns the total width.
     fn draw_top(
         &self,
         list: &mut DrawList,
@@ -116,47 +130,19 @@ impl<'a> CounterDraw<'a> {
         colour: Colour,
         blend: Blend,
     ) -> f32 {
-        // Slot widths use ink_w (digits monospaced to '5'), so the run never
-        // jitters and lines up with the wireframes.
-        let mut widths = Vec::with_capacity(text.len());
-        let mut total = 0.0f32;
+        let total = self.run_width(text, scale);
+        let mut pen = right_x - total;
         for c in text.chars() {
-            let w = self.ink_w(c, scale);
-            widths.push(w);
-            total += w + self.spacing * scale;
-        }
-        if !text.is_empty() {
-            total -= self.spacing * scale;
-        }
-
-        let mut cx = right_x - total;
-        for (i, c) in text.chars().enumerate() {
-            // Centre the glyph's ink box on the slot centre, ink top at top_y.
             let region = Self::region_for(c);
-            let rect = self.atlas.region_rect(region);
-            let ink = self.atlas.ink(region);
-            let tex_w = rect.x1 - rect.x0;
-            let tex_h = rect.y1 - rect.y0;
-            let ink_h = (ink[3] - ink[1]).max(1.0);
-            let target_h = self.digit_h * scale;
-            let k = target_h / ink_h;
-            let img_w = tex_w * k;
-            let img_h = tex_h * k;
-            let slot_cx = cx + widths[i] * 0.5;
-            let raw_w = (ink[2] - ink[0]).max(1.0) * k;
-            let centre = [
-                slot_cx - raw_w * 0.5 - ink[0] * k + img_w * 0.5,
-                top_y - ink[1] * k + img_h * 0.5,
-            ];
-            crate::draw::DrawList::image(list, self.atlas, region, centre, [img_w, img_h], 0.0, colour, blend);
-            cx += widths[i] + self.spacing * scale;
+            let is_digit = c.is_ascii_digit();
+            pen += self.place_top(list, region, pen, top_y, scale, colour, blend, is_digit);
         }
         total
     }
 
-    /// Draw right-aligned so the ink right edge is at `right_x`, ink
-    /// vertically centred at `cy`. `scale` shrinks a glyph (accuracy
-    /// decimals). Returns the ink width.
+    /// Draw right-aligned so the run's slot box ends at `right_x`, texture
+    /// box vertically centred at `cy` (score / combo counters). Returns
+    /// the total width.
     fn draw_right(
         &self,
         list: &mut DrawList,
@@ -167,25 +153,8 @@ impl<'a> CounterDraw<'a> {
         colour: Colour,
         blend: Blend,
     ) -> f32 {
-        // Total advance = sum of ink widths + spacing. Digits are monospaced
-        // to '5' (lazer's FixedWidthReferenceCharacter), so the run keeps a
-        // fixed width as digits roll and lines up with the wireframes.
-        let mut widths = Vec::with_capacity(text.len());
-        let mut total = 0.0f32;
-        for c in text.chars() {
-            let w = self.ink_w(c, scale);
-            widths.push(w);
-            total += w + self.spacing * scale;
-        }
-        total -= self.spacing * scale;
-
-        let mut cx = right_x - total;
-        for (i, c) in text.chars().enumerate() {
-            let w = self.place(list, c, cx + widths[i] * 0.5, cy, self.digit_h, scale, colour, blend);
-            let _ = w;
-            cx += widths[i] + self.spacing * scale;
-        }
-        total
+        let top_y = cy - self.k() * scale * TEX_BOX * 0.5;
+        self.draw_top(list, text, right_x, top_y, scale, colour, blend)
     }
 }
 
@@ -272,7 +241,7 @@ impl HudState {
         draw_wedge(list, m, [-50.0 + 4.0, 15.0 + 5.0]);
 
         // Score digits right edge at virtual (250, 55): centre y = 55 + h/2.
-        let cd = CounterDraw { atlas: assets.atlas, digit_h: 36.0 * m.virt, spacing: -2.0 * m.virt };
+        let cd = CounterDraw { atlas: assets.atlas, digit_h: 36.0 * m.virt };
         let right = m.virt([250.0, 0.0])[0];
         let cy = m.virt([0.0, 55.0 + 20.0])[1];
         let score_text = format!("{}", self.score.display.round() as i64);
@@ -287,7 +256,7 @@ impl HudState {
         // all TOP-aligned; anchored TopRight at virtual (1024-20, 20).
         self.acc.set(accuracy * 100.0, t);
         self.acc.update(t);
-        let acc_cd = CounterDraw { atlas: assets.atlas, digit_h: 36.0 * m.virt, spacing: -2.0 * m.virt };
+        let acc_cd = CounterDraw { atlas: assets.atlas, digit_h: 36.0 * m.virt };
         let acc_right = m.virt([1024.0 - 20.0, 0.0])[0];
         let acc_top = m.virt([0.0, 20.0])[1];
         // Component-local margins (fraction margin-top 4) scale with the
@@ -300,9 +269,10 @@ impl HudState {
         let whole_s = format!("{}", whole as i64);
         let frac_s = format!(".{:02}", frac as i64);
 
-        // Widths, then place left-to-right ending at acc_right.
-        let w_pct: f32 = "%".chars().map(|c| acc_cd.ink_w(c, 1.0) - acc_cd.spacing).sum::<f32>() + acc_cd.spacing;
-        let w_frac: f32 = frac_s.chars().map(|c| acc_cd.ink_w(c, 0.5) + acc_cd.spacing * 0.5).sum::<f32>() - acc_cd.spacing * 0.5;
+        // Widths (texture-slot based), then place left-to-right ending at
+        // acc_right.
+        let w_pct = acc_cd.run_width("%", 1.0);
+        let w_frac = acc_cd.run_width(&frac_s, 0.5);
 
         let pct_right = acc_right;
         let frac_right = pct_right - w_pct;
@@ -335,7 +305,7 @@ impl HudState {
         self.combo_display = lerp_to(self.combo_display, combo as f64, 0.3);
 
         if combo > 0 {
-            let combo_cd = CounterDraw { atlas: assets.atlas, digit_h: 25.0 * 1.3 * m.virt, spacing: -2.0 * 1.3 * m.virt };
+            let combo_cd = CounterDraw { atlas: assets.atlas, digit_h: 25.0 * 1.3 * m.virt };
             let base = m.virt([36.0, 768.0 - 66.0]);
             let cy = base[1] - 26.0 * 1.3 * m.virt;
             let text = format!("{}x", self.combo_display.round() as i64);
@@ -346,13 +316,9 @@ impl HudState {
             } else {
                 Colour::WHITE
             };
-            // Left-anchored: measure with the same monospaced slot widths
-            // that draw_right places glyphs with.
-            let mut width = 0.0f32;
-            for c in text.chars() {
-                width += combo_cd.ink_w(c, combo_scale as f32) + combo_cd.spacing;
-            }
-            width -= combo_cd.spacing;
+            // Left-anchored: measure with the same slot widths draw_right
+            // places glyphs with.
+            let width = combo_cd.run_width(&text, combo_scale as f32);
             combo_cd.draw_right(list, &text, base[0] + width, cy, combo_scale as f32, col, Blend::Alpha);
         }
 
@@ -558,7 +524,9 @@ fn lerp_to(current: f64, target: f64, factor: f64) -> f64 {
     current + (target - current) * factor
 }
 
-/// The wireframe segments behind score digits (ink-aligned).
+/// The wireframe segments behind the score digits, laid out with the same
+/// texture-slot widths as the digits themselves (the wireframe texture
+/// shares the digits' 240-unit box, so slots line up exactly).
 fn draw_wireframe_run(
     list: &mut DrawList,
     atlas: &crate::draw::Atlas,
@@ -567,39 +535,21 @@ fn draw_wireframe_run(
     digits: usize,
     virt: f32,
 ) {
-    // Slot width = digit '5' ink width (the framework monospaces both the
-    // wireframe and digits to the same reference), so the digits land
-    // exactly inside the wireframe boxes.
-    let digit5 = atlas.ink(Region::CounterDigit(b'5'));
-    let d_ink_w = (digit5[2] - digit5[0]).max(1.0);
-    let d_ink_h = (digit5[3] - digit5[1]).max(1.0);
-    let h = 36.0 * virt;
-    let w = d_ink_w * (h / d_ink_h);
-    let region = Region::CounterWireframes;
-    let rect = atlas.region_rect(region);
-    let ink = atlas.ink(region);
-    let ink_h = (ink[3] - ink[1]).max(1.0);
-    let s = h / ink_h;
-    let spacing = -2.0 * virt;
-    let img_w = (rect.x1 - rect.x0) * s;
-    let img_h = (rect.y1 - rect.y0) * s;
-    let ink_cx = (ink[0] + ink[2]) * 0.5 * s;
-    let ink_cy = (ink[1] + ink[3]) * 0.5 * s;
-    let mut x = right;
+    let cd = CounterDraw { atlas, digit_h: 36.0 * virt };
+    let top_y = cy - cd.k() * TEX_BOX * 0.5;
+    let slot = cd.slot_w('5', 1.0);
+    let mut pen = right - slot * digits as f32;
     for _ in 0..digits {
-        let cx = x - w * 0.5;
-        let centre = [cx - ink_cx + img_w * 0.5, cy - ink_cy + img_h * 0.5];
-        crate::draw::DrawList::image(
+        pen += cd.place_top(
             list,
-            atlas,
-            region,
-            centre,
-            [img_w, img_h],
-            0.0,
+            Region::CounterWireframes,
+            pen,
+            top_y,
+            1.0,
             Colour::WHITE.opacity(0.25),
             Blend::Alpha,
+            true,
         );
-        x -= w + spacing;
     }
 }
 
