@@ -19,8 +19,8 @@ osu_replay_render <beatmap.osu> <replay.osr> [options]
 | `--start <ms>` / `--end <ms>` | 渲染回放时间区间（毫秒） |
 | `--score classic` | HUD 显示经典分（默认 standardised） |
 | `--skin <argon\|argon-pro>` | 皮肤变体，默认 `argon-pro`（无 GREAT/PERFECT 判定文字、滑条身体透明度 0.92） |
-| `--encoder <auto\|nvenc\|x264>` | 视频编码器，默认 `auto`（探测到 NVENC 则用硬件编码，否则回退 libx264） |
-| `--quality <n>` | 编码质量：nvenc 的 cq / x264 的 crf，默认 18（nvenc 数值口径不同，20-22 更接近 x264 crf18 的体积） |
+| `--encoder <x264\|x265>` | 视频编码器：libx264（默认）或 libx265，均 preset medium |
+| `--quality <n>` | crf，默认 18 |
 | `--no-guides` | 关闭 UR 条的窗口引导线（判定色色轴），默认开启渲染 |
 | `--audio [file]` | 输出混入 BGM（AAC 192k）：带路径用指定文件；不带值自动取谱面 `[General] AudioFilename`（相对谱面目录）。音频位置按 lazer 时钟链换算：音频位置 = 回放时间 − 总偏移 |
 | `--audio-offset <ms>` | BGM 对齐偏移，默认 **+15**（lazer Windows 平台偏移 `WINDOWS_BASE_AUDIO_OFFSET`；若你在游戏里开了实验性 WASAPI 或设了 AudioOffset/谱面偏移，把三项之和填进来） |
@@ -113,9 +113,8 @@ DT/HT 等 rate mod 的回放按真实游戏速度输出。渲染速度约 180fps
 
 - wgpu 离屏（无窗口），DX12/Vulkan，4x MSAA；BGRA8 读回后喂给
   ffmpeg rawvideo 管道或写成 PNG。
-- 编码双路径：`nvenc` 以 bgr0 直喂 NVENC（CUDA 上传 + 硬件色彩转换，
-  无 CPU swscale；本机构建的 scale_cuda 缺 RGB 内核故不走滤镜链）；
-  `x264` 为原 CPU 路径（libx264 + yuv420p）。
+- 编码：BGRA 管道喂 ffmpeg，libx264（默认）或 libx265，preset medium、
+  crf、yuv420p。
 - 每帧 CPU 侧构建 `DrawList`：SDF 圆环/圆盘/辉光/胶囊/圆弧、纹理
   四边形、滑条身体带描边条带（MSAA 抗锯齿），按 alpha/加色混合分段
   绘制，绘制顺序复刻 `OsuPlayfield` 层级（spinner → follow points →
