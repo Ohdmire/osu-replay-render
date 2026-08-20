@@ -210,6 +210,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 "#;
 
 pub struct Renderer {
+    adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline_alpha: wgpu::RenderPipeline,
@@ -257,7 +258,44 @@ impl Renderer {
             force_fallback_adapter: false,
         }))
         .expect("no suitable GPU adapter");
+        Self::from_adapter(adapter, width, height, atlas)
+    }
 
+    /// Device + queue on an adapter guaranteed compatible with `surface`
+    /// (used by the live-preview `SurfaceRenderer`).
+    pub fn new_with_surface(
+        width: u32,
+        height: u32,
+        atlas: &Atlas,
+        surface: &wgpu::Surface,
+    ) -> (Renderer, wgpu::Device, wgpu::Queue) {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: Some(surface),
+            force_fallback_adapter: false,
+        }))
+        .expect("no GPU adapter supporting the surface");
+        let renderer = Self::from_adapter(adapter, width, height, atlas);
+        let device = renderer.device.clone();
+        let queue = renderer.queue.clone();
+        (renderer, device, queue)
+    }
+
+    pub fn adapter(&self) -> &wgpu::Adapter {
+        &self.adapter
+    }
+
+    pub fn target_view(&self) -> wgpu::TextureView {
+        self.target.create_view(&Default::default())
+    }
+
+    fn from_adapter(
+        adapter: wgpu::Adapter,
+        width: u32,
+        height: u32,
+        atlas: &Atlas,
+    ) -> Renderer {
         let (device, queue) = block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("renderer"),
@@ -601,7 +639,7 @@ impl Renderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Bgra8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let msaa = device.create_texture(&wgpu::TextureDescriptor {
@@ -655,6 +693,7 @@ impl Renderer {
             .collect();
 
         Renderer {
+            adapter,
             device,
             queue,
             body_tex,
@@ -691,7 +730,7 @@ impl Renderer {
 
     /// Builds the full scene command encoder (slider-body prepasses +
     /// composites + scene runs + MSAA resolve).
-    fn encode_scene(&mut self, list: &DrawList, clear: [f64; 4]) -> wgpu::CommandEncoder {
+    pub fn encode_scene(&mut self, list: &DrawList, clear: [f64; 4]) -> wgpu::CommandEncoder {
         let vbytes = list.vertices.len() * std::mem::size_of::<Vertex>();
         let ibytes = list.indices.len() * 4;
         assert!(vbytes as u64 <= self.vbo.size(), "vertex buffer overflow: {}", vbytes);

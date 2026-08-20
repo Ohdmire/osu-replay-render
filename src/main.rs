@@ -14,199 +14,10 @@
 //!   --score classic        Show classic (stable-style) score
 //!   --limit <n>            Render at most n frames (testing)
 
-mod draw;
-mod game;
-mod hud;
-mod render;
-mod scene;
+use osu_replay_render::{build_atlas, decode_image_file, game, osu_background_file, osu_general_value, render::Renderer, scene, draw};
 
-use draw::{Atlas, Image, Region, TtfFont};
-use render::Renderer;
 use scene::{Assets, SceneState};
 use std::io::Write;
-
-const TORUS_BOLD_TTF: &[u8] = include_bytes!("../assets/fonts/TorusPro-Bold.ttf");
-const TORUS_SEMIBOLD_TTF: &[u8] = include_bytes!("../assets/fonts/TorusPro-SemiBold.ttf");
-const CURSOR_TRAIL_PNG: &[u8] = include_bytes!("../assets/cursor/cursortrail.png");
-const REPEAT_EDGE_PNG: &[u8] = include_bytes!("../assets/cursor/repeat-edge-piece.png");
-const APPROACH_CIRCLE_PNG: &[u8] = include_bytes!("../assets/cursor/approachcircle.png");
-
-fn counter_png(c: &str) -> Vec<u8> {
-    std::fs::read(format!("assets/counter/argon-counter-{}.png", c)).unwrap_or_else(|_| {
-        include_bytes!("../assets/counter/argon-counter-5.png").to_vec()
-    })
-}
-
-fn build_atlas(bg_image: Option<Image>) -> (Atlas, TtfFont, TtfFont) {
-    let (mut bold, mut bold_images) = TtfFont::rasterize(TORUS_BOLD_TTF, true);
-    let (mut semibold, mut semibold_images) = TtfFont::rasterize(TORUS_SEMIBOLD_TTF, false);
-
-    let mut images: Vec<(Region, Image)> = Vec::new();
-    if let Some(img) = bg_image {
-        images.push((Region::Background, img));
-    }
-    images.append(&mut bold_images);
-    images.append(&mut semibold_images);
-
-    for d in b'0'..=b'9' {
-        let (w, h, rgba) = decode(&counter_png(&(d - b'0').to_string()));
-        images.push((Region::CounterDigit(d), Image { width: w, height: h, rgba }));
-    }
-    for (name, region) in [
-        ("dot", Region::CounterDot),
-        ("percentage", Region::CounterPercent),
-        ("x", Region::CounterX),
-        ("wireframes", Region::CounterWireframes),
-    ] {
-        let (w, h, rgba) = decode(&counter_png(name));
-        images.push((region, Image { width: w, height: h, rgba }));
-    }
-    {
-        let (w, h, rgba) = decode(CURSOR_TRAIL_PNG);
-        images.push((Region::CursorTrail, Image { width: w, height: h, rgba }));
-    }
-    {
-        let (w, h, rgba) = decode(REPEAT_EDGE_PNG);
-        images.push((Region::RepeatEdge, Image { width: w, height: h, rgba }));
-    }
-    {
-        let (w, h, rgba) = decode(APPROACH_CIRCLE_PNG);
-        images.push((Region::ApproachCircle, Image { width: w, height: h, rgba }));
-    }
-
-    let atlas = Atlas::build(&images);
-    if std::env::var("ATLAS_DEBUG").is_ok() {
-        for r in [Region::CounterDigit(b'5'), Region::Glyph { bold: true, c: 'G', em: 24 }, Region::Glyph { bold: true, c: 'G', em: 96 }, Region::Glyph { bold: false, c: '5', em: 48 }, Region::CounterWireframes] {
-            let rect = atlas.region_rect(r);
-            let ink = atlas.ink(r);
-            eprintln!("ATLAS {:?}: rect=({:.0},{:.0},{:.0},{:.0}) ink=({:.0},{:.0},{:.0},{:.0})", r, rect.x0, rect.y0, rect.x1, rect.y1, ink[0], ink[1], ink[2], ink[3]);
-        }
-    }
-    bold.patch_rects(&atlas, true);
-    semibold.patch_rects(&atlas, false);
-    if std::env::var("ATLAS_DUMP").is_ok() {
-        let file = std::fs::File::create("atlas_dump.png").unwrap();
-        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), atlas.width, atlas.height);
-        enc.set_color(png::ColorType::Rgba);
-        enc.set_depth(png::BitDepth::Eight);
-        let mut writer = enc.write_header().unwrap();
-        writer.write_image_data(&atlas.rgba).unwrap();
-        eprintln!("atlas dumped: {}x{}", atlas.width, atlas.height);
-    }
-    (atlas, bold, semibold)
-}
-
-/// A value from the beatmap's `[General]` section (e.g. `AudioFilename`).
-fn osu_general_value(map_path: &str, key: &str) -> Option<String> {
-    let content = std::fs::read_to_string(map_path).ok()?;
-    let mut in_general = false;
-    for line in content.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_general = line.eq_ignore_ascii_case("[General]");
-            continue;
-        }
-        if in_general {
-            if let Some((k, v)) = line.split_once(':') {
-                if k.trim().eq_ignore_ascii_case(key) {
-                    return Some(v.trim().to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-/// The background image filename from `[Events]` (`0,0,"file.jpg",...`).
-fn osu_background_file(map_path: &str) -> Option<String> {
-    let content = std::fs::read_to_string(map_path).ok()?;
-    let mut in_events = false;
-    for line in content.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_events = line.eq_ignore_ascii_case("[Events]");
-            continue;
-        }
-        if in_events && line.starts_with("0,0,") {
-            // `0,0,"file.jpg",0,0` - strip the opening quote, take up to the
-            // closing one (filenames may contain commas).
-            let rest = line[4..].trim_start_matches('"');
-            let end = rest.find('"').unwrap_or(rest.len());
-            let name = rest[..end].to_string();
-            if !name.is_empty() {
-                return Some(name);
-            }
-        }
-    }
-    None
-}
-
-/// Decodes a PNG or JPEG file into an atlas image (RGBA).
-fn decode_image_file(path: &std::path::Path) -> Result<Image, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
-    let lower = path.to_string_lossy().to_lowercase();
-    if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-        let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(&bytes));
-        let pixels = decoder.decode().map_err(|e| format!("jpeg decode {}: {}", path.display(), e))?;
-        let info = decoder.info().ok_or("jpeg missing info")?;
-        let (w, h) = (info.width as u32, info.height as u32);
-        let rgba = match info.pixel_format {
-            jpeg_decoder::PixelFormat::L8 => {
-                let mut v = Vec::with_capacity((w * h * 4) as usize);
-                for px in &pixels {
-                    v.extend_from_slice(&[*px, *px, *px, 255]);
-                }
-                v
-            }
-            jpeg_decoder::PixelFormat::RGB24 => {
-                let mut v = Vec::with_capacity((w * h * 4) as usize);
-                for px in pixels.chunks_exact(3) {
-                    v.extend_from_slice(&[px[0], px[1], px[2], 255]);
-                }
-                v
-            }
-            other => return Err(format!("unsupported jpeg pixel format {:?}", other)),
-        };
-        Ok(Image { width: w, height: h, rgba })
-    } else {
-        let (w, h, rgba) = decode(&bytes);
-        Ok(Image { width: w, height: h, rgba })
-    }
-}
-
-fn decode(bytes: &[u8]) -> (u32, u32, Vec<u8>) {    // Reuse the png decoding from draw via a tiny wrapper.
-    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
-    let mut reader = decoder.read_info().expect("png read info");
-    let mut buf = vec![0u8; reader.output_buffer_size()];
-    let info = reader.next_frame(&mut buf).expect("png decode");
-    let (w, h) = (info.width, info.height);
-    // draw::decode_png is private; inline conversion here.
-    match info.color_type {
-        png::ColorType::Rgba => (w, h, buf),
-        png::ColorType::GrayscaleAlpha => {
-            let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-            for px in buf.chunks_exact(2) {
-                rgba.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
-            }
-            (w, h, rgba)
-        }
-        png::ColorType::Grayscale => {
-            let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-            for px in &buf {
-                rgba.extend_from_slice(&[*px, *px, *px, 255]);
-            }
-            (w, h, rgba)
-        }
-        png::ColorType::Rgb => {
-            let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-            for px in buf.chunks_exact(3) {
-                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
-            }
-            (w, h, rgba)
-        }
-        other => panic!("unsupported png colour type {:?}", other),
-    }
-}
 
 struct Options {
     out: Option<String>,
@@ -622,12 +433,6 @@ fn main() {
                 .iter().map(|s| s.to_string()).collect(),
             )
         };
-        // The video timeline starts at the first rendered frame's replay
-        // time. Lazer's gameplay clock = audio file position + platform
-        // (+15ms Windows) + user AudioOffset + per-beatmap offset, so the
-        // audio position for replay time T is T - total offset
-        // (--audio-offset, default the +15ms Windows platform base).
-        let audio_start = (frame_times.first().map(|t| *t).unwrap_or(0.0) - opts.audio_offset) / 1000.0;
         let mut cmd = std::process::Command::new("ffmpeg");
         cmd.arg("-y")
             .arg("-f").arg("rawvideo")
@@ -635,16 +440,17 @@ fn main() {
             .arg("-s").arg(format!("{}x{}", opts.width, opts.height))
             .arg("-r").arg(format!("{}", opts.fps))
             .arg("-i").arg("-");
-        if let Some(audio) = &audio_path {
-            cmd.arg("-ss").arg(format!("{:.3}", audio_start))
-                .arg("-i").arg(audio);
-        }
         cmd.args(&encode_args);
-        if audio_path.is_some() {
-            cmd.args(["-map", "0:v", "-map", "1:a", "-c:a", "aac", "-b:a", "192k", "-shortest"]);
-        }
+        // With BGM the audio is muxed in a SECOND ffmpeg pass after
+        // rendering (see below): muxing audio directly on the raw pipe can
+        // grow ffmpeg's interleave queue without bound when fed fast.
+        let video_tmp = if audio_path.is_some() {
+            format!("{}.video.tmp.mp4", out)
+        } else {
+            out.clone()
+        };
         let mut child = cmd
-            .arg(out)
+            .arg(&video_tmp)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::fs::File::create("ffmpeg_err.log").unwrap())
@@ -725,6 +531,45 @@ fn main() {
         );
     }
 
+    // Drain the pipeline's last frame(s) into the writer before finishing.
+    while renderer.pending_len() > 0 {
+        let frame = renderer.read_oldest();
+        if let Err(e) = output.write_frame(&frame, opts.width, opts.height, renderer.padded_row, total) {
+            eprintln!("error writing final frame: {}", e);
+            std::process::exit(1);
+        }
+    }
         output.finish();
+
+    // Second pass: mux the BGM into the video (stream copy + AAC). The
+    // audio is seeked to the first frame's replay time minus the lazer
+    // clock offset, exactly as before.
+    if let Some(audio) = &audio_path {
+        if let Some(out) = &opts.out {
+            let audio_start = (frame_times.first().map(|t| *t).unwrap_or(0.0) - opts.audio_offset) / 1000.0;
+            let tmp = format!("{}.video.tmp.mp4", out);
+            eprintln!("muxing audio: {}", audio);
+            let status = std::process::Command::new("ffmpeg")
+                .arg("-y")
+                .arg("-v").arg("error")
+                .arg("-i").arg(&tmp)
+                .arg("-ss").arg(format!("{:.3}", audio_start))
+                .arg("-i").arg(audio)
+                .arg("-map").arg("0:v")
+                .arg("-map").arg("1:a")
+                .arg("-c:v").arg("copy")
+                .arg("-c:a").arg("aac").arg("-b:a").arg("192k")
+                .arg("-shortest")
+                .arg("-movflags").arg("+faststart")
+                .arg(out)
+                .status()
+                .expect("ffmpeg audio mux");
+            let _ = std::fs::remove_file(&tmp);
+            if !status.success() {
+                eprintln!("error: audio mux failed");
+                std::process::exit(1);
+            }
+        }
+    }
     eprintln!("done: {} frames in {:.1}s", total, t0.elapsed().as_secs_f32());
 }
