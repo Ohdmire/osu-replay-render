@@ -194,9 +194,12 @@ enum Output {
     /// Frames are sent to a dedicated writer thread through a bounded
     /// channel (backpressure); the thread owns the ffmpeg child, writes
     /// each frame with ONE write (contiguous at typical widths, else a
-    /// single repack), and joins at `finish`.
+    /// single repack), and joins at `finish`. Spent frame buffers are
+    /// recycled back through `ret` so the render thread never reallocates
+    /// the ~8MB readback payload per frame.
     Ffmpeg {
         tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+        ret: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
         handle: Option<std::thread::JoinHandle<std::io::Result<()>>>,
     },
     PngDir(String),
@@ -204,28 +207,46 @@ enum Output {
 }
 
 impl Output {
-    /// Queues one frame to the writer thread. Cheap unless the writer is
-    /// more than `BOUND` frames behind (natural backpressure).
-    fn write_frame(&mut self, data: &[u8], width: u32, height: u32, stride: u32, index: usize) -> std::io::Result<()> {
+    /// Returns a buffer to fill the next frame into: a recycled one from
+    /// the writer thread when available, a fresh allocation otherwise.
+    fn take_buf(&mut self, frame_bytes: usize) -> Vec<u8> {
+        match self {
+            Output::Ffmpeg { ret, .. } => {
+                if let Some(rx) = ret {
+                    if let Ok(mut buf) = rx.try_recv() {
+                        buf.clear();
+                        buf.reserve(frame_bytes);
+                        return buf;
+                    }
+                }
+                Vec::with_capacity(frame_bytes)
+            }
+            _ => Vec::with_capacity(frame_bytes),
+        }
+    }
+
+    /// Takes ownership of `buf` (frame data, padded rows) and queues it to
+    /// the writer thread. Cheap unless the writer is more than
+    /// `WRITER_QUEUE` frames behind (natural backpressure).
+    fn write_frame(&mut self, mut buf: Vec<u8>, width: u32, height: u32, stride: u32, index: usize) -> std::io::Result<()> {
         match self {
             Output::Ffmpeg { tx, .. } => {
                 let tx = tx.as_ref().expect("writer channel");
-                let owned = if stride == width * 4 {
-                    data.to_vec()
-                } else {
+                if stride != width * 4 {
                     // Repack padded rows into one contiguous buffer so the
                     // writer thread does a single write per frame.
                     let mut tight = Vec::with_capacity((width * height * 4) as usize);
                     for row in 0..height as usize {
                         let start = row * stride as usize;
-                        tight.extend_from_slice(&data[start..start + width as usize * 4]);
+                        tight.extend_from_slice(&buf[start..start + width as usize * 4]);
                     }
-                    tight
-                };
+                    buf = tight;
+                }
                 let _ = index;
-                tx.send(owned).map_err(|_| std::io::Error::other("ffmpeg writer exited"))
+                tx.send(buf).map_err(|_| std::io::Error::other("ffmpeg writer exited"))
             }
             Output::PngDir(dir) => {
+                let data: &[u8] = &buf;
                 let path = format!("{}/frame_{:06}.png", dir, index);
                 let file = std::fs::File::create(&path)?;
                 let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width, height);
@@ -256,8 +277,9 @@ impl Output {
     /// thread drains the queue, closes ffmpeg's stdin and waits for the
     /// encode to finish.
     fn finish(mut self) {
-        if let Output::Ffmpeg { tx, handle } = &mut self {
+        if let Output::Ffmpeg { tx, ret, handle } = &mut self {
             drop(tx.take());
+            drop(ret.take());
             match handle.take().unwrap().join() {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => eprintln!("ffmpeg writer error: {}", e),
@@ -469,11 +491,14 @@ fn main() {
             .expect("failed to spawn ffmpeg (is it on PATH? or use --png-dir)");
         // Dedicated writer thread: owns ffmpeg's stdin, one write per
         // frame, decoupled from the render loop by a bounded channel.
+        // Buffers are recycled back to the render thread after use.
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(WRITER_QUEUE);
+        let (ret_tx, ret_rx) = std::sync::mpsc::channel::<Vec<u8>>();
         let handle = std::thread::spawn(move || {
             let mut stdin = child.stdin.take().expect("ffmpeg stdin");
             for frame in rx {
                 stdin.write_all(&frame)?;
+                let _ = ret_tx.send(frame);
             }
             drop(stdin); // EOF -> ffmpeg finishes the encode
             let status = child.wait()?;
@@ -482,7 +507,7 @@ fn main() {
             }
             Ok(())
         });
-        Output::Ffmpeg { tx: Some(tx), handle: Some(handle) }
+        Output::Ffmpeg { tx: Some(tx), ret: Some(ret_rx), handle: Some(handle) }
     } else {
         eprintln!("no output specified; use --out <file.mp4> or --png-dir <dir>");
         std::process::exit(2);
@@ -494,6 +519,9 @@ fn main() {
     let assets = Assets { atlas: &atlas, bold: &bold, semibold: &semibold };
     let stats = std::env::var("RENDER_STATS").is_ok();
     let (mut s_build, mut s_render, mut s_write) = (0.0f64, 0.0f64, 0.0f64);
+    // Index of the next frame to be written out; lags behind the frame
+    // being submitted while the pipeline is running ahead.
+    let mut written = 0usize;
 
     for (n, &ft) in frame_times.iter().enumerate() {
         let ta = std::time::Instant::now();
@@ -507,16 +535,21 @@ fn main() {
             }
         }
         let tb = std::time::Instant::now();
-        // Pipelined: submit this frame WITHOUT waiting for the GPU; the
-        // previous frame's readback (already done or nearly so by now) is
-        // mapped out and queued to the writer thread. The GPU always has a
-        // frame of work queued while the CPU builds the next one.
+        // Pipelined: submit this frame WITHOUT waiting for the GPU, and
+        // only read back the OLDEST in-flight frame once the pipeline has
+        // reached depth 2. Until then the GPU renders ahead while the CPU
+        // keeps building the next frame; reading immediately after submit
+        // would serialize CPU and GPU again.
         renderer.render_deferred(&list, [0.055, 0.055, 0.075, 1.0]);
-        let bgra = renderer.read_oldest();
         let tc = std::time::Instant::now();
-        if let Err(e) = output.write_frame(&bgra, opts.width, opts.height, renderer.padded_row, n) {
-            eprintln!("error writing frame {}: {}", n, e);
-            std::process::exit(1);
+        if renderer.pending_len() >= 2 {
+            let mut buf = output.take_buf((renderer.padded_row as usize) * opts.height as usize);
+            renderer.read_oldest_into(&mut buf);
+            if let Err(e) = output.write_frame(buf, opts.width, opts.height, renderer.padded_row, written) {
+                eprintln!("error writing frame {}: {}", written, e);
+                std::process::exit(1);
+            }
+            written += 1;
         }
         let td = std::time::Instant::now();
         s_build += tb.duration_since(ta).as_secs_f64();
@@ -544,11 +577,13 @@ fn main() {
 
     // Drain the pipeline's last frame(s) into the writer before finishing.
     while renderer.pending_len() > 0 {
-        let frame = renderer.read_oldest();
-        if let Err(e) = output.write_frame(&frame, opts.width, opts.height, renderer.padded_row, total) {
+        let mut buf = output.take_buf((renderer.padded_row as usize) * opts.height as usize);
+        renderer.read_oldest_into(&mut buf);
+        if let Err(e) = output.write_frame(buf, opts.width, opts.height, renderer.padded_row, written) {
             eprintln!("error writing final frame: {}", e);
             std::process::exit(1);
         }
+        written += 1;
     }
         output.finish();
 
