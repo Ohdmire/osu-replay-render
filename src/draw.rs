@@ -53,10 +53,12 @@ impl Colour {
         }
     }
 
-    /// osuTK `Color4Extensions.Darken`: multiplySRGB by (1-amount) per channel.
-    /// Amounts >= 1 clamp to black.
+    /// osu-framework `Color4Extensions.Darken(amount)`:
+    /// `Multiply(colour, 1 / (1 + amount))` - a multiplicative darkening
+    /// that KEEPS the hue (Darken(4) = 20% of the colour, a dark tint -
+    /// NOT the old osuTK `1 - amount` semantics which clamp to black).
     pub fn darken(self, amount: f32) -> Colour {
-        let f = (1.0 - amount).max(0.0);
+        let f = 1.0 / (1.0 + amount);
         Colour { r: self.r * f, g: self.g * f, b: self.b * f, a: self.a }
     }
 
