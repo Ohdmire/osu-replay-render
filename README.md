@@ -90,12 +90,20 @@ DT/HT 等 rate mod 的回放按真实游戏速度输出。渲染速度约 180fps
 - `counter/argon-counter-*.png` — lazer 官方 HUD 计数器纹理数字
   （来自 [osu-resources](https://github.com/ppy/osu-resources)，MIT/CC-BY-NC 4.0）。
 - `cursor/cursortrail.png` — 官方光标轨迹点。
+- `cursor/cursor-smoke.png` — 官方烟迹粒子（64×64，来自 osu-resources；
+  烟迹渲染实现后直接可用）。
+- `spinner/spinner-glow.png` — 官方 spinner 侧弧辉光渐变条（1×107；
+  lazer 中由 `ArgonSpinnerProgressArc.ProgressFill` 配合 SpinnerGlow
+  shader 做径向采样——当前渲染器用加色 SDF 弧近似该辉光，此纹理留作
+  后续实现对应 shader 时使用）。
 
 > Argon/Argon-Pro 皮肤其余元素（圆、描边、辉光、滑条、spinner、光标
 > 等）在 lazer 中全部为**程序化矢量绘制**（osu-resources 中除
 > `argon-counter-*`、`approachcircle`、`repeat-edge-piece`、
-> `cursortrail` 外无 argon 纹理，`ring-glow` 等仅用于 classic 皮肤），
-> 已在渲染器中以 SDF/图元逐一直接复刻，无可再提取的纹理资产。
+> `cursortrail`、`cursor-smoke`、`spinner-glow` 外无 argon 纹理，
+> `ring-glow`/`disc`/`number` 等仅用于 classic/legacy 皮肤，menu-cursor
+> 仅菜单用），已在渲染器中以 SDF/图元逐一直接复刻，无可再提取的纹理
+> 资产。
 
 ## 渲染架构
 
