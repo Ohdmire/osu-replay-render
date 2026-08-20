@@ -643,8 +643,11 @@ fn main() {
     let t0 = std::time::Instant::now();
     let mut list = draw::DrawList::new();
     let assets = Assets { atlas: &atlas, bold: &bold, semibold: &semibold };
+    let stats = std::env::var("RENDER_STATS").is_ok();
+    let (mut s_build, mut s_render, mut s_write) = (0.0f64, 0.0f64, 0.0f64);
 
     for (n, &ft) in frame_times.iter().enumerate() {
+        let ta = std::time::Instant::now();
         list.clear();
         let snap = game::snapshot_at(&game, ft);
         state.build_frame(&game, &assets, &snap, &mut list);
@@ -654,11 +657,17 @@ fn main() {
                 state.probe_dump(&game, ft, "probe.json");
             }
         }
+        let tb = std::time::Instant::now();
         let bgra = renderer.render(&list, [0.055, 0.055, 0.075, 1.0]);
+        let tc = std::time::Instant::now();
         if let Err(e) = output.write_frame(&bgra, opts.width, opts.height, renderer.padded_row, n) {
             eprintln!("error writing frame {}: {}", n, e);
             std::process::exit(1);
         }
+        let td = std::time::Instant::now();
+        s_build += tb.duration_since(ta).as_secs_f64();
+        s_render += tc.duration_since(tb).as_secs_f64();
+        s_write += td.duration_since(tc).as_secs_f64();
         if n % 300 == 0 || n + 1 == total {
             eprintln!(
                 "frame {}/{} (t={:.0}ms) elapsed {:.1}s",
@@ -668,6 +677,15 @@ fn main() {
                 t0.elapsed().as_secs_f32()
             );
         }
+    }
+    if stats {
+        eprintln!(
+            "stats: build {:.2}s ({:.2}ms/f) | render+readback {:.2}s ({:.2}ms/f) | write {:.2}s ({:.2}ms/f) | total {:.2}s",
+            s_build, s_build * 1000.0 / total as f64,
+            s_render, s_render * 1000.0 / total as f64,
+            s_write, s_write * 1000.0 / total as f64,
+            t0.elapsed().as_secs_f64()
+        );
     }
 
         output.finish();
