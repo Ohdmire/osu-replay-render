@@ -8,6 +8,7 @@ osu_replay_judge = { path = "../osu-replay-judge" }
 wgpu = "24"
 pollster = "0.4"
 png = "0.17"
+jpeg-decoder = "0.3"
 ab_glyph = "0.2"
 
 [profile.release]

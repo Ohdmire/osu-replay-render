@@ -22,6 +22,9 @@ osu_replay_render <beatmap.osu> <replay.osr> [options]
 | `--encoder <auto\|nvenc\|x264>` | 视频编码器，默认 `auto`（探测到 NVENC 则用硬件编码，否则回退 libx264） |
 | `--quality <n>` | 编码质量：nvenc 的 cq / x264 的 crf，默认 18（nvenc 数值口径不同，20-22 更接近 x264 crf18 的体积） |
 | `--no-guides` | 关闭 UR 条的窗口引导线（判定色色轴），默认开启渲染 |
+| `--audio [file]` | 输出混入 BGM（AAC 192k）：带路径用指定文件；不带值自动取谱面 `[General] AudioFilename`（相对谱面目录）。音频自动 seek 到输出首帧的回放时刻 |
+| `--bg` | 绘制谱面背景图（`[Events]` 的 `0,0,"..."`，相对谱面目录，PNG/JPEG），全屏铺满 |
+| `--bg-opacity <0..1>` | 背景不透明度，默认 **0.3** = 1 − DimLevel（lazer `OsuSetting.DimLevel` 默认 0.7，与游戏内"背景暗度"语义一致） |
 | `--limit <n>` | 最多渲染 n 帧（测试用） |
 
 示例：
