@@ -37,11 +37,14 @@ fn counter_png(c: &str) -> Vec<u8> {
     })
 }
 
-fn build_atlas() -> (Atlas, TtfFont, TtfFont) {
+fn build_atlas(bg_image: Option<Image>) -> (Atlas, TtfFont, TtfFont) {
     let (mut bold, mut bold_images) = TtfFont::rasterize(TORUS_BOLD_TTF, true);
     let (mut semibold, mut semibold_images) = TtfFont::rasterize(TORUS_SEMIBOLD_TTF, false);
 
     let mut images: Vec<(Region, Image)> = Vec::new();
+    if let Some(img) = bg_image {
+        images.push((Region::Background, img));
+    }
     images.append(&mut bold_images);
     images.append(&mut semibold_images);
 
@@ -93,8 +96,85 @@ fn build_atlas() -> (Atlas, TtfFont, TtfFont) {
     (atlas, bold, semibold)
 }
 
-fn decode(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
-    // Reuse the png decoding from draw via a tiny wrapper.
+/// A value from the beatmap's `[General]` section (e.g. `AudioFilename`).
+fn osu_general_value(map_path: &str, key: &str) -> Option<String> {
+    let content = std::fs::read_to_string(map_path).ok()?;
+    let mut in_general = false;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_general = line.eq_ignore_ascii_case("[General]");
+            continue;
+        }
+        if in_general {
+            if let Some((k, v)) = line.split_once(':') {
+                if k.trim().eq_ignore_ascii_case(key) {
+                    return Some(v.trim().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The background image filename from `[Events]` (`0,0,"file.jpg",...`).
+fn osu_background_file(map_path: &str) -> Option<String> {
+    let content = std::fs::read_to_string(map_path).ok()?;
+    let mut in_events = false;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_events = line.eq_ignore_ascii_case("[Events]");
+            continue;
+        }
+        if in_events && line.starts_with("0,0,") {
+            // `0,0,"file.jpg",0,0` - strip the opening quote, take up to the
+            // closing one (filenames may contain commas).
+            let rest = line[4..].trim_start_matches('"');
+            let end = rest.find('"').unwrap_or(rest.len());
+            let name = rest[..end].to_string();
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+/// Decodes a PNG or JPEG file into an atlas image (RGBA).
+fn decode_image_file(path: &std::path::Path) -> Result<Image, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+    let lower = path.to_string_lossy().to_lowercase();
+    if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(&bytes));
+        let pixels = decoder.decode().map_err(|e| format!("jpeg decode {}: {}", path.display(), e))?;
+        let info = decoder.info().ok_or("jpeg missing info")?;
+        let (w, h) = (info.width as u32, info.height as u32);
+        let rgba = match info.pixel_format {
+            jpeg_decoder::PixelFormat::L8 => {
+                let mut v = Vec::with_capacity((w * h * 4) as usize);
+                for px in &pixels {
+                    v.extend_from_slice(&[*px, *px, *px, 255]);
+                }
+                v
+            }
+            jpeg_decoder::PixelFormat::RGB24 => {
+                let mut v = Vec::with_capacity((w * h * 4) as usize);
+                for px in pixels.chunks_exact(3) {
+                    v.extend_from_slice(&[px[0], px[1], px[2], 255]);
+                }
+                v
+            }
+            other => return Err(format!("unsupported jpeg pixel format {:?}", other)),
+        };
+        Ok(Image { width: w, height: h, rgba })
+    } else {
+        let (w, h, rgba) = decode(&bytes);
+        Ok(Image { width: w, height: h, rgba })
+    }
+}
+
+fn decode(bytes: &[u8]) -> (u32, u32, Vec<u8>) {    // Reuse the png decoding from draw via a tiny wrapper.
     let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     let mut reader = decoder.read_info().expect("png read info");
     let mut buf = vec![0u8; reader.output_buffer_size()];
@@ -149,12 +229,19 @@ struct Options {
     /// Whether the UR bar's window guide lines (colour axis) render.
     /// Default on; `--no-guides` disables them.
     guides: bool,
+    /// Optional BGM muxed into the output (`--audio [file]`; without a
+    /// value the beatmap's own audio is used).
+    audio: Option<String>,
+    /// Draw the beatmap background image (`--bg`).
+    bg: bool,
+    /// Background opacity 0..1 (lazer: 1 - DimLevel, default DimLevel 0.7).
+    bg_opacity: f32,
 }
 
 fn parse_args() -> Result<Options, String> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        return Err(format!("usage: {} <beatmap.osu> <replay.osr> [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro] [--no-guides] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
+        return Err(format!("usage: {} <beatmap.osu> <replay.osr> [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro] [--no-guides] [--audio [file.mp3]] [--bg] [--bg-opacity 0..1] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
     }
     let mut opts = Options {
         out: None,
@@ -172,6 +259,9 @@ fn parse_args() -> Result<Options, String> {
         limit: None,
         ffmpeg_extra: Vec::new(),
         guides: true,
+        audio: None,
+        bg: false,
+        bg_opacity: 0.3,
     };
     let mut i = 3;
     while i < args.len() {
@@ -242,6 +332,30 @@ fn parse_args() -> Result<Options, String> {
             }
             "--no-guides" => {
                 opts.guides = false;
+            }
+            "--audio" => {
+                // Optional value: an explicit file, else the beatmap's own
+                // audio (resolved later once the map path is known).
+                opts.audio = match args.get(i + 1) {
+                    Some(v) if !v.starts_with("--") => {
+                        i += 1;
+                        Some(v.clone())
+                    }
+                    Some(_) | None => Some(String::new()),
+                };
+            }
+            "--bg" => {
+                opts.bg = true;
+            }
+            "--bg-opacity" => {
+                i += 1;
+                opts.bg_opacity = args
+                    .get(i)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("bad --bg-opacity (expected 0..1)")?;
+                if !(0.0..=1.0).contains(&opts.bg_opacity) {
+                    return Err("--bg-opacity must be within 0..1".into());
+                }
             }
             other => return Err(format!("unknown argument: {}", other)),
         }
@@ -332,13 +446,71 @@ fn main() {
         game.final_max_combo
     );
 
-    let (atlas, bold, semibold) = build_atlas();
+    // Resolve optional BGM: explicit file, or the beatmap's own audio
+    // (`AudioFilename`, relative to the map).
+    let map_dir = std::path::Path::new(&map_path)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    let audio_path: Option<String> = match &opts.audio {
+        Some(explicit) if !explicit.is_empty() => {
+            if !std::path::Path::new(explicit).exists() {
+                eprintln!("error: audio file not found: {}", explicit);
+                std::process::exit(1);
+            }
+            Some(explicit.clone())
+        }
+        Some(_) => {
+            let name = osu_general_value(&map_path, "AudioFilename")
+                .unwrap_or_else(|| "audio.mp3".to_string());
+            let p = map_dir.join(&name);
+            if p.exists() {
+                eprintln!("audio: {} (from beatmap)", p.display());
+                Some(p.to_string_lossy().into_owned())
+            } else {
+                eprintln!("warning: beatmap audio not found: {} - rendering without BGM", p.display());
+                None
+            }
+        }
+        None => None,
+    };
+
+    // Resolve the beatmap background (`--bg`): the `[Events]` background
+    // image, decoded into the atlas and drawn full-screen at
+    // `--bg-opacity` (default 1 - DimLevel 0.7, matching lazer).
+    let bg_image: Option<Image> = if opts.bg {
+        match osu_background_file(&map_path) {
+            Some(name) => {
+                let p = map_dir.join(&name);
+                match decode_image_file(&p) {
+                    Ok(img) => {
+                        eprintln!("background: {} ({}x{}, opacity {:.2})", p.display(), img.width, img.height, opts.bg_opacity);
+                        Some(img)
+                    }
+                    Err(e) => {
+                        eprintln!("warning: {} - rendering without background", e);
+                        None
+                    }
+                }
+            }
+            None => {
+                eprintln!("warning: beatmap has no background image - rendering without background");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let has_bg = bg_image.is_some();
+    let (atlas, bold, semibold) = build_atlas(bg_image);
     eprintln!("atlas: {}x{}", atlas.width, atlas.height);
 
     let mut renderer = Renderer::new(opts.width, opts.height, &atlas);
     let mut state = SceneState::new(&game, opts.width, opts.height);
     state.pro_skin = opts.skin == "argon-pro";
     state.hud.ur_guides = opts.guides;
+    state.bg_opacity = if has_bg { Some(opts.bg_opacity) } else { None };
     if opts.classic_score {
         state.hud.use_classic_score();
     }
@@ -418,14 +590,25 @@ fn main() {
                 .iter().map(|s| s.to_string()).collect(),
             )
         };
-        let child = std::process::Command::new("ffmpeg")
-            .arg("-y")
+        // The video timeline starts at the first rendered frame's replay
+        // time; the BGM input is seeked to the same instant.
+        let audio_start = frame_times.first().map(|t| t / 1000.0).unwrap_or(0.0);
+        let mut cmd = std::process::Command::new("ffmpeg");
+        cmd.arg("-y")
             .arg("-f").arg("rawvideo")
             .arg("-pix_fmt").arg(in_pix_fmt)
             .arg("-s").arg(format!("{}x{}", opts.width, opts.height))
             .arg("-r").arg(format!("{}", opts.fps))
-            .arg("-i").arg("-")
-            .args(&encode_args)
+            .arg("-i").arg("-");
+        if let Some(audio) = &audio_path {
+            cmd.arg("-ss").arg(format!("{:.3}", audio_start))
+                .arg("-i").arg(audio);
+        }
+        cmd.args(&encode_args);
+        if audio_path.is_some() {
+            cmd.args(["-map", "0:v", "-map", "1:a", "-c:a", "aac", "-b:a", "192k", "-shortest"]);
+        }
+        let child = cmd
             .arg(out)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())

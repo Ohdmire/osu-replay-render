@@ -952,6 +952,8 @@ pub enum Region {
     CursorTrail,
     RepeatEdge,
     ApproachCircle,
+    /// Full-screen beatmap background (`--bg`).
+    Background,
 }
 
 pub struct Atlas {
