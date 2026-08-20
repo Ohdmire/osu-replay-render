@@ -2,11 +2,15 @@
 //! by external embedders (e.g. the OPP live preview) that render frames on
 //! demand into a window or read pixels back.
 
+pub mod autoplay;
 pub mod draw;
 pub mod game;
 pub mod hud;
 pub mod render;
 pub mod scene;
+/// Win32 HWND 直渲(窗口 surface)。跨平台宿主应使用 `render::Renderer`
+/// 的离屏读回路径,把帧送到自己的展示层。
+#[cfg(windows)]
 pub mod surface;
 
 use draw::{Atlas, Image, Region, TtfFont};

@@ -284,6 +284,32 @@ pub fn load(map_path: &str, replay_path: &str) -> Result<GameData, String> {
     Ok(data)
 }
 
+/// Beatmap preview with the Autoplay mod: frames come from the local port
+/// of lazer's `OsuAutoGenerator` instead of a recorded .osr, so no replay
+/// file is needed. The engine then judges the generated frames like any
+/// other replay — every judgement/HP/combo/UR readout is real.
+pub fn load_autoplay(map_path: &str) -> Result<GameData, String> {
+    let content = std::fs::read_to_string(map_path).map_err(|e| format!("cannot read beatmap: {}", e))?;
+    let map = beatmap::decode(&content)?;
+
+    // Lazer autoplay scores: no rate/visibility mods, standardised scoring.
+    let mods = Mods::from_legacy(0, false)?;
+    let classic = false;
+    let difficulty = process::apply_difficulty_mods(map.difficulty, false, false);
+    let hp = difficulty.hp;
+    let processed = process::process(&map, difficulty, classic);
+
+    let frames = crate::autoplay::AutoGenerator::new(&processed.objects, difficulty.ar as f64).generate();
+
+    let mut engine = Engine::new(processed, &mods);
+    engine.run(&frames);
+
+    let mut data = build(mods, classic, map.combo_colours, &engine, hp)?;
+    // lazer's autoplay attribution.
+    data.player = "osu!".to_string();
+    Ok(data)
+}
+
 fn build(
     mods: Mods,
     classic: bool,
