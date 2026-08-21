@@ -180,7 +180,10 @@ pub struct HudState {
     ur_arrow_anim: Option<(f64, f64, f64)>,
     /// Number of ur_events consumed so far.
     ur_processed: usize,
-    /// Whether the UR bar's window guide lines (colour axis) render.
+    /// Whether the whole UR bar (ticks/marker/arrow/number) renders.
+    pub ur_bar: bool,
+    /// Whether the UR bar's window guide lines (colour axis) render
+    /// (only visible when `ur_bar` is on).
     pub ur_guides: bool,
 }
 
@@ -202,6 +205,7 @@ impl HudState {
             ur_ema: 0.0,
             ur_arrow_anim: None,
             ur_processed: 0,
+            ur_bar: true,
             ur_guides: true,
         }
     }
@@ -349,7 +353,9 @@ impl HudState {
         draw_health(list, m, health, t, self.health_flash);
 
         // --- Unstable rate bar (skin style, bottom centre) ------------------------
-        self.draw_ur_bar(game, assets, list, m, t);
+        if self.ur_bar {
+            self.draw_ur_bar(game, assets, list, m, t);
+        }
     }
 
     /// Skin-style unstable-rate bar, horizontal at the bottom centre of the
@@ -498,7 +504,7 @@ impl HudState {
                 [ax, ay],
                 -90.0,
                 8.0 * m.virt,
-                1.6 * m.virt,
+                8.0 * 0.094 * m.virt, // FA ChevronRight stroke: 48/512 of the box
                 Colour::WHITE.opacity(arrow_a),
                 Colour::WHITE.opacity(arrow_a),
                 Blend::Alpha,
