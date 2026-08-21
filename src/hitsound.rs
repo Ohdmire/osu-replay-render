@@ -757,7 +757,13 @@ fn place(buf: &mut [f32], clip: &Clip, start_sec: f64, speed: f64, gl: f32, gr: 
 /// PCM16 stereo WAV. `t0` is the first output frame's map time,
 /// `wall_secs` the output video's duration in seconds; the track spans
 /// exactly that wall window so it muxes 1:1 with the video.
-pub fn render_track_wav(game: &GameData, map_content: &str, t0: f64, wall_secs: f64, rate: f64) -> Vec<u8> {
+/// `master_gain` scales the whole bus (`--hitsounds-volume`).
+///
+/// Loudness follows the game's defaults: samples play at their authored
+/// level (beatmap volume × the sample's mastering, Effect channel 1.0),
+/// no bus normalization. Stacked hits sum in float and the encoder's
+/// soft limiter replaces the DAC clipping the game would do.
+pub fn render_track_wav(game: &GameData, map_content: &str, t0: f64, wall_secs: f64, rate: f64, master_gain: f32) -> Vec<u8> {
     let data = parse_sample_data(map_content);
     let t_map_end = t0 + wall_secs * rate * 1000.0;
     let placements = build_placements(game, &data, t0, t_map_end);
@@ -792,6 +798,13 @@ pub fn render_track_wav(game: &GameData, map_content: &str, t0: f64, wall_secs: 
         place(&mut buf, clip, wall, rate, gl, gr, until);
     }
 
+    // `--hitsounds-volume` master gain (game default: Effect 1.0).
+    if (master_gain - 1.0).abs() > 1e-6 {
+        for v in &mut buf {
+            *v *= master_gain;
+        }
+    }
+
     if std::env::var("HITSOUND_DEBUG").is_ok() {
         let peak = buf.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         eprintln!("hitsound debug: {} clips decoded, buffer peak {:.4}", cache.len(), peak);
@@ -809,6 +822,22 @@ pub fn render_track_wav(game: &GameData, map_content: &str, t0: f64, wall_secs: 
     }
 
     encode_wav(&buf)
+}
+
+/// Soft-knee limiter (tanh above the threshold). The game's BASS mixer
+/// sums channels in float and only clips at the DAC; stacking samples
+/// must not hard-clip inside the track, or dense sections turn into
+/// rail-slamming squares that bury the BGM once summed again in ffmpeg.
+fn soft_limit(x: f32) -> f32 {
+    const T: f32 = 0.7;
+    let a = x.abs();
+    if a <= T {
+        x
+    } else {
+        let t = (a - T) / (1.0 - T);
+        let limited = T + (1.0 - T) * t.tanh();
+        limited.copysign(x)
+    }
 }
 
 fn encode_wav(interleaved: &[f32]) -> Vec<u8> {
@@ -830,7 +859,7 @@ fn encode_wav(interleaved: &[f32]) -> Vec<u8> {
     out.extend_from_slice(&(data_len as u32).to_le_bytes());
     out.reserve(data_len);
     for v in interleaved {
-        let s = v.clamp(-1.0, 1.0);
+        let s = soft_limit(*v);
         out.extend_from_slice(&((s * 32767.0) as i16).to_le_bytes());
     }
     out
