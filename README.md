@@ -110,8 +110,11 @@ if renderer.pending_len() > 0 {
   OutQuint 额外淡出**（"intentionally pile on an extra FadeOut to make
   it happen much faster"），箭头同时收缩至 0.9×）、follow circle
   （2.4x 展开/释放/结束动画 + tick 脉冲）、tick 分数点、折返箭头
-  （白色胶囊 + FontAwesome AngleDoubleRight 双箭头几何：两 chevron
-  边缘相接不重叠、300ms 脉冲、首折返延迟淡入）、滑条头圆。尾部圆在
+  （白色胶囊 + FontAwesome AngleDoubleRight 双箭头：几何量取自框架
+  FontAwesome5 图集（BMFont 字模 74×60 vs 单 chevron 49×81——每个
+  chevron 为单字高的 60/81,中心距 ~6.2u,边缘相接不重叠），颜色
+  `accentColour.Darken(4)`（组合色 ×0.2 的深色调,非纯黑）、300ms
+  脉冲、首折返延迟淡入）、滑条头圆。尾部圆在
   Argon 皮肤中不可见（与 lazer 一致），身体收缩即尾动画。
 - **Spinner**（按 `ArgonSpinnerDisc`/`SpinnerRotationTracker` 源码重写）：
   384u 大圆盘、25 个刻度标记（跟随**真实旋转的毫秒级阻尼**
@@ -125,7 +128,12 @@ if renderer.pending_len() > 0 {
 - **判定**：文字（GREAT/OK/MEH/MISS…，lazer Argon 单词风格、结果色、
   加色混合、miss 下落旋转）、环形爆炸粒子（按结果数量/距离缩放）、
   slider break 小圆点。
-- **Follow points**：间距 32u 的双箭头，渐进滑入 + 淡出。
+- **Follow points**（`ArgonFollowPoint` 逐元素复刻）：间距 32u 的
+  双 chevron——前箭头 `GradientVertical(#FC618F→#BB1A41)` 加色混合,
+  后箭头为其 `Gray(0.2)` 乘入渐变（每通道 ×0.2,近似不可见的深色
+  回声）,中心错开半个 sprite（X=4,Size 8）;chevron 几何按 FA5
+  ChevronRight 真实字模（臂与轴 atan(0.5/0.605)≈40°,轴向深度
+  0.605×字高,描边 48/512×box）。渐进滑入 + 淡出。
 - **光标**：粉渐变环 + 内白环 + 中心点 + 青色辉光，按下弹性放大；
   光标轨迹（加色、(1-age)^4 衰减、300ms 生命）。
 - **HUD**：楔形块、分数/准确率/连击计数器（argon-counter 官方纹理

@@ -1382,14 +1382,17 @@ fn draw_repeat_arrow(
 
     // Dark double chevron (FontAwesome AngleDoubleRight, sprite Size 16):
     // the icon colour is `accentColour.Darken(4)` - a very dark TINT of
-    // the slider's combo colour, not flat black. Each chevron follows the
-    // ChevronRight metrics (glyph height 13.4 at box 16, stroke 48/512 of
-    // the box); the two glyph centres sit ~8 units apart inside the icon.
+    // the slider's combo colour, not flat black. Metrics measured from the
+    // framework's actual FontAwesome5 atlas (BMFont): the double glyph's
+    // ink is 74x60 while ChevronRight's is 49x81, so each chevron in the
+    // pair is 60/81 the single glyph's height (ink height ~9.94 at the
+    // Size-16 box) and the two centres sit ~6.2 units apart - they nearly
+    // touch edge to edge, never a wide gap.
     let unit = s * pulse as f32 * scale as f32;
-    let chev_size = 16.0 * unit;
-    let chev_thickness = 16.0 * 0.094 * unit;
+    let chev_size = 11.85 * unit;
+    let chev_thickness = 11.85 * 0.094 * unit;
     let chev_col = obj.colour.darken(4.0).opacity(alpha as f32);
-    let off = 4.0 * unit;
+    let off = 3.1 * unit;
     let p1 = [pos[0] - cr * off, pos[1] - sr * off];
     let p2 = [pos[0] + cr * off, pos[1] + sr * off];
     draw_chevron(list, p1, rot, chev_size, chev_thickness, chev_col, chev_col, Blend::Alpha);
