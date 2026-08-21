@@ -223,16 +223,10 @@ impl HudState {
         m: &Mapper,
         t: f64,
     ) {
-        // Autoplay (beatmap preview): score/accuracy/combo and the UR bar
-        // are all perfect by construction and say nothing about the
-        // beatmap — hide them, keep the health bar.
+        // Autoplay (beatmap preview): score/accuracy/combo, the UR bar and
+        // the health bar are all perfect by construction and say nothing
+        // about the beatmap — hide the entire HUD.
         if game.autoplay {
-            let health = health_at(game, t);
-            if health < self.last_health - 1e-6 {
-                self.health_flash = Some(t);
-            }
-            self.last_health = health;
-            draw_health(list, m, health, t, self.health_flash);
             return;
         }
 

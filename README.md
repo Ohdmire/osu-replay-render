@@ -18,7 +18,7 @@ osu_replay_render <beatmap.osu> [replay.osr] [options]
 
 | 选项 | 说明 |
 | --- | --- |
-| `--autoplay` | **Autoplay mod**：不输入 .osr,由谱面直接生成回放（本地移植 lazer `OsuAutoGenerator`），作为谱面预览。判定引擎照常判定生成帧（SS/满血/UR 0）；HUD 自动隐藏分数/acc/combo 与 UR 条（血条保留） |
+| `--autoplay` | **Autoplay mod**：不输入 .osr,由谱面直接生成回放（本地移植 lazer `OsuAutoGenerator`），作为谱面预览。判定引擎照常判定生成帧（SS/满血/UR 0）；HUD 整体隐藏（分数/acc/combo/UR 条/血条都不画） |
 | `--out <file.mp4>` | 管道输出到 ffmpeg 编码为 mp4 (h264, crf 18) |
 | `--png-dir <dir>` | 输出 PNG 帧序列到目录 |
 | `--size <WxH>` | 输出分辨率，默认 1920x1080 |
