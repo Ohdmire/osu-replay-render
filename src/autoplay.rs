@@ -127,6 +127,7 @@ impl<'a> AutoGenerator<'a> {
                 position: (f.pos.x, f.pos.y),
                 left: f.action == Some(Action::Left),
                 right: f.action == Some(Action::Right),
+                smoke: false,
             })
             .collect()
     }
