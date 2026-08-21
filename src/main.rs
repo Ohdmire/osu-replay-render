@@ -66,6 +66,16 @@ struct Options {
     /// slider loops, DT/HT pitch) and mix it into the export
     /// (`--hitsounds`).
     hitsounds: bool,
+    /// Hitsound bus gain 0..1 (`--hitsounds-volume`, default 0.6 =
+    /// `VolumeEffect`, see `OsuGame.GetFrameworkConfigDefaults`).
+    hitsounds_volume: f32,
+    /// BGM gain 0..1 (`--bgm-volume`, default 0.6 = `VolumeMusic`).
+    bgm_volume: f32,
+    /// Master gain applied to the final mixed audio 0..1
+    /// (`--master-volume`, default 0.6 = `VolumeUniversal`). The game's
+    /// effective bus gain is channel x master (0.6 x 0.6), so at defaults
+    /// music + hitsounds peak at ~0.72 and essentially never clip.
+    master_volume: f32,
 }
 
 fn parse_args() -> Result<(Options, String, Option<String>), String> {
@@ -101,6 +111,9 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
         audio_offset: None,
         autoplay,
         hitsounds: false,
+        hitsounds_volume: 0.6,
+        bgm_volume: 0.6,
+        master_volume: 0.6,
     };
     let mut i = min_args;
     while i < args.len() {
@@ -209,6 +222,36 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
             }
             "--hitsounds" => {
                 opts.hitsounds = true;
+            }
+            "--master-volume" => {
+                i += 1;
+                opts.master_volume = args
+                    .get(i)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("bad --master-volume (expected 0..1)")?;
+                if !(0.0..=1.0).contains(&opts.master_volume) {
+                    return Err("--master-volume must be within 0..1".into());
+                }
+            }
+            "--hitsounds-volume" => {
+                i += 1;
+                opts.hitsounds_volume = args
+                    .get(i)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("bad --hitsounds-volume (expected 0..1)")?;
+                if !(0.0..=1.0).contains(&opts.hitsounds_volume) {
+                    return Err("--hitsounds-volume must be within 0..1".into());
+                }
+            }
+            "--bgm-volume" => {
+                i += 1;
+                opts.bgm_volume = args
+                    .get(i)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("bad --bgm-volume (expected 0..1)")?;
+                if !(0.0..=1.0).contains(&opts.bgm_volume) {
+                    return Err("--bgm-volume must be within 0..1".into());
+                }
             }
             other => return Err(format!("unknown argument: {}", other)),
         }
@@ -481,7 +524,7 @@ fn main() {
             Ok(content) => {
                 let t0 = frame_times[0];
                 let wall_secs = frame_times.len() as f64 / opts.fps;
-                let wav = hitsound::render_track_wav(&game, &content, t0, wall_secs, game.rate);
+                let wav = hitsound::render_track_wav(&game, &content, t0, wall_secs, game.rate, opts.hitsounds_volume);
                 let p = format!("{}.hits.wav", opts.out.as_ref().unwrap());
                 std::fs::write(&p, wav).unwrap_or_else(|e| panic!("write {}: {}", p, e));
                 eprintln!("hitsounds: {} (ArgonPro samples, {:.1}s)", p, wall_secs);
@@ -691,6 +734,9 @@ fn main() {
                 .arg("-i").arg(&tmp);
             let mut bgm_filters: Vec<String> = Vec::new();
             if let Some(audio) = &audio_path {
+                if (opts.bgm_volume - 1.0).abs() > 1e-6 {
+                    bgm_filters.push(format!("volume={:.4}", opts.bgm_volume));
+                }
                 if (rate - 1.0).abs() > 1e-9 {
                     let sr = probe_sample_rate(audio);
                     bgm_filters.push(format!("asetrate={},aresample={}", (sr as f64 * rate).round() as i64, sr));
@@ -706,6 +752,17 @@ fn main() {
                 }
                 cmd.arg("-i").arg(audio);
             }
+            // Sum stage: plain float summation like the game's BASS mixer
+            // (no limiter, no normalization), followed by the master
+            // volume (`VolumeUniversal`) on the final mix — the game's
+            // chain is per-channel volume x master, i.e. 0.6 x 0.6 at
+            // osu! defaults. Overs clip exactly where the game's DAC
+            // would.
+            let master = if (opts.master_volume - 1.0).abs() > 1e-6 {
+                format!(",volume={:.4}", opts.master_volume)
+            } else {
+                String::new()
+            };
             match (&audio_path, &hits_path) {
                 (Some(_), Some(hits)) => {
                     cmd.arg("-i").arg(hits);
@@ -714,17 +771,24 @@ fn main() {
                     } else {
                         format!("[1:a]{}[bgm];[bgm]", bgm_filters.join(","))
                     };
-                    cmd.arg("-filter_complex").arg(format!("{}amix=inputs=2:normalize=0[aout]", head));
+                    cmd.arg("-filter_complex").arg(format!("{head}amix=inputs=2:normalize=0{master}[aout]"));
                     cmd.arg("-map").arg("0:v").arg("-map").arg("[aout]");
                 }
                 (Some(_), None) => {
-                    if !bgm_filters.is_empty() {
-                        cmd.arg("-af").arg(bgm_filters.join(","));
+                    let mut filters = bgm_filters.clone();
+                    if !master.is_empty() {
+                        filters.push(master.trim_start_matches(',').to_string());
+                    }
+                    if !filters.is_empty() {
+                        cmd.arg("-af").arg(filters.join(","));
                     }
                     cmd.arg("-map").arg("0:v").arg("-map").arg("1:a");
                 }
                 (None, Some(hits)) => {
                     cmd.arg("-i").arg(hits);
+                    if !master.is_empty() {
+                        cmd.arg("-af").arg(master.trim_start_matches(','));
+                    }
                     cmd.arg("-map").arg("0:v").arg("-map").arg("1:a");
                 }
                 (None, None) => unreachable!(),
