@@ -763,6 +763,78 @@ fn place(buf: &mut [f32], clip: &Clip, start_sec: f64, speed: f64, gl: f32, gr: 
 /// level (beatmap volume × the sample's mastering, Effect channel 1.0),
 /// no bus normalization. Stacked hits sum in float and the encoder's
 /// soft limiter replaces the DAC clipping the game would do.
+/// A one-shot hitsound event on the map timeline, for live preview
+/// playback (fire when the playhead crosses `time`).
+#[derive(Clone, Copy, Debug)]
+pub struct HitsoundEvent {
+    /// Map time in ms (judgement time).
+    pub time: f64,
+    /// Sample name: "hitnormal"/"hitwhistle"/"hitfinish"/"hitclap"/
+    /// "slidertick"/"combobreak" (loops are not exposed: ArgonPro mutes
+    /// them).
+    pub name: &'static str,
+    /// Sample bank: "normal"/"soft"/"drum".
+    pub bank: &'static str,
+    /// Beatmap sample volume 0-100 (apply `max(5)` and the Effect
+    /// channel volume on the receiver's side).
+    pub volume: i32,
+    /// Playfield X (0..512) for stereo balance.
+    pub pan_x: f32,
+}
+
+/// All one-shot hitsound events of a replay (sorted by time, loops
+/// excluded). `map_content` is the raw .osu the game data was loaded
+/// from. Volume/bank resolution follows the same lazer semantics as the
+/// offline track.
+pub fn collect_events(game: &GameData, map_content: &str) -> Vec<HitsoundEvent> {
+    let data = parse_sample_data(map_content);
+    let mut events: Vec<HitsoundEvent> = build_placements(game, &data, f64::NEG_INFINITY, f64::INFINITY)
+        .into_iter()
+        .filter(|p| p.until.is_none())
+        .map(|p| HitsoundEvent {
+            time: p.time,
+            name: p.sample.name,
+            bank: p.sample.bank.as_str(),
+            volume: p.sample.volume,
+            pan_x: p.x,
+        })
+        .collect();
+    events.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap());
+    events
+}
+
+/// Embedded skin sample bytes for a (bank, name) pair (ArgonPro set,
+/// combobreak from the Argon set per the lookup chain). PCM WAV, for the
+/// caller's own decoder.
+pub fn sample_bytes(bank: &str, name: &str) -> Option<&'static [u8]> {
+    let bytes: &[u8] = match (bank, name) {
+        ("normal", "hitnormal") => wav!("normal-hitnormal"),
+        ("normal", "hitwhistle") => wav!("normal-hitwhistle"),
+        ("normal", "hitfinish") => wav!("normal-hitfinish"),
+        ("normal", "hitclap") => wav!("normal-hitclap"),
+        ("normal", "slidertick") => wav!("normal-slidertick"),
+        ("normal", "sliderslide") => wav!("normal-sliderslide"),
+        ("normal", "sliderwhistle") => wav!("normal-sliderwhistle"),
+        ("soft", "hitnormal") => wav!("soft-hitnormal"),
+        ("soft", "hitwhistle") => wav!("soft-hitwhistle"),
+        ("soft", "hitfinish") => wav!("soft-hitfinish"),
+        ("soft", "hitclap") => wav!("soft-hitclap"),
+        ("soft", "slidertick") => wav!("soft-slidertick"),
+        ("soft", "sliderslide") => wav!("soft-sliderslide"),
+        ("soft", "sliderwhistle") => wav!("soft-sliderwhistle"),
+        ("drum", "hitnormal") => wav!("drum-hitnormal"),
+        ("drum", "hitwhistle") => wav!("drum-hitwhistle"),
+        ("drum", "hitfinish") => wav!("drum-hitfinish"),
+        ("drum", "hitclap") => wav!("drum-hitclap"),
+        ("drum", "slidertick") => wav!("drum-slidertick"),
+        ("drum", "sliderslide") => wav!("drum-sliderslide"),
+        ("drum", "sliderwhistle") => wav!("drum-sliderwhistle"),
+        (_, "combobreak") => COMBOBREAK,
+        _ => return None,
+    };
+    Some(bytes)
+}
+
 pub fn render_track_wav(game: &GameData, map_content: &str, t0: f64, wall_secs: f64, rate: f64, master_gain: f32) -> Vec<u8> {
     let data = parse_sample_data(map_content);
     let t_map_end = t0 + wall_secs * rate * 1000.0;
