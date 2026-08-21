@@ -650,6 +650,7 @@ dependencies = [
 [[package]]
 name = "osu_replay_judge"
 version = "0.1.0"
+source = "git+https://github.com/Ohdmire/osu-replay-judge.git?branch=master#22d50d96a8e5b9af7adbb3718f1e6c91c0045f84"
 dependencies = [
  "lzma-rs",
 ]
