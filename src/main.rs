@@ -615,7 +615,7 @@ fn main() {
     // clock offset, exactly as before.
     if let Some(audio) = &audio_path {
         if let Some(out) = &opts.out {
-            let audio_start = (frame_times.first().map(|t| *t).unwrap_or(0.0) - opts.audio_offset) / 1000.0;
+            let audio_start = ((frame_times.first().map(|t| *t).unwrap_or(0.0) - opts.audio_offset) / 1000.0).max(0.0);
             let tmp = format!("{}.video.tmp.mp4", out);
             eprintln!("muxing audio: {}", audio);
             let status = std::process::Command::new("ffmpeg")
