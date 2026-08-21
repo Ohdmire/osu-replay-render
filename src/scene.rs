@@ -1380,19 +1380,20 @@ fn draw_repeat_arrow(
         Blend::Alpha,
     );
 
-    // Black double chevron (FontAwesome AngleDoubleRight, Size 16): the
-    // glyph is ONE icon containing both chevrons - each spans ~5.7 of the
-    // 16-unit box axially with their centres ~5.6 units apart, so the two
-    // marks sit edge to edge, never overlapping.
+    // Dark double chevron (FontAwesome AngleDoubleRight, sprite Size 16):
+    // the icon colour is `accentColour.Darken(4)` - a very dark TINT of
+    // the slider's combo colour, not flat black. Each chevron follows the
+    // ChevronRight metrics (glyph height 13.4 at box 16, stroke 48/512 of
+    // the box); the two glyph centres sit ~8 units apart inside the icon.
     let unit = s * pulse as f32 * scale as f32;
-    let chev_size = 10.0 * unit;
-    let chev_thickness = 2.2 * unit;
-    let black = Colour::BLACK.opacity(alpha as f32);
-    let off = 4.8 * unit;
+    let chev_size = 16.0 * unit;
+    let chev_thickness = 16.0 * 0.094 * unit;
+    let chev_col = obj.colour.darken(4.0).opacity(alpha as f32);
+    let off = 4.0 * unit;
     let p1 = [pos[0] - cr * off, pos[1] - sr * off];
     let p2 = [pos[0] + cr * off, pos[1] + sr * off];
-    draw_chevron(list, p1, rot, chev_size, chev_thickness, black, black, Blend::Alpha);
-    draw_chevron(list, p2, rot, chev_size, chev_thickness, black, black, Blend::Alpha);
+    draw_chevron(list, p1, rot, chev_size, chev_thickness, chev_col, chev_col, Blend::Alpha);
+    draw_chevron(list, p2, rot, chev_size, chev_thickness, chev_col, chev_col, Blend::Alpha);
 }
 
 /// Screen-space body geometry for a slider at time `t`: (sub-path points,
@@ -1795,13 +1796,17 @@ pub fn draw_chevron(
     bottom: Colour,
     blend: Blend,
 ) {
+    // FontAwesome `ChevronRight` metrics (viewBox 320x512, path-derived):
+    // glyph height 429.4/512 of the sprite box, axial depth 0.605 of the
+    // height (arms at atan(0.5/0.605) = 39.6 deg from the axis - the outer
+    // edges are exactly 45 deg), stroke 48/512 of the box, rounded tip.
     let (sr, cr) = rotation_deg.to_radians().sin_cos();
-    let half = size * 0.5;
-    let back = half * 0.85;
-    let open = half * 0.85; // +/-~45 degrees (FontAwesome-style)
-    let tip = [pos[0] + cr * half, pos[1] + sr * half];
-    let top_end = [pos[0] + cr * -back + sr * -open, pos[1] + sr * -back + cr * open];
-    let bottom_end = [pos[0] + cr * -back + sr * open, pos[1] + sr * -back - cr * open];
+    let h = size * (429.4 / 512.0);
+    let axial = h * 0.3025; // half of the 0.605H depth
+    let half_h = h * 0.5;
+    let tip = [pos[0] + cr * axial, pos[1] + sr * axial];
+    let top_end = [pos[0] - cr * axial - sr * half_h, pos[1] - sr * axial + cr * half_h];
+    let bottom_end = [pos[0] - cr * axial + sr * half_h, pos[1] - sr * axial - cr * half_h];
     list.capsule_gradient(top_end, tip, thickness, top, bottom, blend);
     list.capsule_gradient(tip, bottom_end, thickness, top, bottom, blend);
 }
@@ -1872,13 +1877,12 @@ fn draw_follow_points(game: &GameData, m: &Mapper, list: &mut DrawList, t: f64) 
                     // ArgonFollowPoint: GradientVertical FC618F -> BB1A41 on
                     // the rotated drawable; the shadow chevron's explicit
                     // Gray(0.2) MULTIPLIES into the inherited gradient
-                    // (ColourInfo.ApplyChild), so it renders as a ~56%-pink
-                    // echo (Darken(0.8) = 1/1.8), not flat gray. Additive
-                    // blending.
+                    // (ColourInfo.ApplyChild) = 20% of each channel, which
+                    // is exactly `darken(4.0)` (1/(1+4)). Additive blending.
                     let top = Colour::from_hex(0xFC618F).opacity(alpha as f32);
                     let bottom = Colour::from_hex(0xBB1A41).opacity(alpha as f32);
-                    let shadow_top = top.darken(0.8);
-                    let shadow_bottom = bottom.darken(0.8);
+                    let shadow_top = top.darken(4.0);
+                    let shadow_bottom = bottom.darken(4.0);
                     let (sr, cr) = rotation.to_radians().sin_cos();
                     let off = size * 0.5;
                     let p2 = [sp[0] + cr * off, sp[1] + sr * off];
