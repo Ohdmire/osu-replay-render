@@ -210,6 +210,11 @@ impl HudState {
         self.classic_score = true;
     }
 
+    /// 实时预览用:双向切换经典分/standardised 计分显示。
+    pub fn set_classic_score(&mut self, enabled: bool) {
+        self.classic_score = enabled;
+    }
+
     pub fn draw(
         &mut self,
         game: &GameData,
@@ -218,6 +223,19 @@ impl HudState {
         m: &Mapper,
         t: f64,
     ) {
+        // Autoplay (beatmap preview): score/accuracy/combo and the UR bar
+        // are all perfect by construction and say nothing about the
+        // beatmap — hide them, keep the health bar.
+        if game.autoplay {
+            let health = health_at(game, t);
+            if health < self.last_health - 1e-6 {
+                self.health_flash = Some(t);
+            }
+            self.last_health = health;
+            draw_health(list, m, health, t, self.health_flash);
+            return;
+        }
+
         // Latest score state at/before t (full judgement timeline).
         let mut score = 0i64;
         let mut combo = 0i32;

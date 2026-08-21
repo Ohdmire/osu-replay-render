@@ -5,8 +5,10 @@ osu!lazer 的 **Argon** 默认皮肤。判定与游戏状态来自
 [osu-replay-judge](../osu-replay-judge)(逐事件与 lazer 全等的判定模拟器)。
 支持两种使用方式:CLI 离屏渲染出视频/PNG;作为库嵌入其他程序做
 **实时预览**——离屏读回(`Renderer::render_deferred` + `read_oldest_into`)
-跨平台,由宿主把 RGBA 帧送到自己的展示层(如 OPP 的 canvas);Windows
-下另有可选的 `SurfaceRenderer` 窗口直渲。
+跨平台,由宿主把 RGBA 帧送到自己的展示层;Windows 下另有
+`SurfaceRenderer` 窗口直渲(`#[cfg(windows)]`,零拷贝 present,高帧率)。
+OPP 两者都用:Windows 走 `SurfaceRenderer` 原生直渲(创建失败自动回退
+canvas),其他平台走离屏读回 + canvas。
 
 ## 用法
 
@@ -16,7 +18,7 @@ osu_replay_render <beatmap.osu> [replay.osr] [options]
 
 | 选项 | 说明 |
 | --- | --- |
-| `--autoplay` | **Autoplay mod**：不输入 .osr,由谱面直接生成回放（本地移植 lazer `OsuAutoGenerator`），作为谱面预览。判定引擎照常判定生成帧（SS/满血/UR 0） |
+| `--autoplay` | **Autoplay mod**：不输入 .osr,由谱面直接生成回放（本地移植 lazer `OsuAutoGenerator`），作为谱面预览。判定引擎照常判定生成帧（SS/满血/UR 0）；HUD 自动隐藏分数/acc/combo 与 UR 条（血条保留） |
 | `--out <file.mp4>` | 管道输出到 ffmpeg 编码为 mp4 (h264, crf 18) |
 | `--png-dir <dir>` | 输出 PNG 帧序列到目录 |
 | `--size <WxH>` | 输出分辨率，默认 1920x1080 |
