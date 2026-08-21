@@ -627,6 +627,12 @@ fn main() {
                 .arg("-map").arg("0:v")
                 .arg("-map").arg("1:a")
                 .arg("-c:v").arg("copy")
+                // Pin the video track timescale to the fps so each frame is
+                // exactly one tick and the container reports avg_frame_rate
+                // 60/1; a source with microsecond timestamps (e.g. the
+                // raw-h264 demuxer rounds 1/60s to 16667us) would otherwise
+                // yield 1000000/16667 (~59.9988).
+                .arg("-video_track_timescale").arg(opts.fps.round().max(1.0).to_string())
                 .arg("-c:a").arg("aac").arg("-b:a").arg("192k")
                 .arg("-shortest")
                 .arg("-movflags").arg("+faststart")
