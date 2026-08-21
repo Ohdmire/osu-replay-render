@@ -204,6 +204,8 @@ pub struct SceneState {
     pub mapper: Mapper,
     /// Beatmap background opacity (`--bg`); None draws no background.
     pub bg_opacity: Option<f32>,
+    /// 物件之间的引导线(follow points);默认开,实时预览可关。
+    pub follow_points: bool,
     cursor_expand: f64,
     cursor_anim: Option<(f64, f64, f64, f64, Easing)>,
     was_pressed: bool,
@@ -220,6 +222,7 @@ impl SceneState {
             pro_skin: false,
             mapper: Mapper::new(width, height),
             bg_opacity: None,
+            follow_points: true,
             cursor_expand: 1.0,
             cursor_anim: None,
             was_pressed: false,
@@ -296,7 +299,9 @@ impl SceneState {
         }
 
         // 2. Follow points.
-        draw_follow_points(game, &self.mapper, list, t);
+        if self.follow_points {
+            draw_follow_points(game, &self.mapper, list, t);
+        }
 
         // 3. Judgement explosions (under objects).
         for ev in &game.events {
