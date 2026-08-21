@@ -262,6 +262,10 @@ pub struct GameData {
     pub final_classic_score: i64,
     pub final_max_combo: i32,
     pub final_accuracy: f64,
+    /// Autoplay mod (beatmap preview): hide the score/accuracy/combo
+    /// counters and the UR bar — the numbers are all perfect and carry no
+    /// information about the beatmap.
+    pub autoplay: bool,
 }
 
 pub fn load(map_path: &str, replay_path: &str) -> Result<GameData, String> {
@@ -305,8 +309,10 @@ pub fn load_autoplay(map_path: &str) -> Result<GameData, String> {
     engine.run(&frames);
 
     let mut data = build(mods, classic, map.combo_colours, &engine, hp)?;
-    // lazer's autoplay attribution.
+    // lazer's autoplay attribution; HUD counters stay hidden (see
+    // GameData::autoplay).
     data.player = "osu!".to_string();
+    data.autoplay = true;
     Ok(data)
 }
 
@@ -579,6 +585,7 @@ fn build(
         final_classic_score: engine.score.classic_display_score(),
         final_max_combo: engine.score.highest_combo,
         final_accuracy: engine.score.accuracy(),
+        autoplay: false,
     })
 }
 
