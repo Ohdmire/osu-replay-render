@@ -696,8 +696,8 @@ fn compute_drain_rate(increases: &[(f64, f64)], drain_start: f64, hp: f32) -> f6
             break;
         }
 
-        adjustment *= 2;
-        if adjustment <= 0 {
+        adjustment = adjustment.saturating_mul(2);
+        if adjustment <= 0 || adjustment > 1 << 40 {
             break;
         }
         result += 1.0 / adjustment as f64 * (lowest_health - target).signum();
