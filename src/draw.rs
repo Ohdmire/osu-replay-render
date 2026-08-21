@@ -855,6 +855,35 @@ impl TtfFont {
 }
 
 /// Draws a string with a TTF font, centred at `center`.
+/// Measures a string with the same glyph classes `draw_ttf_text` rasterises
+/// at: `(advance width, ink top, ink bottom)` in scaled pixels. The ink
+/// extents are relative to the baseline, top negative.
+pub fn ttf_measure(font: &TtfFont, text: &str, size_px: f32, spacing: f32) -> (f32, f32, f32) {
+    let em = TtfFont::class_for(size_px);
+    let scale = size_px / em as f32;
+    let mut width = 0.0f32;
+    let mut top = f32::MAX;
+    let mut bottom = f32::MIN;
+    let mut n = 0;
+    for c in text.chars() {
+        if let Some(g) = font.glyphs.get(&(c, em)) {
+            width += g.advance * scale + spacing;
+            top = top.min(g.yoff);
+            bottom = bottom.max(g.yoff + g.h);
+            n += 1;
+        }
+    }
+    if n > 0 {
+        width -= spacing;
+    }
+    if top == f32::MAX {
+        let (_, descent100) = font.metrics;
+        (width, 0.0, descent100 * em as f32 / 100.0 * scale)
+    } else {
+        (width, top * scale, bottom * scale)
+    }
+}
+
 pub fn draw_ttf_text(
     list: &mut DrawList,
     atlas: &Atlas,

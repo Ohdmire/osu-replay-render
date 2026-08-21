@@ -15,6 +15,7 @@
 //!   --start <ms>           Start time in replay ms (default: beginning)
 //!   --end <ms>             End time in replay ms (default: end)
 //!   --score classic        Show classic (stable-style) score
+//!   --audio-offset <ms>    BGM alignment offset (default 0)
 //!   --limit <n>            Render at most n frames (testing)
 
 use osu_replay_render::{build_atlas, decode_image_file, draw, draw::Image, game, osu_background_file, osu_general_value, render::Renderer, scene};
@@ -50,13 +51,9 @@ struct Options {
     bg: bool,
     /// Background opacity 0..1 (lazer: 1 - DimLevel, default DimLevel 0.7).
     bg_opacity: f32,
-    /// Total lazer audio offset in ms subtracted from replay time to get
-    /// the audio file position. The gameplay clock ADDS the platform
-    /// offset (Windows non-experimental +15, `WINDOWS_BASE_AUDIO_OFFSET`),
-    /// `OsuSetting.AudioOffset` and the per-beatmap offset to the track
-    /// position (FramedBeatmapClock's OffsetCorrectionClock chain), so
-    /// audio_pos = replay_time - total_offset.
-    audio_offset: f64,
+    /// Optional manual audio offset in ms (audio file position =
+    /// replay_time - offset). Default 0; `--audio-offset` overrides.
+    audio_offset: Option<f64>,
     /// Autoplay mod: generate the replay from the beatmap itself (lazer
     /// `OsuAutoGenerator` port) instead of reading an .osr — beatmap
     /// preview without a replay file.
@@ -70,7 +67,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
     let autoplay = args.iter().any(|a| a == "--autoplay");
     let min_args = if autoplay { 2 } else { 3 };
     if args.len() < min_args {
-        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro] [--no-guides] [--audio [file.mp3]] [--bg] [--bg-opacity 0..1] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
+        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro] [--no-guides] [--audio [file.mp3]] [--audio-offset ms] [--bg] [--bg-opacity 0..1] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
     }
     let map_path = args[1].clone();
     let replay_path = if autoplay { None } else { Some(args[2].clone()) };
@@ -93,7 +90,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
         audio: None,
         bg: false,
         bg_opacity: 0.3,
-        audio_offset: 15.0,
+        audio_offset: None,
         autoplay,
     };
     let mut i = min_args;
@@ -192,10 +189,11 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
             }
             "--audio-offset" => {
                 i += 1;
-                opts.audio_offset = args
-                    .get(i)
-                    .and_then(|v| v.parse().ok())
-                    .ok_or("bad --audio-offset (expected milliseconds)")?;
+                opts.audio_offset = Some(
+                    args.get(i)
+                        .and_then(|v| v.parse().ok())
+                        .ok_or("bad --audio-offset (expected milliseconds)")?,
+                );
             }
             "--autoplay" => {
                 opts.autoplay = true;
@@ -308,6 +306,18 @@ impl Output {
 
 /// Bound of the frame queue to the ffmpeg writer thread (frames).
 const WRITER_QUEUE: usize = 3;
+
+/// First audio stream's sample rate (Hz), for the rate-mod `asetrate`
+/// speed-up. Falls back to 44100 when ffprobe is missing or fails.
+fn probe_sample_rate(path: &str) -> u32 {
+    std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=sample_rate", "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+        .unwrap_or(44_100)
+}
 
 fn main() {
     let (opts, map_path, replay_path) = match parse_args() {
@@ -610,20 +620,48 @@ fn main() {
     }
         output.finish();
 
-    // Second pass: mux the BGM into the video (stream copy + AAC). The
-    // audio is seeked to the first frame's replay time minus the lazer
-    // clock offset, exactly as before.
+    // Second pass: mux the BGM into the video (stream copy + AAC).
+    // Audio file position = replay_time - offset*rate (offset is a
+    // wall-time ms value, multiplied by the gameplay rate like lazer's
+    // OffsetCorrectionClock). When that position is negative the replay
+    // clock has not reached the track start yet — lazer holds the track
+    // stopped and starts it once the file position crosses 0, reproduced
+    // here by delaying the audio with leading silence (adelay) instead of
+    // clamping the seek to 0 (the clamp started the music |t0| early and
+    // silently disabled the offset for renders starting at t=0). Rate
+    // mods (DT/NC 1.5, HT 0.75) resample the track — pitch and tempo
+    // scale together, like lazer's Track rate adjustment.
     if let Some(audio) = &audio_path {
         if let Some(out) = &opts.out {
-            let audio_start = ((frame_times.first().map(|t| *t).unwrap_or(0.0) - opts.audio_offset) / 1000.0).max(0.0);
+            let offset = opts.audio_offset.unwrap_or(0.0);
+            let rate = game.rate;
+            let t0 = frame_times.first().map(|t| *t).unwrap_or(0.0);
+            let seek_ms = t0 - offset * rate;
             let tmp = format!("{}.video.tmp.mp4", out);
-            eprintln!("muxing audio: {}", audio);
-            let status = std::process::Command::new("ffmpeg")
-                .arg("-y")
+            eprintln!("muxing audio: {} (offset {}ms, rate {}, file start {}ms)", audio, offset, rate, seek_ms.max(0.0));
+            let mut cmd = std::process::Command::new("ffmpeg");
+            cmd.arg("-y")
                 .arg("-v").arg("error")
-                .arg("-i").arg(&tmp)
-                .arg("-ss").arg(format!("{:.3}", audio_start))
-                .arg("-i").arg(audio)
+                .arg("-i").arg(&tmp);
+            let mut filters: Vec<String> = Vec::new();
+            if (rate - 1.0).abs() > 1e-9 {
+                let sr = probe_sample_rate(audio);
+                filters.push(format!("asetrate={},aresample={}", (sr as f64 * rate).round() as i64, sr));
+            }
+            if seek_ms >= 0.0 {
+                cmd.arg("-ss").arg(format!("{:.3}", seek_ms / 1000.0));
+            } else {
+                // Negative file position: pad silence so the music begins
+                // exactly when the replay clock reaches the offset. adelay
+                // runs after the speed filter, i.e. in the output (wall)
+                // timeline: ms = -seek/rate.
+                filters.push(format!("adelay={}:all=1", (-seek_ms / rate).round() as i64));
+            }
+            cmd.arg("-i").arg(audio);
+            if !filters.is_empty() {
+                cmd.arg("-af").arg(filters.join(","));
+            }
+            let status = cmd
                 .arg("-map").arg("0:v")
                 .arg("-map").arg("1:a")
                 .arg("-c:v").arg("copy")

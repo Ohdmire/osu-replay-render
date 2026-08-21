@@ -29,8 +29,8 @@ osu_replay_render <beatmap.osu> [replay.osr] [options]
 | `--encoder <auto\|x264\|x265\|nvenc>` | 视频编码器：默认 `auto`（探测 NVENC 可用则用之，否则回退 x264）；NVENC 硬件编码（bgr0 直喂 + p5/hq/vbr/cq，**端到端约比 x264 快 1.7×、比 x265 快 3.2×**）；libx264 / libx265（preset medium + crf） |
 | `--quality <n>` | crf（软件）/ cq（nvenc），默认 18 |
 | `--no-guides` | 关闭 UR 条的窗口引导线（判定色色轴），默认开启渲染 |
-| `--audio [file]` | 输出混入 BGM（AAC 192k）：带路径用指定文件；不带值自动取谱面 `[General] AudioFilename`（相对谱面目录）。音频位置按 lazer 时钟链换算：音频位置 = 回放时间 − 总偏移 |
-| `--audio-offset <ms>` | BGM 对齐偏移，默认 **+15**（lazer Windows 平台偏移 `WINDOWS_BASE_AUDIO_OFFSET`；若你在游戏里开了实验性 WASAPI 或设了 AudioOffset/谱面偏移，把三项之和填进来） |
+| `--audio [file]` | 输出混入 BGM（AAC 192k）：带路径用指定文件；不带值自动取谱面 `[General] AudioFilename`（相对谱面目录）。音频位置 = 回放时间 − 偏移；负的起始位置用前置静音（adelay）补齐（复刻 lazer 负时间不播歌的行为）。DT/NC/HT 自动 `asetrate` 变速变调 |
+| `--audio-offset <ms>` | BGM 对齐偏移，默认 **0**；需要时手动传入（内部按 lazer 语义 ×rate） |
 | `--bg` | 绘制谱面背景图（`[Events]` 的 `0,0,"..."`，相对谱面目录，PNG/JPEG），全屏铺满 |
 | `--bg-opacity <0..1>` | 背景不透明度，默认 **0.3** = 1 − DimLevel（lazer `OsuSetting.DimLevel` 默认 0.7，与游戏内"背景暗度"语义一致） |
 | `--limit <n>` | 最多渲染 n 帧（测试用） |

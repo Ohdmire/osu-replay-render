@@ -239,6 +239,20 @@ pub struct UrEvent {
     pub mean: f64,
 }
 
+/// Cumulative key-tap counts after each press edge, for the key overlay
+/// (lazer `InputCountController`: one count per `Activate`, i.e. per rising
+/// edge). Index order matches `KEY_ACTIONS`: Z (K1), X (K2), C (smoke).
+#[derive(Clone, Copy)]
+pub struct KeyCountEvent {
+    pub time: f64,
+    /// Cumulative counts [z, x, c] after the edge at `time`.
+    pub counts: [u32; 3],
+}
+
+/// Keys shown in the key overlay, in display order. osu! default bindings:
+/// Z = K1 (left), X = K2 (right), C = smoke.
+pub const KEY_ACTIONS: [&str; 3] = ["Z", "X", "C"];
+
 pub struct GameData {
     pub score_events: Vec<ScoreEvent>,
     /// Timed hits for the unstable-rate bar (UR-relevant events only).
@@ -257,6 +271,8 @@ pub struct GameData {
     pub health_increases: Vec<(f64, f64)>,
     /// Spinner bonus ticks: (object index, time, large_bonus).
     pub spinner_ticks: Vec<(usize, f64, bool)>,
+    /// Key-tap count timeline for the key overlay (rising edges only).
+    pub key_events: Vec<KeyCountEvent>,
     pub player: String,
     pub final_score: i64,
     pub final_classic_score: i64,
@@ -283,6 +299,7 @@ fn with_lead_in(mut snapshots: Vec<FrameSnap>) -> Vec<FrameSnap> {
                 cursor: first.cursor,
                 left: false,
                 right: false,
+                smoke: false,
                 sliders: Vec::new(),
                 spinners: Vec::new(),
             });
@@ -591,6 +608,26 @@ fn build(
     let drain_end = objects.last().map(|o| o.end_time).unwrap_or(0.0);
     let drain_rate = compute_drain_rate(&health_increases, drain_start, hp);
 
+    // Key overlay counts: rising edges of [left, right, smoke] across the
+    // visual snapshots (the stream the overlay itself displays).
+    let mut key_events: Vec<KeyCountEvent> = Vec::new();
+    {
+        let mut counts = [0u32; 3];
+        let mut prev = [false; 3];
+        for s in &engine.snapshots {
+            let cur = [s.left, s.right, s.smoke];
+            for k in 0..3 {
+                if cur[k] && !prev[k] {
+                    counts[k] += 1;
+                }
+            }
+            if cur != prev {
+                key_events.push(KeyCountEvent { time: s.time, counts });
+                prev = cur;
+            }
+        }
+    }
+
     Ok(GameData {
         score_events,
         ur_events,
@@ -606,6 +643,7 @@ fn build(
         drain_end,
         health_increases,
         spinner_ticks,
+        key_events,
         player: String::new(),
         final_score: engine.score.total_score(),
         final_classic_score: engine.score.classic_display_score(),
@@ -699,6 +737,23 @@ pub fn snapshot_at(game: &GameData, t: f64) -> FrameSnap {
     }
     snap.time = t;
     snap
+}
+
+/// Key overlay states at time `t`: [z, x, c], taken from the last snapshot
+/// at or before `t` (same rule as `snapshot_at`'s button state).
+pub fn key_state_at(game: &GameData, t: f64) -> [bool; 3] {
+    let snaps = &game.snapshots;
+    let idx = snaps.partition_point(|s| s.time <= t).saturating_sub(1);
+    match snaps.get(idx) {
+        Some(s) => [s.left, s.right, s.smoke],
+        None => [false, false, false],
+    }
+}
+
+/// Cumulative key-tap counts at time `t` (lazer `ActivationCount`).
+pub fn key_counts_at(game: &GameData, t: f64) -> [u32; 3] {
+    let n = game.key_events.partition_point(|e| e.time <= t);
+    if n == 0 { [0, 0, 0] } else { game.key_events[n - 1].counts }
 }
 
 /// Health at time `t` (no fail).

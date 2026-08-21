@@ -1,8 +1,8 @@
 //! Argon HUD: wedge pieces, score/accuracy/combo counters (argon-counter
 //! texture digits with wireframes), health bar, and rolling counter logic.
 
-use crate::draw::{draw_ttf_text, value_at, Blend, Colour, DrawList, Easing, Region};
-use crate::game::{health_at, GameData};
+use crate::draw::{draw_ttf_text, ttf_measure, value_at, Blend, Colour, DrawList, Easing, Region};
+use crate::game::{health_at, key_counts_at, key_state_at, GameData, KEY_ACTIONS};
 use crate::scene::{colour_for_result, draw_chevron, Assets, Mapper};
 
 const WEDGE_COLOUR: u32 = 0x66CCFF;
@@ -158,6 +158,21 @@ impl<'a> CounterDraw<'a> {
     }
 }
 
+/// Per-key overlay animation state: tracks press/release edges so the
+/// indicator slide and name-colour fades can run from the right moment.
+struct KeyAnim {
+    pressed: bool,
+    press_t: f64,
+    release_t: f64,
+}
+
+impl KeyAnim {
+    fn new() -> KeyAnim {
+        // Finite far-past: value_at clamps to the eased end value.
+        KeyAnim { pressed: false, press_t: -1e12, release_t: -1e12 }
+    }
+}
+
 pub struct HudState {
     score: Rolling,
     acc: Rolling,
@@ -185,6 +200,10 @@ pub struct HudState {
     /// Whether the UR bar's window guide lines (colour axis) render
     /// (only visible when `ur_bar` is on).
     pub ur_guides: bool,
+    /// Key overlay (Z/X/C tap display, lazer `ArgonKeyCounterDisplay`).
+    pub key_overlay: bool,
+    /// Press/release animation state per key (order matches KEY_ACTIONS).
+    keys: [KeyAnim; 3],
 }
 
 impl HudState {
@@ -207,6 +226,8 @@ impl HudState {
             ur_processed: 0,
             ur_bar: true,
             ur_guides: true,
+            key_overlay: true,
+            keys: [KeyAnim::new(), KeyAnim::new(), KeyAnim::new()],
         }
     }
 
@@ -329,7 +350,10 @@ impl HudState {
         if combo > 0 {
             let combo_cd = CounterDraw { atlas: assets.atlas, digit_h: 25.0 * 1.3 * m.virt };
             let base = m.virt([36.0, 768.0 - 66.0]);
-            let cy = base[1] - 26.0 * 1.3 * m.virt;
+            // ArgonSkin.cs: combo 组件 BottomLeft + Position(36, -66),数字贴
+            // 组件盒底(240 贴图盒的 ink 底边距 ~31/240,scale 1.3 后数字 ink
+            // 底 ≈ -66 线上方 ~7 单位) —— 即与 key overlay 数字同一水平线。
+            let cy = base[1] - 18.0 * 1.3 * m.virt;
             let text = format!("{}x", self.combo_display.round() as i64);
             let flash = self.was_miss && t < self.last_combo_time + 800.0;
             let col = if flash {
@@ -355,6 +379,126 @@ impl HudState {
         // --- Unstable rate bar (skin style, bottom centre) ------------------------
         if self.ur_bar {
             self.draw_ur_bar(game, assets, list, m, t);
+        }
+
+        // --- Key overlay (Z/X/C tap display) ---------------------------------------
+        if self.key_overlay && std::env::var("NO_KEYS").is_err() {
+            self.draw_key_overlay(game, assets, list, m, t);
+        }
+    }
+
+    /// `ArgonKeyCounterDisplay` port: a horizontal row of key counters at
+    /// the bottom-right of the screen, laid out per `ArgonSkin.cs` (Argon-Pro
+    /// inherits it): BottomRight anchor, Position (-36, -66) — right margin
+    /// 36 (hit_error_offset_width 26 + padding 10), bottom edge 66 above the
+    /// screen bottom (padding*2 + song progress height), i.e. the SAME
+    /// horizontal line as the combo counter (also -66).
+    /// Each `ArgonKeyCounter` box is 52.5 x 45 (35/30 Figma units * the 1.5 eyeballed scale factor) showing
+    /// the key letter (Torus Bold 15, `OsuColour.Blue0`), the cumulative
+    /// press count (Torus Bold 21) and a top indicator line (4.5 tall, alpha
+    /// 0.5 idle) that brightens over 10ms and slides down 4 units over 60ms
+    /// OutQuint while held, easing back over 250ms OutQuart on release.
+    fn draw_key_overlay(&mut self, game: &GameData, assets: &Assets, list: &mut DrawList, m: &Mapper, t: f64) {
+        const COUNTER_W: f32 = 52.5;
+        const COUNTER_H: f32 = 45.0;
+        const SPACING: f32 = 2.0;
+        const LINE_H: f32 = 4.5;
+        const PRESS_OFFSET: f32 = 4.0;
+        const NAME_SIZE: f32 = 15.0;
+        const COUNT_SIZE: f32 = 21.0;
+
+        let state = key_state_at(game, t);
+        let counts = key_counts_at(game, t);
+        let blue0 = Colour::from_hex(0x99DDFF);
+
+        let total_w = 3.0 * COUNTER_W + 2.0 * SPACING;
+        // ArgonSkin.cs 布局: BottomRight + Position(-(hit_error_offset_width
+        // + padding), -(padding*2 + song_progress_offset_height)) = (-36, -66)
+        // —— 右边距 36,底边与 combo 同一水平线(combo 也是 -66)。
+        let x1 = m.virt([1024.0 - 36.0, 0.0])[0];
+        let y1 = m.virt([0.0, 768.0 - 66.0])[1];
+        let x0 = x1 - total_w * m.virt;
+        let y0 = y1 - COUNTER_H * m.virt;
+
+        for k in 0..3 {
+            let anim = &mut self.keys[k];
+            if state[k] != anim.pressed {
+                if state[k] {
+                    anim.press_t = t;
+                } else {
+                    anim.release_t = t;
+                }
+                anim.pressed = state[k];
+            }
+
+            let cx0 = x0 + (k as f32 * (COUNTER_W + SPACING)) * m.virt;
+
+            // Indicator line: brighten + slide down while held, ease back
+            // on release.
+            let (alpha, y_off) = if anim.pressed {
+                (
+                    value_at(t, anim.press_t, anim.press_t + 10.0, 0.5, 1.0, Easing::OutQuint),
+                    value_at(t, anim.press_t, anim.press_t + 60.0, 0.0, 1.0, Easing::OutQuint),
+                )
+            } else {
+                (
+                    value_at(t, anim.release_t, anim.release_t + 250.0, 1.0, 0.5, Easing::OutQuart),
+                    value_at(t, anim.release_t, anim.release_t + 250.0, 1.0, 0.0, Easing::OutQuart),
+                )
+            };
+            let r = LINE_H * 0.5 * m.virt;
+            let cy = y0 + r + y_off as f32 * m.virt;
+            list.capsule(
+                [cx0 + r, cy],
+                [cx0 + COUNTER_W * m.virt - r, cy],
+                r,
+                Colour::WHITE.opacity(alpha as f32),
+                Blend::Alpha,
+            );
+
+            // Key name: Blue0 -> white over 10ms on press, back over 200ms.
+            let f = if anim.pressed {
+                value_at(t, anim.press_t, anim.press_t + 10.0, 0.0, 1.0, Easing::OutQuint)
+            } else {
+                value_at(t, anim.release_t, anim.release_t + 200.0, 1.0, 0.0, Easing::OutQuart)
+            };
+            let col = Colour::lerp(blue0, Colour::WHITE, f as f32);
+            let size = NAME_SIZE * m.virt;
+            let (w, top, bottom) = ttf_measure(assets.bold, KEY_ACTIONS[k], size, 0.0);
+            let ink_top = y0 + (LINE_H + PRESS_OFFSET) * m.virt;
+            draw_ttf_text(
+                list,
+                assets.atlas,
+                assets.bold,
+                true,
+                KEY_ACTIONS[k],
+                [cx0 + w * 0.5, ink_top + (bottom - top) * 0.5],
+                size,
+                col,
+                0.0,
+                Blend::Alpha,
+            );
+
+            // Cumulative press count, bottom-left of the box: lazer anchors
+            // the TEXT LAYOUT bottom at the box bottom (countText
+            // BottomLeft), so the digit ink sits a font-descent (~5.5 units
+            // at Torus 21) above it — the same line the combo digits end on.
+            let text = format!("{}", counts[k]);
+            let size = COUNT_SIZE * m.virt;
+            let (w, top, bottom) = ttf_measure(assets.bold, &text, size, 0.0);
+            let ink_bottom = y0 + COUNTER_H * m.virt - 5.5 * m.virt;
+            draw_ttf_text(
+                list,
+                assets.atlas,
+                assets.bold,
+                true,
+                &text,
+                [cx0 + w * 0.5, ink_bottom - (bottom - top) * 0.5],
+                size,
+                Colour::WHITE,
+                0.0,
+                Blend::Alpha,
+            );
         }
     }
 
