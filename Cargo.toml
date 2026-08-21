@@ -2,6 +2,7 @@
 name = "osu_replay_render"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 osu_replay_judge = { path = "../osu-replay-judge" }

@@ -260,3 +260,7 @@ UR、光标轨迹、按键显示全部走既有回放路径,无需 .osr 文件�
 - 实际嵌入示例：[OPP](../OPP) 的 `src-tauri/src/live_render.rs`
   （Tauri 原生子窗口 + 播放线程 + seek/play/pause 命令,前端配合
   DOM 位置上报与可拖动进度条）。
+
+## 许可
+
+[MIT](LICENSE)
