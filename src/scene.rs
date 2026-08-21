@@ -347,7 +347,18 @@ impl SceneState {
     }
 
     fn update_trail(&mut self, cursor: [f32; 2], t: f64) {
-        let last_pos = self.trail.last().map(|p| p.pos);
+        // 时间不连续(实时预览的 seek 跳变,含回退):拖尾是光标运动的
+        // 时间连续性产物,跳变时旧轨迹整体作废且不做插值。否则回退后
+        // 旧点年龄为负、永不 retire 且 draw 端 clamp 成全亮;前进大跳
+        // 会在相距很远的两位置间插出一条贯穿屏幕的长尾,越拖越多。
+        let jumped = self
+            .trail
+            .last()
+            .map_or(true, |p| (t - p.time).abs() > TRAIL_DURATION);
+        if jumped {
+            self.trail.clear();
+        }
+        let last_pos = if jumped { None } else { self.trail.last().map(|p| p.pos) };
         if let Some(last) = last_pos {
             let dx = cursor[0] - last[0];
             let dy = cursor[1] - last[1];
@@ -367,7 +378,7 @@ impl SceneState {
         } else {
             self.trail.push(TrailPart { pos: cursor, time: t });
         }
-        self.trail.retain(|p| t - p.time < TRAIL_DURATION);
+        self.trail.retain(|p| (t - p.time).abs() < TRAIL_DURATION);
     }
 
     fn draw_trail(&mut self, list: &mut DrawList) {

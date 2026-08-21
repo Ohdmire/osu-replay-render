@@ -81,6 +81,8 @@ impl SurfaceRenderer {
                 std::num::NonZeroIsize::new(hwnd).ok_or("invalid hwnd")?,
             ),
         );
+        // 单一 Instance:surface 与 adapter 必须同源,跨实例的 surface id
+        // 在 wgpu-core 里直接 panic("Surface does not exist")。
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let surface = unsafe {
             instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
@@ -91,8 +93,16 @@ impl SurfaceRenderer {
             })
         }
         .map_err(|e| format!("create surface: {e:?}"))?;
+        let adapter = crate::render::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+        }))
+        .ok_or("没有支持该窗口的 GPU 适配器")?;
 
-        let (renderer, device, queue) = Renderer::new_with_surface(width, height, atlas, &surface);
+        let renderer = Renderer::from_adapter(adapter, width, height, atlas);
+        let device = renderer.device().clone();
+        let queue = renderer.queue().clone();
         let frame_aspect = width as f32 / height as f32;
 
         let caps = surface.get_capabilities(renderer.adapter());
@@ -223,6 +233,11 @@ impl SurfaceRenderer {
             surface_size: (0, 0),
             frame_aspect,
         })
+    }
+
+    /// 热替换图集(透传给内部离屏 Renderer)。
+    pub fn set_atlas(&mut self, atlas: &crate::draw::Atlas) {
+        self.renderer.set_atlas(atlas);
     }
 
     /// (Re)configures the surface for the window's current size; call on

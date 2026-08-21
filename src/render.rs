@@ -216,6 +216,8 @@ pub struct Renderer {
     pipeline_alpha: wgpu::RenderPipeline,
     pipeline_additive: wgpu::RenderPipeline,
     atlas_bind: wgpu::BindGroup,
+    atlas_layout: wgpu::BindGroupLayout,
+    atlas_sampler: wgpu::Sampler,
     screen_bind: wgpu::BindGroup,
     body_tex: wgpu::Texture,
     body_bind: wgpu::BindGroup,
@@ -261,36 +263,68 @@ impl Renderer {
         Self::from_adapter(adapter, width, height, atlas)
     }
 
-    /// Device + queue on an adapter guaranteed compatible with `surface`
-    /// (used by the live-preview `SurfaceRenderer`).
-    pub fn new_with_surface(
-        width: u32,
-        height: u32,
-        atlas: &Atlas,
-        surface: &wgpu::Surface,
-    ) -> (Renderer, wgpu::Device, wgpu::Queue) {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(surface),
-            force_fallback_adapter: false,
-        }))
-        .expect("no GPU adapter supporting the surface");
-        let renderer = Self::from_adapter(adapter, width, height, atlas);
-        let device = renderer.device.clone();
-        let queue = renderer.queue.clone();
-        (renderer, device, queue)
-    }
+    /// Device + queue on a caller-provided adapter. The caller must obtain
+    /// the adapter from the SAME `wgpu::Instance` that created any surface
+    /// it intends to present to (a surface id from another instance is
+    /// invalid and panics inside wgpu-core).
 
     pub fn adapter(&self) -> &wgpu::Adapter {
         &self.adapter
+    }
+
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// 热替换图集(背景图开关时用):重建纹理并上传,重绑 bind group,
+    /// 管线/设备/窗口全部保留——避免整套 wgpu 初始化重付。
+    pub fn set_atlas(&mut self, atlas: &Atlas) {
+        let tex_size = wgpu::Extent3d { width: atlas.width, height: atlas.height, depth_or_array_layers: 1 };
+        let atlas_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("atlas"),
+            size: tex_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &atlas_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &atlas.rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(atlas.width * 4),
+                rows_per_image: Some(atlas.height),
+            },
+            tex_size,
+        );
+        let view = atlas_tex.create_view(&Default::default());
+        self.atlas_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &self.atlas_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.atlas_sampler) },
+            ],
+            label: Some("atlas bind"),
+        });
     }
 
     pub fn target_view(&self) -> wgpu::TextureView {
         self.target.create_view(&Default::default())
     }
 
-    fn from_adapter(
+    pub fn from_adapter(
         adapter: wgpu::Adapter,
         width: u32,
         height: u32,
@@ -705,6 +739,8 @@ impl Renderer {
             pipeline_alpha,
             pipeline_additive,
             atlas_bind,
+            atlas_layout,
+            atlas_sampler: sampler,
             screen_bind,
             target,
             msaa,
