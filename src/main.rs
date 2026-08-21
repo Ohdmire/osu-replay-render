@@ -16,9 +16,12 @@
 //!   --end <ms>             End time in replay ms (default: end)
 //!   --score classic        Show classic (stable-style) score
 //!   --audio-offset <ms>    BGM alignment offset (default 0)
+//!   --hitsounds            Synthesize the ArgonPro hitsound track (lazer
+//!                          gameplay-audio parity) and mix it into the
+//!                          export, amix-summed with --audio when present
 //!   --limit <n>            Render at most n frames (testing)
 
-use osu_replay_render::{build_atlas, decode_image_file, draw, draw::Image, game, osu_background_file, osu_general_value, render::Renderer, scene};
+use osu_replay_render::{build_atlas, decode_image_file, draw, draw::Image, game, hitsound, osu_background_file, osu_general_value, render::Renderer, scene};
 
 use scene::{Assets, SceneState};
 use std::io::Write;
@@ -58,6 +61,11 @@ struct Options {
     /// `OsuAutoGenerator` port) instead of reading an .osr — beatmap
     /// preview without a replay file.
     autoplay: bool,
+    /// Synthesize the hitsound track (ArgonPro skin samples, lazer
+    /// gameplay-audio parity: hit-only judgements, beatmap volumes/banks,
+    /// slider loops, DT/HT pitch) and mix it into the export
+    /// (`--hitsounds`).
+    hitsounds: bool,
 }
 
 fn parse_args() -> Result<(Options, String, Option<String>), String> {
@@ -67,7 +75,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
     let autoplay = args.iter().any(|a| a == "--autoplay");
     let min_args = if autoplay { 2 } else { 3 };
     if args.len() < min_args {
-        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro] [--no-guides] [--audio [file.mp3]] [--audio-offset ms] [--bg] [--bg-opacity 0..1] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
+        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro] [--no-guides] [--audio [file.mp3]] [--audio-offset ms] [--bg] [--bg-opacity 0..1] [--hitsounds] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
     }
     let map_path = args[1].clone();
     let replay_path = if autoplay { None } else { Some(args[2].clone()) };
@@ -92,6 +100,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
         bg_opacity: 0.3,
         audio_offset: None,
         autoplay,
+        hitsounds: false,
     };
     let mut i = min_args;
     while i < args.len() {
@@ -197,6 +206,9 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
             }
             "--autoplay" => {
                 opts.autoplay = true;
+            }
+            "--hitsounds" => {
+                opts.hitsounds = true;
             }
             other => return Err(format!("unknown argument: {}", other)),
         }
@@ -455,6 +467,35 @@ fn main() {
         std::process::exit(1);
     }
 
+    if opts.hitsounds && opts.out.is_none() {
+        eprintln!("warning: --hitsounds needs --out (video export) - ignoring");
+    }
+
+    // Hitsound track (`--hitsounds`): synthesized offline from the
+    // judgement timeline plus the .osu sample data (hit-only triggers,
+    // beatmap banks/volumes, slider slide loops, DT/HT pitch), on the
+    // export's wall timeline so it muxes 1:1 with the video. Written as a
+    // temp WAV, mixed into the output in the second pass below.
+    let hits_path: Option<String> = if opts.hitsounds && opts.out.is_some() {
+        match std::fs::read_to_string(&map_path) {
+            Ok(content) => {
+                let t0 = frame_times[0];
+                let wall_secs = frame_times.len() as f64 / opts.fps;
+                let wav = hitsound::render_track_wav(&game, &content, t0, wall_secs, game.rate);
+                let p = format!("{}.hits.wav", opts.out.as_ref().unwrap());
+                std::fs::write(&p, wav).unwrap_or_else(|e| panic!("write {}: {}", p, e));
+                eprintln!("hitsounds: {} (ArgonPro samples, {:.1}s)", p, wall_secs);
+                Some(p)
+            }
+            Err(e) => {
+                eprintln!("warning: cannot re-read beatmap for hitsounds: {} - skipping", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // auto: probe NVENC with a tiny test encode, fall back to x264.
     let encoder = if opts.encoder == "auto" {
         let probe = std::process::Command::new("ffmpeg")
@@ -507,10 +548,11 @@ fn main() {
             .arg("-r").arg(format!("{}", opts.fps))
             .arg("-i").arg("-");
         cmd.args(&encode_args);
-        // With BGM the audio is muxed in a SECOND ffmpeg pass after
-        // rendering (see below): muxing audio directly on the raw pipe can
-        // grow ffmpeg's interleave queue without bound when fed fast.
-        let video_tmp = if audio_path.is_some() {
+        // With BGM or hitsounds the audio is muxed in a SECOND ffmpeg pass
+        // after rendering (see below): muxing audio directly on the raw
+        // pipe can grow ffmpeg's interleave queue without bound when fed
+        // fast.
+        let video_tmp = if audio_path.is_some() || hits_path.is_some() {
             format!("{}.video.tmp.mp4", out)
         } else {
             out.clone()
@@ -620,7 +662,7 @@ fn main() {
     }
         output.finish();
 
-    // Second pass: mux the BGM into the video (stream copy + AAC).
+    // Second pass: mux the audio into the video (stream copy + AAC).
     // Audio file position = replay_time - offset*rate (offset is a
     // wall-time ms value, multiplied by the gameplay rate like lazer's
     // OffsetCorrectionClock). When that position is negative the replay
@@ -630,40 +672,64 @@ fn main() {
     // clamping the seek to 0 (the clamp started the music |t0| early and
     // silently disabled the offset for renders starting at t=0). Rate
     // mods (DT/NC 1.5, HT 0.75) resample the track — pitch and tempo
-    // scale together, like lazer's Track rate adjustment.
-    if let Some(audio) = &audio_path {
+    // scale together, like lazer's Track rate adjustment. The hitsound
+    // track is a separate audio stream: with BGM present both are summed
+    // with amix (normalize=0 keeps the levels as authored).
+    if audio_path.is_some() || hits_path.is_some() {
         if let Some(out) = &opts.out {
             let offset = opts.audio_offset.unwrap_or(0.0);
             let rate = game.rate;
-            let t0 = frame_times.first().map(|t| *t).unwrap_or(0.0);
-            let seek_ms = t0 - offset * rate;
+            let first = frame_times.first().map(|t| *t).unwrap_or(0.0);
+            let seek_ms = first - offset * rate;
             let tmp = format!("{}.video.tmp.mp4", out);
-            eprintln!("muxing audio: {} (offset {}ms, rate {}, file start {}ms)", audio, offset, rate, seek_ms.max(0.0));
+            if let Some(audio) = &audio_path {
+                eprintln!("muxing audio: {} (offset {}ms, rate {}, file start {}ms)", audio, offset, rate, seek_ms.max(0.0));
+            }
             let mut cmd = std::process::Command::new("ffmpeg");
             cmd.arg("-y")
                 .arg("-v").arg("error")
                 .arg("-i").arg(&tmp);
-            let mut filters: Vec<String> = Vec::new();
-            if (rate - 1.0).abs() > 1e-9 {
-                let sr = probe_sample_rate(audio);
-                filters.push(format!("asetrate={},aresample={}", (sr as f64 * rate).round() as i64, sr));
+            let mut bgm_filters: Vec<String> = Vec::new();
+            if let Some(audio) = &audio_path {
+                if (rate - 1.0).abs() > 1e-9 {
+                    let sr = probe_sample_rate(audio);
+                    bgm_filters.push(format!("asetrate={},aresample={}", (sr as f64 * rate).round() as i64, sr));
+                }
+                if seek_ms >= 0.0 {
+                    cmd.arg("-ss").arg(format!("{:.3}", seek_ms / 1000.0));
+                } else {
+                    // Negative file position: pad silence so the music
+                    // begins exactly when the replay clock reaches the
+                    // offset. adelay runs after the speed filter, i.e. in
+                    // the output (wall) timeline: ms = -seek/rate.
+                    bgm_filters.push(format!("adelay={}:all=1", (-seek_ms / rate).round() as i64));
+                }
+                cmd.arg("-i").arg(audio);
             }
-            if seek_ms >= 0.0 {
-                cmd.arg("-ss").arg(format!("{:.3}", seek_ms / 1000.0));
-            } else {
-                // Negative file position: pad silence so the music begins
-                // exactly when the replay clock reaches the offset. adelay
-                // runs after the speed filter, i.e. in the output (wall)
-                // timeline: ms = -seek/rate.
-                filters.push(format!("adelay={}:all=1", (-seek_ms / rate).round() as i64));
-            }
-            cmd.arg("-i").arg(audio);
-            if !filters.is_empty() {
-                cmd.arg("-af").arg(filters.join(","));
+            match (&audio_path, &hits_path) {
+                (Some(_), Some(hits)) => {
+                    cmd.arg("-i").arg(hits);
+                    let head = if bgm_filters.is_empty() {
+                        "[1:a]".to_string()
+                    } else {
+                        format!("[1:a]{}[bgm];[bgm]", bgm_filters.join(","))
+                    };
+                    cmd.arg("-filter_complex").arg(format!("{}amix=inputs=2:normalize=0[aout]", head));
+                    cmd.arg("-map").arg("0:v").arg("-map").arg("[aout]");
+                }
+                (Some(_), None) => {
+                    if !bgm_filters.is_empty() {
+                        cmd.arg("-af").arg(bgm_filters.join(","));
+                    }
+                    cmd.arg("-map").arg("0:v").arg("-map").arg("1:a");
+                }
+                (None, Some(hits)) => {
+                    cmd.arg("-i").arg(hits);
+                    cmd.arg("-map").arg("0:v").arg("-map").arg("1:a");
+                }
+                (None, None) => unreachable!(),
             }
             let status = cmd
-                .arg("-map").arg("0:v")
-                .arg("-map").arg("1:a")
                 .arg("-c:v").arg("copy")
                 // Pin the video track timescale to the fps so each frame is
                 // exactly one tick and the container reports avg_frame_rate
@@ -677,7 +743,13 @@ fn main() {
                 .arg(out)
                 .status()
                 .expect("ffmpeg audio mux");
-            let _ = std::fs::remove_file(&tmp);
+            let keep_tmp = std::env::var("HITSOUND_DEBUG").is_ok();
+            if !keep_tmp {
+                let _ = std::fs::remove_file(&tmp);
+                if let Some(hits) = &hits_path {
+                    let _ = std::fs::remove_file(hits);
+                }
+            }
             if !status.success() {
                 eprintln!("error: audio mux failed");
                 std::process::exit(1);

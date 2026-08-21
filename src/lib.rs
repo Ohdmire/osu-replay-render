@@ -5,6 +5,7 @@
 pub mod autoplay;
 pub mod draw;
 pub mod game;
+pub mod hitsound;
 pub mod hud;
 pub mod render;
 pub mod scene;
