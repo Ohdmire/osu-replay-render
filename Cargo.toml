@@ -5,7 +5,7 @@ edition = "2024"
 license = "MIT"
 
 [dependencies]
-osu_replay_judge = { path = "../osu-replay-judge" }
+osu_replay_judge = { git = "https://github.com/Ohdmire/osu-replay-judge.git", branch = "master" }
 wgpu = "24"
 raw-window-handle = "0.6"
 pollster = "0.4"
