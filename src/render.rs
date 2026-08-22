@@ -244,7 +244,10 @@ pub struct Renderer {
 }
 
 fn sample_count() -> u32 {
-    if std::env::var("NO_MSAA").is_ok() { 1 } else { 4 }
+    // Android (Mali/Adreno/SwiftShader): MSAA costs 4× the fragment work and
+    // has driver-side resolve quirks that drop parts of the scene; the
+    // software renderer benefits even more from disabling it.
+    if cfg!(target_os = "android") || std::env::var("NO_MSAA").is_ok() { 1 } else { 4 }
 }
 
 pub fn block_on<F: std::future::Future>(fut: F) -> F::Output {
