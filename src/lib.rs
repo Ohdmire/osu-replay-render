@@ -9,10 +9,12 @@ pub mod hitsound;
 pub mod hud;
 pub mod render;
 pub mod scene;
-/// Win32 HWND 直渲(窗口 surface)。跨平台宿主应使用 `render::Renderer`
-/// 的离屏读回路径,把帧送到自己的展示层。
-#[cfg(windows)]
+/// 原生窗口直渲(窗口 surface,跨平台:Windows Win32 / Linux Xlib)。
+/// 宿主以 raw window handle 传入自己的窗口;句柄类型经
+/// [`raw_window_handle`] 再导出,宿主无需直接依赖该 crate。
 pub mod surface;
+
+pub use raw_window_handle;
 
 use draw::{Atlas, Image, Region, TtfFont};
 
