@@ -26,6 +26,16 @@ use osu_replay_render::{build_atlas, decode_image_file, draw, draw::Image, game,
 use scene::{Assets, SceneState};
 use std::io::Write;
 
+/// Hidden mod visual override.
+enum HdMode {
+    /// Follow the replay's own mods (default).
+    Auto,
+    /// `--hd`: force HD visuals on regardless of the replay's mods.
+    On,
+    /// `--no-hd`: force HD visuals off even when the replay has the mod.
+    Off,
+}
+
 struct Options {
     out: Option<String>,
     png_dir: Option<String>,
@@ -61,6 +71,12 @@ struct Options {
     /// `OsuAutoGenerator` port) instead of reading an .osr — beatmap
     /// preview without a replay file.
     autoplay: bool,
+    /// Force the Hidden mod visuals (`--hd`), overriding the replay's own
+    /// mods: objects fade out before their hit time, approach circles are
+    /// hidden (except the first object's). Visual only — judgement/score
+    /// stay computed from the replay's actual mods (HD changes no
+    /// judgement anyway).
+    hd: HdMode,
     /// Synthesize the hitsound track (ArgonPro skin samples, lazer
     /// gameplay-audio parity: hit-only judgements, beatmap volumes/banks,
     /// slider loops, DT/HT pitch) and mix it into the export
@@ -85,7 +101,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
     let autoplay = args.iter().any(|a| a == "--autoplay");
     let min_args = if autoplay { 2 } else { 3 };
     if args.len() < min_args {
-        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro] [--no-guides] [--audio [file.mp3]] [--audio-offset ms] [--bg] [--bg-opacity 0..1] [--hitsounds] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
+        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--hd] [--no-hd] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro] [--no-guides] [--audio [file.mp3]] [--audio-offset ms] [--bg] [--bg-opacity 0..1] [--hitsounds] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
     }
     let map_path = args[1].clone();
     let replay_path = if autoplay { None } else { Some(args[2].clone()) };
@@ -110,6 +126,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
         bg_opacity: 0.3,
         audio_offset: None,
         autoplay,
+        hd: HdMode::Auto,
         hitsounds: false,
         hitsounds_volume: 0.6,
         bgm_volume: 0.6,
@@ -219,6 +236,12 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
             }
             "--autoplay" => {
                 opts.autoplay = true;
+            }
+            "--hd" => {
+                opts.hd = HdMode::On;
+            }
+            "--no-hd" => {
+                opts.hd = HdMode::Off;
             }
             "--hitsounds" => {
                 opts.hitsounds = true;
@@ -393,13 +416,21 @@ fn main() {
             game::load_autoplay(&map_path)
         }
     };
-    let game = match game {
+    let mut game = match game {
         Ok(g) => g,
         Err(e) => {
             eprintln!("error: {}", e);
             std::process::exit(1);
         }
     };
+    // HD override: by default (Auto) the visuals follow the replay's own
+    // mods; `--hd`/`--no-hd` force them on/off (visual override only —
+    // score/judgement always come from the replay's actual mods).
+    match opts.hd {
+        HdMode::Auto => {}
+        HdMode::On => game.hidden = true,
+        HdMode::Off => game.hidden = false,
+    }
     eprintln!(
         "player: {} | objects: {} | snapshots: {} | final score: {} (max combo {})",
         game.player,

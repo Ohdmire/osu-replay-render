@@ -282,6 +282,14 @@ pub struct GameData {
     /// counters and the UR bar — the numbers are all perfect and carry no
     /// information about the beatmap.
     pub autoplay: bool,
+    /// Hidden mod (`OsuModHidden`, visual only — HD changes no judgement).
+    /// Objects fade out before their hit time; approach circles are hidden
+    /// except on the first object.
+    pub hidden: bool,
+    /// Beatmap index of the first non-spinner object
+    /// (`IsFirstAdjustableObject`): under HD it keeps its approach circle
+    /// (`IncreaseFirstObjectVisibility`, default on).
+    pub hd_first_object: usize,
 }
 
 /// 完整渲染:判定引擎的快照从「首物件时间 − 抢先量」才开始,谱面前奏
@@ -628,6 +636,12 @@ fn build(
         }
     }
 
+    let hd_first_object = objects
+        .iter()
+        .find(|o| o.kind != ObjKind::Spinner)
+        .map(|o| o.index)
+        .unwrap_or(0);
+
     Ok(GameData {
         score_events,
         ur_events,
@@ -650,6 +664,8 @@ fn build(
         final_max_combo: engine.score.highest_combo,
         final_accuracy: engine.score.accuracy(),
         autoplay: false,
+        hidden: mods.hidden,
+        hd_first_object,
     })
 }
 
