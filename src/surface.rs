@@ -17,6 +17,9 @@ pub struct SurfaceRenderer {
     params_bind: wgpu::BindGroup,
     blit_bind: wgpu::BindGroup,
     surface_format: wgpu::TextureFormat,
+    /// Composite alpha mode supported by the platform (Android only allows
+    /// `Inherit`; desktop prefers `Opaque`).
+    alpha_mode: wgpu::CompositeAlphaMode,
     /// (surface_w, surface_h); 0x0 means "not yet usable, skip frames".
     surface_size: (u32, u32),
     frame_aspect: f32,
@@ -107,6 +110,13 @@ impl SurfaceRenderer {
             .find(|f| **f == wgpu::TextureFormat::Bgra8Unorm)
             .copied()
             .unwrap_or(caps.formats.first().copied().unwrap_or(wgpu::TextureFormat::Bgra8Unorm));
+        let alpha_mode = caps
+            .alpha_modes
+            .iter()
+            .copied()
+            .find(|m| *m == wgpu::CompositeAlphaMode::Opaque)
+            .or_else(|| caps.alpha_modes.first().copied())
+            .unwrap_or(wgpu::CompositeAlphaMode::Inherit);
 
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("blit shader"),
@@ -225,6 +235,7 @@ impl SurfaceRenderer {
             params_bind,
             blit_bind,
             surface_format,
+            alpha_mode,
             surface_size: (0, 0),
             frame_aspect,
         })
@@ -254,7 +265,7 @@ impl SurfaceRenderer {
                 width,
                 height,
                 present_mode: wgpu::PresentMode::Fifo,
-                alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+                alpha_mode: self.alpha_mode,
                 view_formats: vec![],
                 desired_maximum_frame_latency: 2,
             },
@@ -295,7 +306,9 @@ impl SurfaceRenderer {
         }
         self.queue.submit(Some(encoder.finish()));
         frame.present();
-        self.device.poll(wgpu::Maintain::Poll);
+        // No device.poll here: window presentation provides the needed
+        // synchronization, and Maintain::Poll busy-syncs against the driver
+        // on some Android GPUs, eating CPU and stalling the frame loop.
         true
     }
 }
