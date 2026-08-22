@@ -36,6 +36,48 @@ const SPINNER_DISC: f32 = 384.0; // playfield units
 const FOLLOW_POINT_SPACING: f32 = 32.0;
 const FOLLOW_POINT_PREEMPT: f64 = 800.0;
 
+// ---------------------------------------------------------------------------
+// Hidden mod (`OsuModHidden`). HD changes no judgement; it only rewrites the
+// visibility timelines: non-slider objects (including slider nested head/
+// ticks) fade in over `preempt * 0.4` instead of the default formula
+// ("Sliders retain their default TimeFadeIn to match Stable"), then fade out
+// over the windows below. Approach circles are hidden (except the first
+// object). Follow points / judgements / HUD are untouched.
+// ---------------------------------------------------------------------------
+
+const HD_FADE_IN_MULTIPLIER: f64 = 0.4;
+const HD_FADE_OUT_DURATION_MULTIPLIER: f64 = 0.3;
+/// `DrawableSliderTick.ANIM_DURATION`.
+const HD_TICK_ANIM_DURATION: f64 = 150.0;
+
+/// HD fade-in span for non-slider objects (`preempt * 0.4`). Sliders keep
+/// `obj.fade_in` (the default formula).
+fn hd_fade_in(obj: &ObjView) -> f64 {
+    if obj.kind == ObjKind::Slider {
+        obj.fade_in
+    } else {
+        obj.preempt * HD_FADE_IN_MULTIPLIER
+    }
+}
+
+/// `getFadeOutParameters` default (circle) case: linear fade to zero over
+/// `preempt * 0.3`, starting `fade_in` after the lifetime start — the object
+/// is fully invisible for the last 30% of its preempt. `fade_in` is the
+/// HD-adjusted fade-in of the anchor object (circles: 0.4 × preempt; the
+/// slider head/tail/repeat ride the HEAD's sequence, whose fade-in is also
+/// 0.4 × preempt since it is a nested non-slider).
+fn hd_fade_out(preempt: f64, start_time: f64, fade_in: f64, t: f64) -> f64 {
+    let fs = start_time - preempt + fade_in;
+    value_at(
+        t,
+        fs,
+        fs + preempt * HD_FADE_OUT_DURATION_MULTIPLIER,
+        1.0,
+        0.0,
+        Easing::Linear,
+    )
+}
+
 pub fn colour_for_result(result: HitResult) -> Colour {
     match result {
         HitResult::Miss | HitResult::LargeTickMiss | HitResult::IgnoreMiss => {
@@ -213,6 +255,8 @@ pub struct SceneState {
     slider_anims: Vec<SliderAnim>,
     spinner_anims: Vec<SpinnerAnim>,
     pub hud: hud::HudState,
+    /// Hidden mod active (from `GameData::hidden`).
+    hidden: bool,
     last_t: f64,
 }
 
@@ -230,6 +274,7 @@ impl SceneState {
             slider_anims: (0..game.objects.len()).map(|_| SliderAnim::new()).collect(),
             spinner_anims: (0..game.objects.len()).map(|_| SpinnerAnim::new()).collect(),
             hud: hud::HudState::new(),
+            hidden: game.hidden,
             last_t: f64::NEG_INFINITY,
         }
     }
@@ -337,7 +382,13 @@ impl SceneState {
         // 6. Approach circles.
         if std::env::var("NO_APPROACH").is_err() {
             for obj in &game.objects {
-                draw_approach_circle(assets, list, &self.mapper, obj, t);
+                // HD hides approach circles everywhere except the first
+                // adjustable object (`IncreaseFirstObjectVisibility`,
+                // default on; spinners never qualify as the first object).
+                if game.hidden && obj.index != game.hd_first_object {
+                    continue;
+                }
+                draw_approach_circle(assets, list, &self.mapper, obj, t, game.hidden);
             }
         }
 
@@ -418,7 +469,15 @@ impl SceneState {
             return;
         }
 
-        let base_alpha = value_at(t, appear, appear + obj.fade_in, 0.0, 1.0, Easing::Linear);
+        // HD overrides the fade-in to 0.4 * preempt and fades the circle
+        // out over the last stretch of the preempt (fully invisible 30% of
+        // the preempt before the hit time); hit-state animations stack on
+        // top as usual.
+        let base_alpha = if self.hidden {
+            value_at(t, appear, appear + hd_fade_in(obj), 0.0, 1.0, Easing::Linear)
+        } else {
+            value_at(t, appear, appear + obj.fade_in, 0.0, 1.0, Easing::Linear)
+        };
         // `ArgonMainCirclePiece` hit state: the WHOLE piece (all fills,
         // number, flash and the border ring included) runs `this.FadeOut`
         // on top of the per-layer animations. The colour block (fills +
@@ -426,13 +485,16 @@ impl SceneState {
         // 150ms, the flash pops in/out over 300ms, while the piece fade
         // runs 800 * 0.8 = 640ms OutQuad - the ring lingers longest.
         // On miss the circle fades over 100ms.
-        let overall = if judged && hit {
+        let mut overall = if judged && hit {
             value_at(t, ht, ht + 640.0, 1.0, 0.0, Easing::OutQuad)
         } else if judged {
             value_at(t, ht, ht + 100.0, 1.0, 0.0, Easing::Linear)
         } else {
             1.0
         };
+        if self.hidden {
+            overall *= hd_fade_out(obj.preempt, obj.start_time, hd_fade_in(obj), t);
+        }
         let alpha = base_alpha * overall;
         if alpha <= 0.003 {
             return;
@@ -598,6 +660,19 @@ impl SceneState {
             // AccentColour.Darken(4) = the accent at 20% - a dark TINT,
             // not black).
             let mut fade = alpha as f32;
+            // HD slider body: a LONG fade spanning from the default fade-in
+            // end to the slider end (`Easing.Out` = OutQuad) - the track
+            // gradually vanishes while the ball/follow circle stay visible.
+            if self.hidden {
+                fade *= value_at(
+                    t,
+                    appear + obj.fade_in,
+                    obj.end_time,
+                    1.0,
+                    0.0,
+                    Easing::OutQuad,
+                ) as f32;
+            }
             if body_judged && body_hit && head_hit && t > bt {
                 fade *= value_at(t, bt, bt + 40.0, 1.0, 0.0, Easing::Linear) as f32;
             }
@@ -628,7 +703,7 @@ impl SceneState {
             if n.kind != NestedKind::Tick {
                 continue;
             }
-            draw_slider_tick(list, m, obj, n.position, n.time, n.span_index, n.judged, t);
+            draw_slider_tick(list, m, obj, n.position, n.time, n.span_index, n.judged, t, self.hidden);
         }
 
         // --- Repeat arrows ---------------------------------------------------------
@@ -699,7 +774,18 @@ impl SceneState {
         } else {
             1.0
         };
-        let combined = alpha * head_alpha;
+        // HD: the head circle is a nested non-slider - its own fade-in is
+        // 0.4 * preempt (faster than the body's default) and it rides the
+        // circle fade-out window anchored at the head. The slider `alpha`
+        // (default fade-in) keeps applying to the body/ball only.
+        let head_base = if self.hidden {
+            let head_fade_in = obj.preempt * HD_FADE_IN_MULTIPLIER;
+            value_at(t, appear, appear + head_fade_in, 0.0, 1.0, Easing::Linear)
+                * hd_fade_out(obj.preempt, obj.start_time, head_fade_in, t)
+        } else {
+            alpha
+        };
+        let combined = head_base * head_alpha;
         if combined > 0.003 {
             draw_circle_piece(
                 assets,
@@ -937,12 +1023,25 @@ impl SceneState {
         }
 
         // Overall fade (`DrawableSpinner.UpdateHitStateTransforms`:
-        // FadeOut(240) - linear).
-        let alpha = if judged {
+        // FadeOut(240) - linear). HD multiplies an EXTRA fade that only
+        // starts AT the spinner's end time (the `Spinner` case anchors the
+        // fade-out at `fadeOutStartTime + longFadeDuration == EndTime`),
+        // over preempt * 0.3.
+        let mut alpha = if judged {
             value_at(t, jt, jt + 240.0, 1.0, 0.0, Easing::Linear)
         } else {
             1.0
         };
+        if self.hidden {
+            alpha *= value_at(
+                t,
+                obj.end_time,
+                obj.end_time + obj.preempt * HD_FADE_OUT_DURATION_MULTIPLIER,
+                1.0,
+                0.0,
+                Easing::Linear,
+            );
+        }
         if alpha <= 0.003 {
             return;
         }
@@ -1229,6 +1328,7 @@ fn draw_slider_tick(
     span_index: usize,
     judged: Option<(f64, HitResult)>,
     t: f64,
+    hidden: bool,
 ) {
     let span_duration = obj.duration / obj.span_count.max(1) as f64;
     let offset = if span_index > 0 { 200.0 } else { obj.preempt * 0.66 };
@@ -1252,6 +1352,12 @@ fn draw_slider_tick(
                 scale = value_at(t, jt, jt + 150.0, 1.0, 1.5, Easing::Out);
             }
         }
+    }
+    // HD tick window (`SliderTick` case): linear fade ending exactly AT the
+    // tick time, over `min(preempt - ANIM_DURATION, 1000)`.
+    if hidden {
+        let dur = (obj.preempt - HD_TICK_ANIM_DURATION).min(1000.0).max(0.0);
+        alpha *= value_at(t, time - dur, time, 1.0, 0.0, Easing::Linear);
     }
     if alpha <= 0.003 {
         return;
@@ -1565,6 +1671,35 @@ mod tests {
             head_judged: None,
             body_judged: None,
         }
+    }
+
+    /// Hidden mod windows, locked against `OsuModHidden`:
+    /// fade-in 0.4 * preempt (non-sliders; sliders keep the default),
+    /// fade-out linear over the last `0.3 * preempt` starting
+    /// `fade_in` after the lifetime start.
+    #[test]
+    fn hd_windows_match_osu_mod_hidden() {
+        // Circle, preempt 1000, HD fade-in 400.
+        let mut circle = test_slider(1);
+        circle.kind = ObjKind::Circle;
+        circle.preempt = 1000.0;
+        assert!((hd_fade_in(&circle) - 400.0).abs() < 1e-9);
+
+        // Slider keeps the default fade-in.
+        let slider = test_slider(1);
+        assert!((hd_fade_in(&slider) - 400.0).abs() < 1e-9);
+        let mut short_preempt_slider = test_slider(1);
+        short_preempt_slider.preempt = 450.0;
+        short_preempt_slider.fade_in = 311.0;
+        assert!((hd_fade_in(&short_preempt_slider) - 311.0).abs() < 1e-9);
+
+        // Circle fade-out window [start - 1000 + 400, + 300] = [9400, 9700].
+        let fo = |t| hd_fade_out(1000.0, 10000.0, 400.0, t);
+        assert!((fo(9200.0) - 1.0).abs() < 1e-9);
+        assert!((fo(9400.0) - 1.0).abs() < 1e-9);
+        assert!((fo(9550.0) - 0.5).abs() < 1e-9);
+        assert!((fo(9700.0) - 0.0).abs() < 1e-9);
+        assert!((fo(9900.0) - 0.0).abs() < 1e-9);
     }
 
     /// While snaking in, the end arrow rides the tip and aims back along the
@@ -2034,7 +2169,16 @@ fn draw_judgement_text(assets: &Assets, list: &mut DrawList, m: &Mapper, ev: &Ev
 // Approach circles
 // ---------------------------------------------------------------------------
 
-fn draw_approach_circle(assets: &Assets, list: &mut DrawList, m: &Mapper, obj: &ObjView, t: f64) {
+/// `hd`: HD is active and this is the first adjustable object - the only
+/// approach circle kept. Its fade window uses the HD-adjusted TimeFadeIn.
+fn draw_approach_circle(
+    assets: &Assets,
+    list: &mut DrawList,
+    m: &Mapper,
+    obj: &ObjView,
+    t: f64,
+    hd: bool,
+) {
     let appear = obj.start_time - obj.preempt;
     if t < appear || t > obj.start_time {
         return;
@@ -2050,7 +2194,13 @@ fn draw_approach_circle(assets: &Assets, list: &mut DrawList, m: &Mapper, obj: &
         return;
     }
 
-    let fade_in_dur = (obj.fade_in * 2.0).min(obj.preempt);
+    let fade_in_dur = if hd {
+        // `Math.Min(TimeFadeIn * 2, TimePreempt)` with the HD-adjusted
+        // TimeFadeIn (preempt * 0.4) = 0.8 * preempt.
+        (obj.preempt * HD_FADE_IN_MULTIPLIER * 2.0).min(obj.preempt)
+    } else {
+        (obj.fade_in * 2.0).min(obj.preempt)
+    };
     let alpha = value_at(t, appear, appear + fade_in_dur, 0.0, 0.9, Easing::Linear)
         * value_at(t, obj.start_time - 50.0, obj.start_time, 1.0, 0.0, Easing::Linear);
     if alpha <= 0.003 {

@@ -209,6 +209,119 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// RGB → YUV420 (BT.601 limited range) on the GPU. One Y invocation packs
+/// 4 horizontal luma bytes into one storage word; one chroma invocation
+/// packs a full storage word (or two for NV12), so no two invocations ever
+/// touch the same word — no atomics needed. Requires width % 8 == 0 and
+/// even height (word alignment of every plane row); callers fall back to a
+/// CPU conversion otherwise.
+const YUV_SHADER: &str = r#"
+struct Params {
+    size: vec2<u32>,
+};
+@group(0) @binding(0) var<uniform> params: Params;
+@group(1) @binding(0) var tex: texture_2d<f32>;
+@group(2) @binding(0) var<storage, read_write> out: array<u32>;
+
+fn luma_y(c: vec3<f32>) -> u32 {
+    let y = 16.0 + 219.0 * dot(c, vec3<f32>(0.299, 0.587, 0.114));
+    return u32(clamp(y, 16.0, 235.0) + 0.5);
+}
+
+fn chroma_uv(c: vec3<f32>) -> vec2<u32> {
+    let cb = 128.0 + 224.0 * dot(c, vec3<f32>(-0.168736, -0.331264, 0.5));
+    let cr = 128.0 + 224.0 * dot(c, vec3<f32>(0.5, -0.418688, -0.081312));
+    return vec2<u32>(u32(clamp(cb, 16.0, 240.0) + 0.5), u32(clamp(cr, 16.0, 240.0) + 0.5));
+}
+
+fn block_avg(x: u32, y: u32) -> vec3<f32> {
+    var sum = vec3<f32>(0.0, 0.0, 0.0);
+    for (var dy = 0u; dy < 2u; dy = dy + 1u) {
+        for (var dx = 0u; dx < 2u; dx = dx + 1u) {
+            sum = sum + textureLoad(tex, vec2<i32>(i32(x + dx), i32(y + dy)), 0).rgb;
+        }
+    }
+    return sum * 0.25;
+}
+
+@compute @workgroup_size(8, 4)
+fn cs_y(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let w = params.size.x;
+    let h = params.size.y;
+    let x0 = gid.x * 4u;
+    let y = gid.y;
+    if (x0 + 3u >= w || y >= h) { return; }
+    var word = 0u;
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let c = textureLoad(tex, vec2<i32>(i32(x0 + i), i32(y)), 0).rgb;
+        word = word | (luma_y(c) << (8u * i));
+    }
+    out[y * (w / 4u) + gid.x] = word;
+}
+
+// NV12: UV pairs interleaved after the Y plane, one pair per 2x2 block.
+@compute @workgroup_size(8, 4)
+fn cs_uv_nv12(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let w = params.size.x;
+    let h = params.size.y;
+    let cw = w / 2u;
+    let ch = h / 2u;
+    let cx0 = gid.x * 4u;
+    let cy = gid.y;
+    if (cx0 + 3u >= cw || cy >= ch) { return; }
+    var words = array<u32, 2>(0u, 0u);
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let uv = chroma_uv(block_avg((cx0 + i) * 2u, cy * 2u));
+        let j = i / 2u;
+        let s = (i % 2u) * 16u;
+        words[j] = words[j] | (uv.x << s) | (uv.y << (s + 8u));
+    }
+    let base = (w * h + cy * w + cx0 * 2u) / 4u;
+    out[base] = words[0];
+    out[base + 1u] = words[1];
+}
+
+// I420: U plane then V plane after the Y plane.
+@compute @workgroup_size(8, 4)
+fn cs_uv_i420(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let w = params.size.x;
+    let h = params.size.y;
+    let cw = w / 2u;
+    let ch = h / 2u;
+    let cx0 = gid.x * 4u;
+    let cy = gid.y;
+    if (cx0 + 3u >= cw || cy >= ch) { return; }
+    var wu = 0u;
+    var wv = 0u;
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let uv = chroma_uv(block_avg((cx0 + i) * 2u, cy * 2u));
+        wu = wu | (uv.x << (8u * i));
+        wv = wv | (uv.y << (8u * i));
+    }
+    let u_base = (w * h + cy * cw + cx0) / 4u;
+    let v_base = (w * h + cw * ch + cy * cw + cx0) / 4u;
+    out[u_base] = wu;
+    out[v_base] = wv;
+}
+"#;
+
+struct YuvPass {
+    pipeline_y: wgpu::ComputePipeline,
+    pipeline_uv_nv12: wgpu::ComputePipeline,
+    pipeline_uv_i420: wgpu::ComputePipeline,
+    params_bind: wgpu::BindGroup,
+    tex_bind: wgpu::BindGroup,
+    out_bind: wgpu::BindGroup,
+    out_buf: wgpu::Buffer,
+    ring: Vec<wgpu::Buffer>,
+    ring_next: usize,
+    pending: std::collections::VecDeque<usize>,
+    /// Packed frame size in bytes (w*h*3/2); ring buffers are this size.
+    bytes: u32,
+    groups_y: (u32, u32),
+    groups_uv: (u32, u32),
+}
+
 pub struct Renderer {
     adapter: wgpu::Adapter,
     device: wgpu::Device,
@@ -238,6 +351,9 @@ pub struct Renderer {
     readback_ring: Vec<wgpu::Buffer>,
     readback_next: usize,
     readback_pending: std::collections::VecDeque<usize>,
+    /// Lazy GPU RGB→YUV420 conversion (see [`YuvPass`]); None until the
+    /// first `render_deferred_yuv`.
+    yuv: Option<YuvPass>,
     pub width: u32,
     pub height: u32,
     pub padded_row: u32,
@@ -752,6 +868,7 @@ impl Renderer {
             readback_ring,
             readback_next: 0,
             readback_pending: std::collections::VecDeque::new(),
+            yuv: None,
             width,
             height,
             padded_row,
@@ -1125,6 +1242,225 @@ impl Renderer {
             .pop_front()
             .expect("read_oldest with empty pipeline");
         let buffer = &self.readback_ring[slot];
+        let slice = buffer.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        self.device.poll(wgpu::Maintain::Wait);
+        let data = slice.get_mapped_range();
+        out.clear();
+        out.extend_from_slice(&data);
+        drop(data);
+        buffer.unmap();
+    }
+
+    // ---- GPU YUV420 output (BGRA scene target → NV12/I420 buffer) ----
+
+    /// Whether the GPU conversion supports this renderer's dimensions
+    /// (width % 8 == 0, height % 2 == 0; every plane row must be
+    /// word-aligned). Callers fall back to a CPU conversion otherwise.
+    pub fn yuv_ready(&self) -> bool {
+        self.width % 8 == 0 && self.height % 2 == 0
+    }
+
+    /// Packed NV12/I420 frame size: `w * h * 3 / 2` bytes.
+    pub fn yuv_frame_bytes(&self) -> usize {
+        (self.width as usize * self.height as usize * 3) / 2
+    }
+
+    fn init_yuv(&mut self) {
+        assert!(self.yuv_ready(), "GPU YUV path requires width % 8 == 0 and even height");
+        let (width, height) = (self.width, self.height);
+        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("yuv shader"),
+            source: wgpu::ShaderSource::Wgsl(YUV_SHADER.into()),
+        });
+
+        let params_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("yuv params layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: NonZeroU64::new(8),
+                },
+                count: None,
+            }],
+        });
+        let tex_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("yuv tex layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let out_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("yuv out layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("yuv layout"),
+            bind_group_layouts: &[&params_layout, &tex_layout, &out_layout],
+            push_constant_ranges: &[],
+        });
+
+        let make_pipeline = |entry: &str| {
+            self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("yuv pipeline"),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let pipeline_y = make_pipeline("cs_y");
+        let pipeline_uv_nv12 = make_pipeline("cs_uv_nv12");
+        let pipeline_uv_i420 = make_pipeline("cs_uv_i420");
+
+        let params_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("yuv params"),
+            size: 8,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&params_buf, 0, cast_slice(&[width, height]));
+        let params_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &params_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &params_buf,
+                    offset: 0,
+                    size: Some(NonZeroU64::new(8).unwrap()),
+                }),
+            }],
+            label: Some("yuv params bind"),
+        });
+
+        let target_view = self.target.create_view(&Default::default());
+        let tex_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &tex_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&target_view),
+            }],
+            label: Some("yuv tex bind"),
+        });
+
+        // w*h*3/2 is a multiple of 4 for any %8/%2 dimensions (copy size
+        // requirement); round up anyway so odd cases still validate.
+        let bytes = ((self.yuv_frame_bytes() + 3) / 4 * 4) as u32;
+        let out_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("yuv out"),
+            size: bytes as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let out_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &out_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &out_buf,
+                    offset: 0,
+                    size: None,
+                }),
+            }],
+            label: Some("yuv out bind"),
+        });
+        let ring: Vec<wgpu::Buffer> = (0..3)
+            .map(|i| {
+                self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("yuv readback {i}")),
+                    size: bytes as u64,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
+
+        self.yuv = Some(YuvPass {
+            pipeline_y,
+            pipeline_uv_nv12,
+            pipeline_uv_i420,
+            params_bind,
+            tex_bind,
+            out_bind,
+            out_buf,
+            ring,
+            ring_next: 0,
+            pending: std::collections::VecDeque::new(),
+            bytes,
+            groups_y: ((width / 4 + 7) / 8, (height + 3) / 4),
+            groups_uv: ((width / 8 + 7) / 8, (height / 2 + 3) / 4),
+        });
+    }
+
+    /// Renders one frame and converts it to YUV420 on the GPU (NV12 when
+    /// `interleaved`, I420 otherwise), submitting without waiting for the
+    /// GPU — mirror of [`Renderer::render_deferred`]. Retrieve converted
+    /// frames with [`Renderer::read_oldest_yuv_into`].
+    pub fn render_deferred_yuv(&mut self, list: &DrawList, clear: [f64; 4], interleaved: bool) {
+        if self.yuv.is_none() {
+            self.init_yuv();
+        }
+        let slot = {
+            let y = self.yuv.as_mut().unwrap();
+            let s = y.ring_next;
+            y.ring_next = (s + 1) % y.ring.len();
+            s
+        };
+        let mut encoder = self.encode_scene(list, clear);
+        {
+            let y = self.yuv.as_ref().unwrap();
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("yuv pass"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, &y.params_bind, &[]);
+            pass.set_bind_group(1, &y.tex_bind, &[]);
+            pass.set_bind_group(2, &y.out_bind, &[]);
+            pass.set_pipeline(&y.pipeline_y);
+            pass.dispatch_workgroups(y.groups_y.0, y.groups_y.1, 1);
+            pass.set_pipeline(if interleaved { &y.pipeline_uv_nv12 } else { &y.pipeline_uv_i420 });
+            pass.dispatch_workgroups(y.groups_uv.0, y.groups_uv.1, 1);
+        }
+        let y = self.yuv.as_ref().unwrap();
+        encoder.copy_buffer_to_buffer(&y.out_buf, 0, &y.ring[slot], 0, y.bytes as u64);
+        self.queue.submit(Some(encoder.finish()));
+        self.yuv.as_mut().unwrap().pending.push_back(slot);
+    }
+
+    /// Number of submitted-but-not-yet-read YUV frames.
+    pub fn yuv_pending_len(&self) -> usize {
+        self.yuv.as_ref().map_or(0, |y| y.pending.len())
+    }
+
+    /// Maps the OLDEST pending YUV frame and copies it into `out`
+    /// (`yuv_frame_bytes()` bytes). Mirror of [`Renderer::read_oldest_into`].
+    pub fn read_oldest_yuv_into(&mut self, out: &mut Vec<u8>) {
+        let slot = self
+            .yuv
+            .as_mut()
+            .and_then(|y| y.pending.pop_front())
+            .expect("read_oldest_yuv with empty pipeline");
+        let buffer = &self.yuv.as_ref().unwrap().ring[slot];
         let slice = buffer.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         self.device.poll(wgpu::Maintain::Wait);

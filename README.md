@@ -19,6 +19,8 @@ osu_replay_render <beatmap.osu> [replay.osr] [options]
 | 选项 | 说明 |
 | --- | --- |
 | `--autoplay` | **Autoplay mod**：不输入 .osr,由谱面直接生成回放（本地移植 lazer `OsuAutoGenerator`），作为谱面预览。判定引擎照常判定生成帧（SS/满血/UR 0）；HUD 整体隐藏（分数/acc/combo/UR 条/血条都不画） |
+| `--hd` | **强制 Hidden mod 视觉（on）**，覆盖回放原有 mods：物件提前淡出、缩圈隐藏（首个物件保留）。纯视觉覆盖——判定/分数仍按回放真实 mods 计算（HD 本就不影响判定） |
+| `--no-hd` | **强制关闭 HD 视觉（off）**，即使回放自带 HD 也以全可见渲染。缺省为 **auto**：跟随回放自身 mods |
 | `--out <file.mp4>` | 管道输出到 ffmpeg 编码为 mp4 (h264, crf 18) |
 | `--png-dir <dir>` | 输出 PNG 帧序列到目录 |
 | `--size <WxH>` | 输出分辨率，默认 1920x1080 |
@@ -140,6 +142,17 @@ if renderer.pending_len() > 0 {
   0.605×字高,描边 48/512×box）。渐进滑入 + 淡出。
 - **光标**：粉渐变环 + 内白环 + 中心点 + 青色辉光，按下弹性放大；
   光标轨迹（加色、(1-age)^4 衰减、300ms 生命）。
+- **HD（Hidden mod）**：复刻 `OsuModHidden`——非滑条物件（含滑条头/tick）
+  淡入改为 `preempt×0.4`（滑条身体保持默认淡入以对齐 stable），圆/滑条头在
+  `[start−preempt+fadeIn, +0.3×preempt]` 线性淡出（打击前 30% preempt 完全
+  隐形）；滑条身体自默认淡入结束到 `EndTime` 整段 `Easing.Out` 长淡出，球与
+  follow circle 不淡（球悬浮在隐形轨道上，与 lazer 一致）；tick 在
+  `min(preempt−150, 1000)ms` 窗口内淡至自身时刻；spinner 在 `EndTime` 之后才
+  以 `0.3×preempt` 淡出；approach circle 全部隐藏（仅全图首个非 spinner 物件
+  保留，`IncreaseFirstObjectVisibility` 默认开，其缩圈淡入用 HD 调整后的
+  `TimeFadeIn×2`）；折返箭头不受影响（Argon 的 repeat `CirclePiece` 为
+  `Empty()`）。HD 不改变任何判定（判定端仅用于分数系数 ×1.04），mods 位来自
+  回放文件自动启用。
 - **HUD**：楔形块、分数/准确率/连击计数器（argon-counter 官方纹理
   数字 + 线框背景 + ink 对齐度量）、数字滚动（250ms）、连击弹出/miss
   变红、血条（简化 HP 模拟 + 受伤闪红）、**UR 条**（水平置于屏幕底部
