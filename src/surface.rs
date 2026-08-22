@@ -5,6 +5,7 @@
 
 use crate::draw::{Atlas, DrawList};
 use crate::render::Renderer;
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
 pub struct SurfaceRenderer {
     renderer: Renderer,
@@ -67,29 +68,23 @@ fn f32_bytes(v: &[f32]) -> &[u8] {
 }
 
 impl SurfaceRenderer {
-    /// Creates the renderer plus a wgpu surface for the given Win32 HWND.
-    /// The scene is rendered internally at `width`x`height` and letterboxed
-    /// onto the window.
+    /// Creates the renderer plus a wgpu surface for the given raw window
+    /// handle (Windows: Win32;Linux: Xlib/XWayland)。The scene is rendered
+    /// internally at `width`x`height` and letterboxed onto the window.
     pub fn new(
         width: u32,
         height: u32,
         atlas: &Atlas,
-        hwnd: isize,
+        raw_display: RawDisplayHandle,
+        raw_window: RawWindowHandle,
     ) -> Result<SurfaceRenderer, String> {
-        let raw = raw_window_handle::RawWindowHandle::Win32(
-            raw_window_handle::Win32WindowHandle::new(
-                std::num::NonZeroIsize::new(hwnd).ok_or("invalid hwnd")?,
-            ),
-        );
         // 单一 Instance:surface 与 adapter 必须同源,跨实例的 surface id
         // 在 wgpu-core 里直接 panic("Surface does not exist")。
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let surface = unsafe {
             instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                raw_display_handle: raw_window_handle::RawDisplayHandle::Windows(
-                    raw_window_handle::WindowsDisplayHandle::new(),
-                ),
-                raw_window_handle: raw,
+                raw_display_handle: raw_display,
+                raw_window_handle: raw_window,
             })
         }
         .map_err(|e| format!("create surface: {e:?}"))?;
