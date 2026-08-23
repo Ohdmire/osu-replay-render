@@ -521,6 +521,7 @@ const ANIMATABLE_TEXTURE_NAMES: &[(&str, &str)] = &[
     ("cursor", "-"),
     ("cursortrail", "-"),
     ("reversearrow", "-"),
+    ("followpoint", "-"), // OsuLegacySkinTransformer: GetAnimation("followpoint", true, true, true)
     ("spinner-background", "-"),
     ("spinner-circle", "-"),
     ("spinner-metre", "-"),

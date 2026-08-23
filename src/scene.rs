@@ -334,7 +334,11 @@ struct LegacyCache {
     /// Stable picks the trail style from the cursor texture's provider:
     /// disjoint (no `cursormiddle`) vs continuous additive.
     disjoint_trail: bool,
-    followpoint: Option<SkinTexture>,
+    /// `followpoint` frame sequence (`OsuLegacySkinTransformer`:
+    /// `GetAnimation("followpoint", animatable, looping,
+    /// applyConfigFrameRate)`; skins without a bare sprite ship only
+    /// `followpoint-0..N` frames).
+    followpoint: Option<SkinAnimation>,
     /// Judgement bursts (`LegacySkin.getJudgementAnimation`).
     judgement: [Option<SkinAnimation>; 4], // hit0, hit50, hit100, hit300
     /// Old-style spinner sprites (most skins); `new_style` selects the
@@ -446,7 +450,7 @@ impl LegacyCache {
             cursormiddle,
             cursortrail: skin.get_texture("cursortrail"),
             disjoint_trail,
-            followpoint: skin.get_texture("followpoint"),
+            followpoint: skin::get_animation(skin, "followpoint", true, true, true, "-"),
             judgement,
             spinner_glow: skin.get_texture("spinner-glow"),
             spinner_background: skin.get_texture("spinner-background"),
@@ -2841,14 +2845,17 @@ fn draw_follow_points(
                     let scale = value_at(t, fade_in, fade_in + end.fade_in, 1.5, 1.0, Easing::Out);
                     let sp = m.pf(pos);
 
-                    // Legacy: the skin's `followpoint` sprite (untinted),
-                    // rotated along the connection.
+                    // Legacy: the skin's `followpoint` animation, phased
+                    // from the follow point's own fade-in
+                    // (`FollowPoint.AnimationStartTime = fadeInTime`),
+                    // untinted, rotated along the connection.
                     if let Some(lg) = legacy
-                        && let Some(tex) = lg.followpoint
+                        && let Some(anim) = &lg.followpoint
                     {
-                        let w = tex.display_width() * m.pf * end.scale * scale as f32;
-                        let h = tex.display_height() * m.pf * end.scale * scale as f32;
-                        list.image(atlas, tex.region, sp, [w, h], rotation, Colour::WHITE.opacity(alpha as f32), Blend::Alpha);
+                        let frame = anim.frame_at(t - fade_in);
+                        let w = frame.display_width() * m.pf * end.scale * scale as f32;
+                        let h = frame.display_height() * m.pf * end.scale * scale as f32;
+                        list.image(atlas, frame.region, sp, [w, h], rotation, Colour::WHITE.opacity(alpha as f32), Blend::Alpha);
                         d += FOLLOW_POINT_SPACING;
                         continue;
                     }
