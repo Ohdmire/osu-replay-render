@@ -836,6 +836,22 @@ pub fn sample_bytes(bank: &str, name: &str) -> Option<&'static [u8]> {
 }
 
 pub fn render_track_wav(game: &GameData, map_content: &str, t0: f64, wall_secs: f64, rate: f64, master_gain: f32) -> Vec<u8> {
+    render_track(game, map_content, t0, wall_secs, rate, master_gain, true)
+}
+
+/// `render_track_wav` without the bus soft limiter: the sum stays
+/// linear and only true `>= 1.0` overs saturate at the PCM16
+/// conversion. `scale` is PCM headroom the caller divides back out
+/// before applying its own channel/master chain — for mixes that clip
+/// exactly once at the end (live-render parity). A tanh knee on this
+/// bus ducked dense stacks 2-4 dB and bent every stack peak; the
+/// float-sum mix only needs the headroom so PCM16 can carry stacks
+/// above unity.
+pub fn render_track_wav_linear(game: &GameData, map_content: &str, t0: f64, wall_secs: f64, rate: f64, scale: f32) -> Vec<u8> {
+    render_track(game, map_content, t0, wall_secs, rate, scale, false)
+}
+
+fn render_track(game: &GameData, map_content: &str, t0: f64, wall_secs: f64, rate: f64, gain: f32, limit: bool) -> Vec<u8> {
     let data = parse_sample_data(map_content);
     let t_map_end = t0 + wall_secs * rate * 1000.0;
     let placements = build_placements(game, &data, t0, t_map_end);
@@ -870,10 +886,11 @@ pub fn render_track_wav(game: &GameData, map_content: &str, t0: f64, wall_secs: 
         place(&mut buf, clip, wall, rate, gl, gr, until);
     }
 
-    // `--hitsounds-volume` master gain (game default: Effect 1.0).
-    if (master_gain - 1.0).abs() > 1e-6 {
+    // Master gain / headroom scale (`--hitsounds-volume`, or the linear
+    // variant's PCM headroom).
+    if (gain - 1.0).abs() > 1e-6 {
         for v in &mut buf {
-            *v *= master_gain;
+            *v *= gain;
         }
     }
 
@@ -893,7 +910,7 @@ pub fn render_track_wav(game: &GameData, map_content: &str, t0: f64, wall_secs: 
         }
     }
 
-    encode_wav(&buf)
+    encode_wav(&buf, limit)
 }
 
 /// Soft-knee limiter (tanh above the threshold). The game's BASS mixer
@@ -912,7 +929,7 @@ fn soft_limit(x: f32) -> f32 {
     }
 }
 
-fn encode_wav(interleaved: &[f32]) -> Vec<u8> {
+fn encode_wav(interleaved: &[f32], limit: bool) -> Vec<u8> {
     let frames = interleaved.len() / 2;
     let data_len = frames * 4;
     let mut out = Vec::with_capacity(44 + data_len);
@@ -931,7 +948,8 @@ fn encode_wav(interleaved: &[f32]) -> Vec<u8> {
     out.extend_from_slice(&(data_len as u32).to_le_bytes());
     out.reserve(data_len);
     for v in interleaved {
-        let s = soft_limit(*v);
+        // f32 -> i16 `as` casts saturate: the linear variant's only clip.
+        let s = if limit { soft_limit(*v) } else { *v };
         out.extend_from_slice(&((s * 32767.0) as i16).to_le_bytes());
     }
     out
