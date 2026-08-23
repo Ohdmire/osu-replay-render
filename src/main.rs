@@ -15,13 +15,19 @@
 //!   --start <ms>           Start time in replay ms (default: beginning)
 //!   --end <ms>             End time in replay ms (default: end)
 //!   --score classic        Show classic (stable-style) score
+//!   --skin <dir|argon|argon-pro>
+//!                          Render with a user skin: an unpacked .osk
+//!                          directory (skin.ini + sprites; @2x, animation
+//!                          frames and number fonts resolved like lazer,
+//!                          missing elements fall back to the built-in
+//!                          argon visuals)
 //!   --audio-offset <ms>    BGM alignment offset (default 0)
 //!   --hitsounds            Synthesize the ArgonPro hitsound track (lazer
 //!                          gameplay-audio parity) and mix it into the
 //!                          export, amix-summed with --audio when present
 //!   --limit <n>            Render at most n frames (testing)
 
-use osu_replay_render::{build_atlas, decode_image_file, draw, draw::Image, game, hitsound, osu_background_file, osu_general_value, render::Renderer, scene};
+use osu_replay_render::{build_atlas, decode_image_file, draw, draw::Image, game, hitsound, osu_background_file, osu_general_value, render::Renderer, scene, skin};
 
 use scene::{Assets, SceneState};
 use std::io::Write;
@@ -46,6 +52,8 @@ struct Options {
     end: Option<f64>,
     classic_score: bool,
     skin: String,
+    /// User skin directory (`--skin <dir>`): legacy skin rendering.
+    skin_dir: Option<std::path::PathBuf>,
     /// auto (default: probe NVENC, fall back to x264) | x264 | x265 | nvenc.
     encoder: String,
     /// crf; 18 by default.
@@ -115,6 +123,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
         end: None,
         classic_score: false,
         skin: "argon-pro".to_string(),
+        skin_dir: None,
         encoder: "auto".to_string(),
         quality: 18,
         probe: None,
@@ -174,10 +183,19 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
             "--skin" => {
                 i += 1;
                 let skin = args.get(i).cloned().ok_or("--skin needs a value")?;
-                if skin != "argon" && skin != "argon-pro" {
-                    return Err("--skin must be argon or argon-pro".into());
+                if skin == "argon" || skin == "argon-pro" {
+                    opts.skin = skin;
+                    opts.skin_dir = None;
+                } else {
+                    // A user skin directory (unpacked .osk): legacy skin
+                    // rendering with per-element argon fallbacks.
+                    let p = std::path::Path::new(&skin);
+                    if !p.is_dir() {
+                        return Err(format!("--skin: not a directory: {} (or argon|argon-pro)", skin));
+                    }
+                    opts.skin_dir = Some(p.to_path_buf());
+                    opts.skin = "argon".to_string();
                 }
-                opts.skin = skin;
             }
             "--encoder" => {
                 i += 1;
@@ -497,7 +515,19 @@ fn main() {
     };
 
     let has_bg = bg_image.is_some();
-    let (atlas, bold, semibold) = build_atlas(bg_image);
+
+    // Skin resolution (`--skin <dir>`: user legacy skin with argon
+    // fallbacks; the combo colours override the beatmap's like stable).
+    let mut resolved_skin = match skin::load_skin(opts.skin_dir.as_deref()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    game::apply_skin_combo_colours(&mut game, &resolved_skin);
+
+    let (atlas, bold, semibold) = build_atlas(bg_image, &mut resolved_skin);
     eprintln!("atlas: {}x{}", atlas.width, atlas.height);
 
     let mut renderer = Renderer::new(opts.width, opts.height, &atlas);
@@ -665,7 +695,7 @@ fn main() {
     let total = frame_times.len();
     let t0 = std::time::Instant::now();
     let mut list = draw::DrawList::new();
-    let assets = Assets { atlas: &atlas, bold: &bold, semibold: &semibold };
+    let assets = Assets { atlas: &atlas, bold: &bold, semibold: &semibold, skin: &resolved_skin };
     let stats = std::env::var("RENDER_STATS").is_ok();
     let (mut s_build, mut s_render, mut s_write) = (0.0f64, 0.0f64, 0.0f64);
     // Index of the next frame to be written out; lags behind the frame

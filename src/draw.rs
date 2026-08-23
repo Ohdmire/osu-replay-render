@@ -342,10 +342,37 @@ impl DrawList {
         colour: Colour,
         blend: Blend,
     ) {
+        self.image_sub(atlas, region, center, size, rotation_deg, colour, blend, 0.0, 0.0, 1.0, 1.0);
+    }
+
+    /// Textured quad restricted to a sub-rectangle of the region (u/v in
+    /// 0..1 of the region, v0 top). Used for masked legacy sprites (the
+    /// spinner metre reveals top-down).
+    pub fn image_sub(
+        &mut self,
+        atlas: &Atlas,
+        region: Region,
+        center: [f32; 2],
+        size: [f32; 2],
+        rotation_deg: f32,
+        colour: Colour,
+        blend: Blend,
+        u0: f32,
+        v0: f32,
+        u1: f32,
+        v1: f32,
+    ) {
         let rect = atlas.region_rect(region);
         let aw = atlas.width as f32;
         let ah = atlas.height as f32;
-        let rect = Rect { x0: rect.x0 / aw, y0: rect.y0 / ah, x1: rect.x1 / aw, y1: rect.y1 / ah };
+        let rw = rect.x1 - rect.x0;
+        let rh = rect.y1 - rect.y0;
+        let rect = Rect {
+            x0: (rect.x0 + rw * u0) / aw,
+            y0: (rect.y0 + rh * v0) / ah,
+            x1: (rect.x0 + rw * u1) / aw,
+            y1: (rect.y0 + rh * v1) / ah,
+        };
         let (s, c) = rotation_deg.to_radians().sin_cos();
         let rot = |p: [f32; 2]| -> [f32; 2] {
             [center[0] + p[0] * c - p[1] * s, center[1] + p[0] * s + p[1] * c]
@@ -985,6 +1012,9 @@ pub enum Region {
     ApproachCircle,
     /// Full-screen beatmap background (`--bg`).
     Background,
+    /// A user-skin texture (`--skin <dir>`): index into the skin's
+    /// texture table, assigned when the atlas is built.
+    Skin(u32),
 }
 
 pub struct Atlas {
@@ -1064,6 +1094,7 @@ fn decode_png(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
     (w, h, buf)
 }
 
+#[derive(Clone)]
 pub struct Image {
     pub width: u32,
     pub height: u32,

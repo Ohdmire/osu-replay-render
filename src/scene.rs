@@ -7,6 +7,7 @@
 use crate::draw::{draw_ttf_text, lerp, value_at, Atlas, Blend, Colour, DrawList, Easing, TtfFont};
 use crate::game::{EventView, GameData, JudgementDisplay, ObjKind, ObjView};
 use crate::hud;
+use crate::skin::{self, Skin, SkinAnimation, SkinTexture, SIXTY_FRAME_TIME};
 use osu_replay_judge::process::NestedKind;
 use osu_replay_judge::score::hit_result_ext;
 use osu_replay_judge::score::HitResult;
@@ -20,6 +21,24 @@ pub const GRADIENT_THICKNESS: f32 = BORDER_THICKNESS * 2.5; // 11.034
 pub const OUTER_GRADIENT_SIZE: f32 = 128.0 - BORDER_THICKNESS * 4.0; // 110.345
 pub const INNER_GRADIENT_SIZE: f32 = OUTER_GRADIENT_SIZE - GRADIENT_THICKNESS * 2.0; // 88.276
 pub const INNER_FILL_SIZE: f32 = INNER_GRADIENT_SIZE - GRADIENT_THICKNESS * 2.0; // 66.207
+
+// ---------------------------------------------------------------------------
+// Legacy skin metrics (osu.Game.Rulesets.Osu Skinning/Legacy).
+// ---------------------------------------------------------------------------
+
+/// `OsuLegacySkinTransformer.LEGACY_CIRCLE_RADIUS` = `OsuHitObject.OBJECT_RADIUS` (64) - 5.
+pub const LEGACY_CIRCLE_RADIUS: f32 = 59.0;
+/// `LegacySpinner.SPRITE_SCALE`.
+pub const LEGACY_SPINNER_SCALE: f32 = 0.625;
+/// `LegacySpinner.SPINNER_TOP_OFFSET` (window space 640x480).
+pub const LEGACY_SPINNER_TOP_OFFSET: f32 = 45.0 - 16.0;
+/// `LegacySpinner.SPINNER_Y_CENTRE`.
+pub const LEGACY_SPINNER_Y_CENTRE: f32 = LEGACY_SPINNER_TOP_OFFSET + 219.0;
+/// `LegacyCursor.REVOLUTION_DURATION`.
+pub const LEGACY_CURSOR_REVOLUTION: f64 = 10_000.0;
+/// `LegacySliderBody` gradient `border_portion` - border band width as a
+/// fraction of the body radius.
+pub const LEGACY_SLIDER_BORDER_PORTION: f32 = 0.1875;
 
 const FOLLOW_AREA: f32 = 2.4;
 const PLAYFIELD_SHIFT: f32 = 12.8; // 8 virtual px * 1.6
@@ -148,6 +167,24 @@ impl Mapper {
             v[1] / 768.0 * self.screen_h,
         ]
     }
+
+    /// Legacy spinner coordinates: stable's 640x480 WINDOW space
+    /// (`LegacySpinner`: the container fills the window and shifts up by
+    /// 8 window units, cancelling the playfield's downwards shift). The
+    /// space stretches to the full screen on both axes.
+    pub fn win(&self, v: [f32; 2]) -> [f32; 2] {
+        let cx = self.screen_w * 0.5;
+        let cy = self.screen_h * 0.5 - 8.0 * self.screen_h / 480.0;
+        [
+            cx + (v[0] - 320.0) / 640.0 * self.screen_w,
+            cy + (v[1] - 240.0) / 480.0 * self.screen_h,
+        ]
+    }
+
+    /// Window-space scale (screen px per 640x480 unit, height axis).
+    pub fn win_unit(&self) -> f32 {
+        self.screen_h / 480.0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +198,12 @@ struct SliderAnim {
     follow_alpha_anim: Option<(f64, f64, f64, f64, Easing)>,
     tick_pulse: Option<(f64, f64, f64, Easing)>, // (start, from, to, easing)
     was_tracking: bool,
+    /// Legacy follow circle state (`LegacyFollowCircle`), independent of
+    /// the argon values: (scale, alpha) + pending transforms.
+    fc_scale: f64,
+    fc_alpha: f64,
+    fc_scale_anim: Option<(f64, f64, f64, f64, Easing)>,
+    fc_alpha_anim: Option<(f64, f64, f64, f64, Easing)>,
     /// Per-repeat arrow rotation, indexed by repeat index:
     /// (has rotation been set yet, smoothed Arrow.Rotation in degrees).
     /// `DrawableSliderRepeat.UpdateSnakingPosition` keeps a live rotation
@@ -177,6 +220,10 @@ impl SliderAnim {
             follow_alpha_anim: None,
             tick_pulse: None,
             was_tracking: false,
+            fc_scale: 1.0,
+            fc_alpha: 0.0,
+            fc_scale_anim: None,
+            fc_alpha_anim: None,
             repeat_rots: Vec::new(),
         }
     }
@@ -239,6 +286,232 @@ pub struct Assets<'a> {
     pub atlas: &'a Atlas,
     pub bold: &'a TtfFont,
     pub semibold: &'a TtfFont,
+    /// The resolved skin (user legacy skin with argon fallback).
+    pub skin: &'a skin::ResolvedSkin,
+}
+
+// ---------------------------------------------------------------------------
+// Legacy skin sprite cache (resolved once per render)
+// ---------------------------------------------------------------------------
+
+/// Number sprite font: `{prefix}-{digit}` textures + the overlap setting.
+struct LegacyDigits {
+    prefix: String,
+    digits: [Option<SkinTexture>; 10],
+    overlap: f32,
+}
+
+/// Everything the legacy rendering paths need, resolved from the skin on
+/// first use. Elements the skin does not provide stay `None` and the
+/// argon vector visuals take over for that element (lazer's
+/// `SkinnableDrawable` fallback semantics).
+struct LegacyCache {
+    /// `[General] Version` (`LegacySetting::Version`).
+    version: f64,
+    /// (circle, overlay) for hit circles; `sliderstartcircle` variants
+    /// preferred for slider heads when the skin ships them
+    /// (`LegacySliderHeadHitCircle`'s priority lookup).
+    hitcircle: Option<(SkinTexture, Option<SkinTexture>)>,
+    sliderstartcircle: Option<(SkinTexture, Option<SkinTexture>)>,
+    approachcircle: Option<SkinTexture>,
+    reversearrow: Option<SkinTexture>,
+    /// `sliderb` frame sequence (`LegacySliderBall`: animatable, no
+    /// separator) + the nd/spec layers and tint config.
+    sliderball: Option<SkinAnimation>,
+    sliderball_nd: Option<SkinTexture>,
+    sliderball_spec: Option<SkinTexture>,
+    sliderball_tint: bool,
+    sliderball_colour: Colour,
+    /// `LegacySliderBody.GetBorderColour`: `SliderBorder` ?? white.
+    slider_border_colour: Colour,
+    /// `SliderTrackOverride` (body accent), None = hit object accent.
+    slider_track_colour: Option<Colour>,
+    followcircle: Option<SkinAnimation>,
+    scorepoint: Option<SkinTexture>,
+    cursor: Option<SkinTexture>,
+    cursormiddle: Option<SkinTexture>,
+    cursortrail: Option<SkinTexture>,
+    /// Stable picks the trail style from the cursor texture's provider:
+    /// disjoint (no `cursormiddle`) vs continuous additive.
+    disjoint_trail: bool,
+    followpoint: Option<SkinTexture>,
+    /// Judgement bursts (`LegacySkin.getJudgementAnimation`).
+    judgement: [Option<SkinAnimation>; 4], // hit0, hit50, hit100, hit300
+    /// Old-style spinner sprites (most skins); `new_style` selects the
+    /// `spinner-top/bottom/middle` glow layout when `spinner-glow` exists.
+    spinner_glow: Option<SkinTexture>,
+    spinner_background: Option<SkinTexture>,
+    spinner_circle: Option<SkinTexture>,
+    spinner_metre: Option<SkinTexture>,
+    spinner_approachcircle: Option<SkinTexture>,
+    spinner_spin: Option<SkinTexture>,
+    spinner_clear: Option<SkinTexture>,
+    spinner_background_colour: Colour,
+    spinner_blink: bool,
+    /// `HitCircleOverlayAboveNumber` (default true).
+    overlay_above_number: bool,
+    cursor_rotate: bool,
+    hitcircle_digits: Option<LegacyDigits>,
+    score_digits: Option<LegacyDigits>,
+}
+
+fn judgement_index(result: HitResult) -> Option<usize> {
+    Some(match result {
+        HitResult::Miss | HitResult::LargeTickMiss | HitResult::IgnoreMiss => 0,
+        HitResult::Meh => 1,
+        HitResult::Ok | HitResult::Good => 2,
+        HitResult::Great | HitResult::Perfect => 3,
+        _ => return None,
+    })
+}
+
+impl LegacyCache {
+    fn new(skin: &skin::ResolvedSkin) -> LegacyCache {
+        let generic_bool = |key: &str, default: bool| {
+            skin.get_config(skin_lookup_generic(key))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(default)
+        };
+        let custom_colour = |key: &str| -> Option<Colour> {
+            skin.get_config(skin::SkinLookup::CustomColour(skin::SkinCustomColourLookup(key.to_string())))
+                .and_then(|v| v.as_colour())
+        };
+
+        let version = skin
+            .get_config(skin::SkinLookup::LegacySetting(skin::configuration::LegacySetting::Version))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(skin::configuration::LATEST_VERSION);
+
+        let circle_pair = |name: &str| -> Option<(SkinTexture, Option<SkinTexture>)> {
+            let circle = skin.get_texture(name)?;
+            let overlay = skin.get_texture(&format!("{}overlay", name));
+            Some((circle, overlay))
+        };
+        let hitcircle = circle_pair("hitcircle");
+        let sliderstartcircle = circle_pair("sliderstartcircle");
+
+        // LegacySliderBall: `GetTextures("sliderb", animatable: true,
+        // separator: "")`; frame rate follows the slider velocity per
+        // frame at draw time, so the cached 60fps base is re-scaled there.
+        let sliderball = skin::get_animation(skin, "sliderb", true, true, false, "");
+        let followcircle = skin::get_animation(skin, "sliderfollowcircle", true, true, true, "-");
+
+        let judgement_names = ["hit0", "hit50", "hit100", "hit300"];
+        let judgement = judgement_names.map(|name| skin::get_animation(skin, name, true, false, false, "-"));
+
+        // Stable picks the disjoint trail style based on the provider of
+        // the cursor texture: no cursormiddle there => disjoint.
+        let cursor = skin.get_texture("cursor");
+        let cursormiddle = skin.get_texture("cursormiddle");
+        let disjoint_trail = match (&cursor, &cursormiddle) {
+            // A skin without any cursor sprite keeps the argon cursor;
+            // its trail style is irrelevant then.
+            (None, _) => false,
+            (Some(_), None) => true,
+            (Some(_), Some(_)) => false,
+        };
+
+        let digits = |font: skin::texture::LegacyFont| -> Option<LegacyDigits> {
+            let prefix = skin::get_font_prefix(skin, font);
+            let mut out: [Option<SkinTexture>; 10] = Default::default();
+            let mut any = false;
+            for (d, slot) in out.iter_mut().enumerate() {
+                *slot = skin.get_texture(&format!("{}-{}", prefix, d));
+                any |= slot.is_some();
+            }
+            any.then(|| LegacyDigits { prefix, digits: out, overlap: skin::get_font_overlap(skin, font) })
+        };
+
+        LegacyCache {
+            version,
+            hitcircle,
+            sliderstartcircle,
+            approachcircle: skin.get_texture("approachcircle"),
+            reversearrow: skin.get_texture("reversearrow"),
+            sliderball,
+            sliderball_nd: skin.get_texture("sliderb-nd"),
+            sliderball_spec: skin.get_texture("sliderb-spec"),
+            sliderball_tint: skin
+                .get_config(skin::SkinLookup::LegacySetting(
+                    skin::configuration::LegacySetting::AllowSliderBallTint,
+                ))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            sliderball_colour: custom_colour("SliderBall").unwrap_or(Colour::WHITE),
+            slider_border_colour: custom_colour("SliderBorder").unwrap_or(Colour::WHITE),
+            slider_track_colour: custom_colour("SliderTrackOverride"),
+            followcircle,
+            scorepoint: skin.get_texture("sliderscorepoint"),
+            cursor,
+            cursormiddle,
+            cursortrail: skin.get_texture("cursortrail"),
+            disjoint_trail,
+            followpoint: skin.get_texture("followpoint"),
+            judgement,
+            spinner_glow: skin.get_texture("spinner-glow"),
+            spinner_background: skin.get_texture("spinner-background"),
+            spinner_circle: skin.get_texture("spinner-circle"),
+            spinner_metre: skin.get_texture("spinner-metre"),
+            spinner_approachcircle: skin.get_texture("spinner-approachcircle"),
+            spinner_spin: skin.get_texture("spinner-spin"),
+            spinner_clear: skin.get_texture("spinner-clear"),
+            spinner_background_colour: custom_colour("SpinnerBackground")
+                .unwrap_or(Colour::rgba_bytes(100, 100, 100, 255)),
+            spinner_blink: !generic_bool("SpinnerNoBlink", false),
+            overlay_above_number: generic_bool("HitCircleOverlayAboveNumber", true),
+            cursor_rotate: generic_bool("CursorRotate", true),
+            hitcircle_digits: digits(skin::texture::LegacyFont::HitCircle),
+            score_digits: digits(skin::texture::LegacyFont::Score),
+        }
+    }
+}
+
+fn skin_lookup_generic(key: &str) -> skin::SkinLookup {
+    skin::SkinLookup::Generic(key.to_string())
+}
+
+/// Draws a number with legacy digit sprites (`LegacySpriteText` layout:
+/// advance = glyph width - overlap, positive overlap pulls closer).
+#[allow(clippy::too_many_arguments)]
+fn draw_legacy_number(
+    list: &mut DrawList,
+    atlas: &Atlas,
+    digits: &LegacyDigits,
+    text: &str,
+    center: [f32; 2],
+    scale: f32,
+    colour: Colour,
+    blend: Blend,
+) {
+    let glyph = |c: char| digits.digits.get(c.to_digit(10).unwrap_or(0) as usize).copied().flatten();
+    let widths: Vec<(f32, SkinTexture)> = text
+        .chars()
+        .filter_map(|c| {
+            glyph(c).map(|t| (t.display_width() * scale, t))
+        })
+        .collect();
+    if widths.is_empty() {
+        return;
+    }
+    let total: f32 = widths
+        .iter()
+        .map(|&(w, _)| w - digits.overlap * scale)
+        .sum::<f32>()
+        + digits.overlap * scale;
+    let mut pen = center[0] - total * 0.5;
+    for (w, tex) in widths {
+        let h = tex.display_height() * scale;
+        list.image(
+            atlas,
+            tex.region,
+            [pen + w * 0.5, center[1]],
+            [w, h],
+            0.0,
+            colour,
+            blend,
+        );
+        pen += w - digits.overlap * scale;
+    }
 }
 
 pub struct SceneState {
@@ -258,6 +531,9 @@ pub struct SceneState {
     /// Hidden mod active (from `GameData::hidden`); pub so a host can
     /// force HD visuals live on top of the replay's own mods.
     pub hidden: bool,
+    /// Resolved legacy skin sprites (lazily built on the first frame a
+    /// legacy skin is active).
+    legacy: Option<LegacyCache>,
     last_t: f64,
 }
 
@@ -276,6 +552,7 @@ impl SceneState {
             spinner_anims: (0..game.objects.len()).map(|_| SpinnerAnim::new()).collect(),
             hud: hud::HudState::new(),
             hidden: game.hidden,
+            legacy: None,
             last_t: f64::NEG_INFINITY,
         }
     }
@@ -294,12 +571,25 @@ impl SceneState {
             1000.0 / 60.0
         };
 
-        // Cursor expand animation.
+        // Resolve the legacy sprite set on the first frame a legacy skin
+        // is active (missing elements keep their argon fallbacks).
+        if self.legacy.is_none() && assets.skin.is_legacy() {
+            self.legacy = Some(LegacyCache::new(assets.skin));
+        }
+
+        // Cursor expand animation. Legacy cursors pop to 1.3 over 100ms
+        // Out both ways (`LegacyCursor.Expand/Contract`); argon to 1.2
+        // with an elastic pop.
         let pressed = snap.left || snap.right;
         if pressed != self.was_pressed {
-            let target = if pressed { 1.2 } else { 1.0 };
-            let easing = if pressed { Easing::OutElasticHalf } else { Easing::OutQuad };
-            self.cursor_anim = Some((t, t + 400.0, self.cursor_expand, target, easing));
+            let (target, dur, easing) = if self.legacy.is_some() {
+                (if pressed { 1.3 } else { 1.0 }, 100.0, Easing::Out)
+            } else if pressed {
+                (1.2, 400.0, Easing::OutElasticHalf)
+            } else {
+                (1.0, 400.0, Easing::OutQuad)
+            };
+            self.cursor_anim = Some((t, t + dur, self.cursor_expand, target, easing));
             self.was_pressed = pressed;
         }
         if let Some((a, b, from, to, e)) = self.cursor_anim {
@@ -346,17 +636,20 @@ impl SceneState {
 
         // 2. Follow points.
         if self.follow_points {
-            draw_follow_points(game, &self.mapper, list, t);
+            draw_follow_points(self.legacy.as_ref(), game, &self.mapper, list, assets.atlas, t);
         }
 
-        // 3. Judgement explosions (under objects).
-        for ev in &game.events {
-            if self.pro_skin
-                && matches!(ev.result, osu_replay_judge::score::HitResult::Great | osu_replay_judge::score::HitResult::Perfect)
-            {
-                continue;
+        // 3. Judgement explosions (under objects) - argon only (legacy
+        // skins have no per-hit particle rings).
+        if self.legacy.is_none() {
+            for ev in &game.events {
+                if self.pro_skin
+                    && matches!(ev.result, osu_replay_judge::score::HitResult::Great | osu_replay_judge::score::HitResult::Perfect)
+                {
+                    continue;
+                }
+                draw_judgement_explosion(list, &self.mapper, ev, t);
             }
-            draw_judgement_explosion(list, &self.mapper, ev, t);
         }
 
         // 4. Hit objects, reverse start-time order (earlier on top).
@@ -370,14 +663,14 @@ impl SceneState {
             }
         }
 
-        // 5. Judgement text.
+        // 5. Judgement text (legacy: skin burst sprites).
         for ev in &game.events {
             if self.pro_skin
                 && matches!(ev.result, osu_replay_judge::score::HitResult::Great | osu_replay_judge::score::HitResult::Perfect)
             {
                 continue;
             }
-            draw_judgement_text(assets, list, &self.mapper, ev, t);
+            draw_judgement_text(self.legacy.as_ref(), assets, list, &self.mapper, ev, t);
         }
 
         // 6. Approach circles.
@@ -395,13 +688,13 @@ impl SceneState {
                 if game.hidden && obj.index != game.hd_first_object {
                     continue;
                 }
-                draw_approach_circle(assets, list, &self.mapper, obj, t, game.hidden);
+                draw_approach_circle(self.legacy.as_ref(), assets, list, &self.mapper, obj, t, game.hidden);
             }
         }
 
         // 7. Cursor + trail.
-        self.draw_trail(list);
-        draw_cursor(list, cursor_screen, self.cursor_expand as f32);
+        self.draw_trail(list, assets);
+        draw_cursor(self.legacy.as_ref(), assets, list, cursor_screen, self.cursor_expand as f32, t);
 
         // 8. HUD.
         self.hud.draw(game, assets, list, &self.mapper, t);
@@ -444,9 +737,47 @@ impl SceneState {
         self.trail.retain(|p| (t - p.time).abs() < TRAIL_DURATION);
     }
 
-    fn draw_trail(&mut self, list: &mut DrawList) {
+    fn draw_trail(&mut self, list: &mut DrawList, assets: &Assets) {
         let expand = self.cursor_expand as f32;
         let t = self.last_t;
+
+        // Legacy trail (`LegacyCursorTrail`): sprite trail; disjoint skins
+        // (no cursormiddle) drop one part every 60ms with a 150ms linear
+        // fade, continuous skins interpolate along the movement with an
+        // additive 500ms fade.
+        if let Some(lg) = &self.legacy
+            && let Some(tex) = lg.cursortrail
+        {
+            let fade_duration = if lg.disjoint_trail { 150.0 } else { 500.0 };
+            let mut last_time = f64::NEG_INFINITY;
+            for p in &self.trail {
+                let disjoint_part = lg.disjoint_trail && last_time >= p.time - 1e-9;
+                last_time = p.time;
+                if disjoint_part {
+                    continue;
+                }
+                let age = (t - p.time).clamp(0.0, fade_duration) / fade_duration;
+                let alpha = 1.0 - age as f32;
+                if alpha <= 0.004 {
+                    continue;
+                }
+                // `Texture.ScaleAdjust *= STABLE_MAGIC_SCALE_FACTOR` on
+                // load: trail sprites display at px / 1.6.
+                let w = tex.display_width() / 1.6;
+                let h = tex.display_height() / 1.6;
+                list.image(
+                    assets.atlas,
+                    tex.region,
+                    p.pos,
+                    [w, h],
+                    0.0,
+                    Colour::WHITE.opacity(alpha),
+                    if lg.disjoint_trail { Blend::Alpha } else { Blend::Additive },
+                );
+            }
+            return;
+        }
+
         for p in &self.trail {
             let age = (t - p.time).clamp(0.0, TRAIL_DURATION) / TRAIL_DURATION;
             let alpha = (1.0 - age as f32).powf(TRAIL_FADE_EXPONENT) * TRAIL_ALPHA;
@@ -491,9 +822,14 @@ impl SceneState {
         // flash) always disappears well before the ring: fills hide over
         // 150ms, the flash pops in/out over 300ms, while the piece fade
         // runs 800 * 0.8 = 640ms OutQuad - the ring lingers longest.
-        // On miss the circle fades over 100ms.
+        // On miss the circle fades over 100ms. Legacy pieces fade their
+        // sprites over 240ms Out with a 1.4x pop instead.
         let mut overall = if judged && hit {
-            value_at(t, ht, ht + 640.0, 1.0, 0.0, Easing::OutQuad)
+            if self.legacy.is_some() {
+                value_at(t, ht, ht + 240.0, 1.0, 0.0, Easing::Linear)
+            } else {
+                value_at(t, ht, ht + 640.0, 1.0, 0.0, Easing::OutQuad)
+            }
         } else if judged {
             value_at(t, ht, ht + 100.0, 1.0, 0.0, Easing::Linear)
         } else {
@@ -508,6 +844,7 @@ impl SceneState {
         }
 
         draw_circle_piece(
+            self.legacy.as_ref(),
             assets,
             list,
             &self.mapper,
@@ -574,6 +911,11 @@ impl SceneState {
                             anim.tick_pulse =
                                 Some((t, anim.follow_scale, FOLLOW_AREA as f64 * 1.08, Easing::OutQuint));
                         }
+                        // `LegacyFollowCircle.OnSliderTick`: at full
+                        // extension (>= 2x) pulse 2.2 -> 2 over 200ms.
+                        if self.legacy.is_some() && anim.fc_scale >= 2.0 {
+                            anim.fc_scale_anim = Some((t, t + 200.0, 2.2, 2.0, Easing::Linear));
+                        }
                     }
                 }
             }
@@ -600,6 +942,32 @@ impl SceneState {
                 anim.follow_alpha_anim = Some((t, t + 150.0, anim.follow_alpha, 0.0, Easing::OutQuint));
             }
         }
+
+        // Legacy follow circle state (`LegacyFollowCircle`): press pops
+        // to 2x over min(180, remaining) Out with the alpha ramping over
+        // min(60, remaining); a mid-slider break flashes to 4x and dies
+        // over 100ms; the natural end settles at 1.6x Out / 200ms In.
+        if self.legacy.is_some() {
+            let remaining = (obj.end_time - t).max(0.0);
+            if tracking && !anim.was_tracking {
+                anim.fc_scale_anim = Some((t, t + remaining.min(180.0), anim.fc_scale, 2.0, Easing::Out));
+                anim.fc_alpha_anim = Some((t, t + remaining.min(60.0), anim.fc_alpha, 1.0, Easing::Linear));
+            } else if !tracking && anim.was_tracking {
+                if slider_ended {
+                    anim.fc_scale_anim = Some((t, t + 200.0, anim.fc_scale, 1.6, Easing::Out));
+                    anim.fc_alpha_anim = Some((t, t + 200.0, anim.fc_alpha, 0.0, Easing::In));
+                } else {
+                    anim.fc_scale_anim = Some((t, t + 100.0, anim.fc_scale, 4.0, Easing::Linear));
+                    anim.fc_alpha_anim = Some((t, t + 100.0, anim.fc_alpha, 0.0, Easing::Linear));
+                }
+            }
+            if let Some((a, b, from, to, e)) = anim.fc_scale_anim {
+                anim.fc_scale = value_at(t, a, b, from, to, e);
+            }
+            if let Some((a, b, from, to, e)) = anim.fc_alpha_anim {
+                anim.fc_alpha = value_at(t, a, b, from, to, e);
+            }
+        }
         anim.was_tracking = tracking;
 
         if let Some((a, b, from, to, e)) = anim.follow_anim {
@@ -623,6 +991,8 @@ impl SceneState {
 
         let follow_scale_now = anim.follow_scale;
         let follow_alpha_now = anim.follow_alpha;
+        let fc_scale_now = anim.fc_scale;
+        let fc_alpha_now = anim.fc_alpha;
         let anim = &self.slider_anims[obj.index];
         let _ = anim;
 
@@ -657,7 +1027,11 @@ impl SceneState {
         }
 
         // --- Body -------------------------------------------------------------
-        let path_radius = OUTER_GRADIENT_SIZE / 2.0 * obj.scale;
+        let legacy = self.legacy.as_ref();
+        let path_radius = match legacy {
+            Some(_) => LEGACY_CIRCLE_RADIUS, // OsuLegacySkinTransformer.LEGACY_CIRCLE_RADIUS
+            None => OUTER_GRADIENT_SIZE / 2.0,
+        } * obj.scale;
         let sub = obj.sub_path(p0, p1);
         if sub.len() >= 2 {
             let screen_pts: Vec<[f32; 2]> = sub.iter().map(|&p| m.pf(p)).collect();
@@ -666,6 +1040,12 @@ impl SceneState {
             // gets BodyAlpha (0.92 pro / 0.98 normal, applied to
             // AccentColour.Darken(4) = the accent at 20% - a dark TINT,
             // not black).
+            // LegacySliderBody: border = `SliderBorder` ?? white, body =
+            // `SliderTrackOverride` ?? accent at 0.7 alpha (a constant
+            // track alpha regardless of the source colour), border band
+            // `border_portion` (0.1875) of the radius. (The stable
+            // gradient's inner shadow core is approximated by the flat
+            // two-band SDF body.)
             let mut fade = alpha as f32;
             // HD slider body: a LONG fade spanning from the default fade-in
             // end to the slider end (`Easing.Out` = OutQuad) - the track
@@ -683,11 +1063,24 @@ impl SceneState {
             if body_judged && body_hit && head_hit && t > bt {
                 fade *= value_at(t, bt, bt + 40.0, 1.0, 0.0, Easing::Linear) as f32;
             }
-            let body_alpha = if self.pro_skin { 0.92 } else { 0.98 };
             let cap_r = path_radius * m.pf;
-            let cap_border = GRADIENT_THICKNESS * obj.scale * m.pf;
-            let border_col = obj.colour.opacity(fade);
-            let body_col = obj.colour.darken(4.0).opacity(fade * body_alpha);
+            let (cap_border, border_col, body_col) = match legacy {
+                Some(lg) => (
+                    LEGACY_SLIDER_BORDER_PORTION * cap_r,
+                    lg.slider_border_colour.opacity(fade),
+                    lg.slider_track_colour
+                        .unwrap_or(obj.colour)
+                        .opacity(0.7 * fade),
+                ),
+                None => {
+                    let body_alpha = if self.pro_skin { 0.92 } else { 0.98 };
+                    (
+                        GRADIENT_THICKNESS * obj.scale * m.pf,
+                        obj.colour.opacity(fade),
+                        obj.colour.darken(4.0).opacity(fade * body_alpha),
+                    )
+                }
+            };
             let mut segments = Vec::with_capacity(screen_pts.len() - 1);
             for i in 0..screen_pts.len() - 1 {
                 segments.push((screen_pts[i], screen_pts[i + 1]));
@@ -710,7 +1103,19 @@ impl SceneState {
             if n.kind != NestedKind::Tick {
                 continue;
             }
-            draw_slider_tick(list, m, obj, n.position, n.time, n.span_index, n.judged, t, self.hidden);
+            draw_slider_tick(
+                self.legacy.as_ref(),
+                assets,
+                list,
+                m,
+                obj,
+                n.position,
+                n.time,
+                n.span_index,
+                n.judged,
+                t,
+                self.hidden,
+            );
         }
 
         // --- Repeat arrows ---------------------------------------------------------
@@ -758,7 +1163,7 @@ impl SceneState {
                     };
                     st.0 = true;
                 }
-                draw_repeat_arrow(assets, list, m, obj, pos, n.time, n.judged, t, st.1);
+                draw_repeat_arrow(self.legacy.as_ref(), assets, list, m, obj, pos, n.time, n.judged, t, st.1);
                 ri += 1;
             }
         }
@@ -795,6 +1200,7 @@ impl SceneState {
         let combined = head_base * head_alpha;
         if combined > 0.003 {
             draw_circle_piece(
+                self.legacy.as_ref(),
                 assets,
                 list,
                 m,
@@ -826,7 +1232,32 @@ impl SceneState {
             let ball_pos_screen = m.pf(obj.slider_ball_at(completion));
             let ball_r = OUTER_GRADIENT_SIZE * 0.5 * obj.scale * m.pf;
 
-            if follow_alpha_now > 0.003 {
+            if let Some(lg) = legacy {
+                // LegacyFollowCircle: the sprite renders at half its
+                // authored size inside the ball area (ctor `Scale *= 0.5`)
+                // and animates its own scale/alpha.
+                if fc_alpha_now > 0.003
+                    && let Some(fc) = &lg.followcircle
+                    && let Some(frame) = fc.frames.first().copied()
+                {
+                    let frame = if fc.frames.len() > 1 {
+                        fc.frame_at(t - obj.start_time)
+                    } else {
+                        frame
+                    };
+                    let w = frame.display_width() * s * 0.5 * fc_scale_now as f32;
+                    let h = frame.display_height() * s * 0.5 * fc_scale_now as f32;
+                    list.image(
+                        assets.atlas,
+                        frame.region,
+                        ball_pos_screen,
+                        [w, h],
+                        0.0,
+                        Colour::WHITE.opacity(fc_alpha_now as f32),
+                        Blend::Alpha,
+                    );
+                }
+            } else if follow_alpha_now > 0.003 {
                 // Follow circle (under the ball): border 4, additive.
                 let fr = 64.0 * obj.scale * follow_scale_now as f32 * m.pf;
                 let fcol = obj.colour;
@@ -848,53 +1279,88 @@ impl SceneState {
             }
 
             if ball_alpha > 0.003 {
-                // ArgonSliderBall: circular container OUTER_GRADIENT_SIZE,
-                // white border of GRADIENT_THICKNESS, gradient fill
-                // accent -> accent.darken(0.5), and a FontAwesome
-                // AngleRight icon (Size 48, Scale (0.6, 0.8)) in white,
-                // rotated with the ball container to point along the
-                // direction of travel (`ball.Rotation` in
-                // DrawableSliderBall.UpdateProgress - no extra 180).
-                // The fa-angle-right glyph is 45-degree arms; the (0.6, 0.8)
-                // scale skews them to ~53 degrees from the axis (106 degree
-                // opening), ink ~11.3 x 24.2 in a 14.4 x 38.4 box, stroke
-                // ~5.3 (128-space units).
                 let rot = ball_rotation(obj, completion);
-                let (sr, cr) = rot.to_radians().sin_cos();
-                // Fill.
-                list.disc(
-                    ball_pos_screen,
-                    ball_r,
-                    obj.colour.opacity(ball_alpha as f32),
-                    obj.colour.darken(0.5).opacity(ball_alpha as f32),
-                    Blend::Alpha,
-                );
-                // White border ring.
-                list.ring(
-                    ball_pos_screen,
-                    ball_r,
-                    GRADIENT_THICKNESS * obj.scale * m.pf,
-                    Colour::WHITE.opacity(ball_alpha as f32),
-                    Colour::WHITE.opacity(ball_alpha as f32),
-                    Blend::Alpha,
-                );
-                // Icon: two round-capped strokes forming the angle bracket.
-                // On slider end the icon also shrinks to 0.9x over 200ms
-                // OutQuint (`icon.ScaleTo(defaultIconScale * 0.9, ...)`).
-                let icon_scale = if body_judged {
-                    value_at(t, bt, bt + 200.0, 1.0, 0.9, Easing::OutQuint) as f32
+                if let Some(lg) = legacy && let Some(ball) = &lg.sliderball {
+                    // LegacySliderBall: `sliderb` frame sequence advanced
+                    // by the slider velocity (`frameDelay = max(0.15 /
+                    // velocity * 60fps, 60fps)`), tinted with the combo
+                    // colour when `AllowSliderBallTint`; the `sliderb-nd`
+                    // (darkened 5,5,5) and `sliderb-spec` (additive) layers
+                    // counter-rotate to stay axis-aligned.
+                    let span_duration = obj.duration / obj.span_count.max(1) as f64;
+                    let velocity = if span_duration > 0.0 { obj.slider_distance / span_duration } else { 0.0 };
+                    let frame_delay = if velocity > 0.0 {
+                        (0.15 / velocity * SIXTY_FRAME_TIME).max(SIXTY_FRAME_TIME)
+                    } else {
+                        SIXTY_FRAME_TIME
+                    };
+                    let playhead = ((t - obj.start_time).max(0.0) / frame_delay) as usize;
+                    let frame = ball.frames[playhead % ball.frames.len()];
+                    let tint = if lg.sliderball_tint {
+                        obj.colour
+                    } else {
+                        lg.sliderball_colour
+                    };
+                    let draw_layer = |list: &mut DrawList, tex: SkinTexture, colour: Colour, rotation: f32, blend: Blend| {
+                        let w = tex.display_width() * s;
+                        let h = tex.display_height() * s;
+                        list.image(assets.atlas, tex.region, ball_pos_screen, [w, h], rotation, colour.opacity(ball_alpha as f32), blend);
+                    };
+                    if let Some(nd) = lg.sliderball_nd {
+                        draw_layer(list, nd, Colour::rgba_bytes(5, 5, 5, 255), -rot, Blend::Alpha);
+                    }
+                    draw_layer(list, frame, tint, rot, Blend::Alpha);
+                    if let Some(spec) = lg.sliderball_spec {
+                        draw_layer(list, spec, Colour::WHITE, -rot, Blend::Additive);
+                    }
                 } else {
-                    1.0
-                };
-                let unit = obj.scale * m.pf * icon_scale;
-                let thickness = 2.65 * unit;
-                let tip = [ball_pos_screen[0] + cr * 5.5 * unit, ball_pos_screen[1] + sr * 5.5 * unit];
-                let back = -5.0 * unit;
-                let open = 11.5 * unit;
-                let top = [ball_pos_screen[0] + cr * back + sr * -open, ball_pos_screen[1] + sr * back + cr * open];
-                let bottom = [ball_pos_screen[0] + cr * back + sr * open, ball_pos_screen[1] + sr * back - cr * open];
-                list.capsule(top, tip, thickness, Colour::WHITE.opacity(ball_alpha as f32), Blend::Alpha);
-                list.capsule(tip, bottom, thickness, Colour::WHITE.opacity(ball_alpha as f32), Blend::Alpha);
+                    // ArgonSliderBall: circular container OUTER_GRADIENT_SIZE,
+                    // white border of GRADIENT_THICKNESS, gradient fill
+                    // accent -> accent.darken(0.5), and a FontAwesome
+                    // AngleRight icon (Size 48, Scale (0.6, 0.8)) in white,
+                    // rotated with the ball container to point along the
+                    // direction of travel (`ball.Rotation` in
+                    // DrawableSliderBall.UpdateProgress - no extra 180).
+                    // The fa-angle-right glyph is 45-degree arms; the (0.6, 0.8)
+                    // scale skews them to ~53 degrees from the axis (106 degree
+                    // opening), ink ~11.3 x 24.2 in a 14.4 x 38.4 box, stroke
+                    // ~5.3 (128-space units).
+                    let (sr, cr) = rot.to_radians().sin_cos();
+                    // Fill.
+                    list.disc(
+                        ball_pos_screen,
+                        ball_r,
+                        obj.colour.opacity(ball_alpha as f32),
+                        obj.colour.darken(0.5).opacity(ball_alpha as f32),
+                        Blend::Alpha,
+                    );
+                    // White border ring.
+                    list.ring(
+                        ball_pos_screen,
+                        ball_r,
+                        GRADIENT_THICKNESS * obj.scale * m.pf,
+                        Colour::WHITE.opacity(ball_alpha as f32),
+                        Colour::WHITE.opacity(ball_alpha as f32),
+                        Blend::Alpha,
+                    );
+                    // Icon: two round-capped strokes forming the angle bracket.
+                    // On slider end the icon also shrinks to 0.9x over 200ms
+                    // OutQuint (`icon.ScaleTo(defaultIconScale * 0.9, ...)`).
+                    let icon_scale = if body_judged {
+                        value_at(t, bt, bt + 200.0, 1.0, 0.9, Easing::OutQuint) as f32
+                    } else {
+                        1.0
+                    };
+                    let unit = obj.scale * m.pf * icon_scale;
+                    let thickness = 2.65 * unit;
+                    let tip = [ball_pos_screen[0] + cr * 5.5 * unit, ball_pos_screen[1] + sr * 5.5 * unit];
+                    let back = -5.0 * unit;
+                    let open = 11.5 * unit;
+                    let top = [ball_pos_screen[0] + cr * back + sr * -open, ball_pos_screen[1] + sr * back + cr * open];
+                    let bottom = [ball_pos_screen[0] + cr * back + sr * open, ball_pos_screen[1] + sr * back - cr * open];
+                    list.capsule(top, tip, thickness, Colour::WHITE.opacity(ball_alpha as f32), Blend::Alpha);
+                    list.capsule(tip, bottom, thickness, Colour::WHITE.opacity(ball_alpha as f32), Blend::Alpha);
+                }
             }
         }
     }
@@ -1053,6 +1519,26 @@ impl SceneState {
             return;
         }
         let a = alpha as f32;
+
+        // Legacy spinner (`LegacySpinner` + `LegacyOldStyleSpinner`): the
+        // skin's sprites laid out in stable's 640x480 window space.
+        if let Some(lg) = &self.legacy {
+            draw_spinner_legacy(
+                lg,
+                assets,
+                list,
+                m,
+                obj,
+                a,
+                t,
+                progress,
+                anim.complete_at,
+                anim.display_rotation,
+                anim.bonus_score,
+                anim.bonus_flash,
+            );
+            return;
+        }
 
         // Pop-in scales (ArgonSpinnerDisc.updateStateTransforms): phase 1
         // over [0.5p, 0.75p] (centre -> 0.3, disc -> 0.2), a hold, then
@@ -1215,6 +1701,156 @@ impl SceneState {
     }
 }
 
+/// `LegacyOldStyleSpinner`: glow (new-style only), tinted background,
+/// spinning disc, top-down masked metre, approach circle shrinking
+/// 1.86x -> 0.1x over the duration, the spin/clear sprites and the
+/// bonus counter in score digits. All positions in the 640x480 window
+/// space via [`Mapper::win`].
+#[allow(clippy::too_many_arguments)]
+fn draw_spinner_legacy(
+    lg: &LegacyCache,
+    assets: &Assets,
+    list: &mut DrawList,
+    m: &Mapper,
+    obj: &ObjView,
+    alpha: f32,
+    t: f64,
+    progress: f64,
+    complete_at: Option<f64>,
+    display_rotation: f64,
+    bonus_score: i64,
+    bonus_flash: Option<(f64, bool)>,
+) {
+    let unit = m.win_unit();
+    let centre = m.win([320.0, LEGACY_SPINNER_Y_CENTRE]);
+    let scale = LEGACY_SPINNER_SCALE;
+
+    let draw_sprite = |list: &mut DrawList, tex: SkinTexture, pos: [f32; 2], s: f32, rotation: f32, colour: Colour, blend: Blend| {
+        let w = tex.display_width() * scale * unit * s;
+        let h = tex.display_height() * scale * unit * s;
+        list.image(assets.atlas, tex.region, pos, [w, h], rotation, colour, blend);
+    };
+
+    // Glow (new-style skins ship `spinner-glow`): additive, brightness
+    // follows the spin progress.
+    if let Some(glow) = lg.spinner_glow {
+        let glow_a = (0.2 + 0.6 * progress as f32) * alpha;
+        draw_sprite(list, glow, centre, 1.0, 0.0, Colour::WHITE.opacity(glow_a), Blend::Additive);
+    }
+
+    if let Some(background) = lg.spinner_background {
+        draw_sprite(list, background, centre, 1.0, 0.0, lg.spinner_background_colour.opacity(alpha), Blend::Alpha);
+    }
+
+    if let Some(disc) = lg.spinner_circle {
+        draw_sprite(list, disc, centre, 1.0, display_rotation as f32, Colour::WHITE.opacity(alpha), Blend::Alpha);
+    }
+
+    // Metre: 10 bars; `getMetreHeight` blinks the partial bar (capped at
+    // 99% progress so it keeps blinking at full) - deterministic here.
+    if let Some(metre) = lg.spinner_metre {
+        const TOTAL_BARS: f64 = 10.0;
+        let final_height = 692.0 * scale as f64; // window units
+        let mut p = progress * 100.0;
+        if lg.spinner_blink {
+            p = p.min(99.0);
+        }
+        let mut bars = (p as i64) / 10;
+        if lg.spinner_blink && p > 0.0 {
+            let fraction = (p as i64 % 10) as f64 / 10.0;
+            // RNG.NextBool(fraction): deterministic per (time, bar).
+            let hash = (t as i64 as u64).wrapping_mul(2654435761).wrapping_add(p as u64);
+            if (hash % 1000) as f64 / 1000.0 < fraction {
+                bars += 1;
+            }
+        }
+        let visible = bars as f64 / TOTAL_BARS * final_height;
+        if visible > 0.5 {
+            let metre_display_h = metre.display_height() as f64 * scale as f64;
+            let top = m.win([0.0, LEGACY_SPINNER_TOP_OFFSET]);
+            let w = metre.display_width() * scale * unit;
+            let h = visible as f32 * unit;
+            let fraction_full = (final_height / metre_display_h).min(1.0) as f32;
+            let visible_fraction = (visible / metre_display_h).min(1.0) as f32;
+            list.image_sub(
+                assets.atlas,
+                metre.region,
+                [top[0] + w * 0.5, top[1] + h * 0.5],
+                [w, h],
+                0.0,
+                Colour::WHITE.opacity(alpha),
+                Blend::Alpha,
+                0.0,
+                0.0,
+                1.0,
+                (visible_fraction / fraction_full).min(1.0),
+            );
+        }
+    }
+
+    // Approach circle: 1.86x -> 0.1x linearly over the spinner duration.
+    if let Some(approach) = lg.spinner_approachcircle {
+        let s = value_at(t, obj.start_time, obj.start_time + obj.duration, 1.86, 0.1, Easing::Linear) as f32;
+        draw_sprite(list, approach, centre, s, 0.0, Colour::WHITE.opacity(alpha), Blend::Alpha);
+    }
+
+    // "spin" sprite: fades in over the second half of the fade-in,
+    // fades out over min(400, duration) before the judgement time.
+    if let Some(spin) = lg.spinner_spin {
+        let jt = obj.end_time;
+        let spin_fade_out = 400.0f64.min(obj.duration);
+        let spin_alpha = value_at(t, obj.start_time - obj.fade_in / 2.0, obj.start_time, 0.0, 1.0, Easing::Linear)
+            * value_at(t, jt - spin_fade_out, jt, 1.0, 0.0, Easing::Linear);
+        if spin_alpha > 0.003 && t < jt {
+            let pos = m.win([320.0, LEGACY_SPINNER_TOP_OFFSET + 335.0]);
+            draw_sprite(list, spin, pos, 1.0, 0.0, Colour::WHITE.opacity(spin_alpha as f32 * alpha), Blend::Alpha);
+        }
+    }
+
+    // "clear" sprite on completion (`onCompletedChanged`): fade in 400
+    // Out, scale 2x -> 0.8x (240 Out) -> 1x (160), gone 50ms before the
+    // judgement.
+    if let (Some(clear), Some(ct)) = (lg.spinner_clear, complete_at) {
+        let jt = obj.end_time.max(ct);
+        let x = t - ct;
+        let clear_alpha = value_at(x, 0.0, 400.0, 0.0, 1.0, Easing::Out)
+            * value_at(t, jt - 50.0, jt, 1.0, 0.0, Easing::Linear);
+        if clear_alpha > 0.003 && t < jt {
+            let s = if x < 240.0 {
+                value_at(x, 0.0, 240.0, 2.0, 0.8, Easing::Out)
+            } else {
+                value_at(x, 240.0, 400.0, 0.8, 1.0, Easing::Linear)
+            };
+            let pos = m.win([320.0, LEGACY_SPINNER_TOP_OFFSET + 115.0]);
+            draw_sprite(list, clear, pos, s as f32, 0.0, Colour::WHITE.opacity(clear_alpha as f32 * alpha), Blend::Alpha);
+        }
+    }
+
+    // Bonus counter in score digits (`bonusCounter`): 1.4x -> 1.8x / 500ms
+    // fade at max, else 2x -> 1.28x over an 800ms fade.
+    if let (Some(digits), Some((bt, is_max))) = (&lg.score_digits, bonus_flash) {
+        if bonus_score > 0 {
+            let x = t - bt;
+            let (s, ba) = if is_max {
+                (
+                    value_at(x, 0.0, 1000.0, 1.4, 1.8, Easing::Out) as f32,
+                    value_at(x, 0.0, 500.0, 1.0, 0.0, Easing::Out) as f32,
+                )
+            } else {
+                (
+                    value_at(x, 0.0, 800.0, 2.0, 1.28, Easing::Out) as f32,
+                    value_at(x, 0.0, 800.0, 1.0, 0.0, Easing::Out) as f32,
+                )
+            };
+            if ba > 0.003 {
+                let pos = m.win([320.0, LEGACY_SPINNER_TOP_OFFSET + 299.0]);
+                let text = bonus_score.to_string();
+                draw_legacy_number(list, assets.atlas, digits, &text, pos, unit * scale * s, Colour::WHITE.opacity(ba * alpha), Blend::Alpha);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared element drawing (free functions)
 // ---------------------------------------------------------------------------
@@ -1222,6 +1858,128 @@ impl SceneState {
 /// The Argon main circle piece (hit circles and slider heads).
 #[allow(clippy::too_many_arguments)]
 fn draw_circle_piece(
+    legacy: Option<&LegacyCache>,
+    assets: &Assets,
+    list: &mut DrawList,
+    m: &Mapper,
+    obj: &ObjView,
+    accent: Colour,
+    alpha: f32,
+    number: u32,
+    with_outer_fill: bool,
+    judged: bool,
+    hit: bool,
+    ht: f64,
+    t: f64,
+) {
+    if let Some(lg) = legacy {
+        // SkinnableDrawable fallback semantics: a legacy skin serves the
+        // sprites OR the argon vector piece draws (`with_outer_fill` ==
+        // false means this is a slider head, which prefers
+        // `sliderstartcircle`).
+        let pair = if with_outer_fill { lg.hitcircle } else { lg.sliderstartcircle.or(lg.hitcircle) };
+        if let Some((circle, overlay)) = pair {
+            draw_circle_piece_legacy(
+                lg,
+                assets,
+                list,
+                m,
+                obj,
+                accent,
+                alpha,
+                number,
+                judged,
+                hit,
+                ht,
+                t,
+                circle,
+                overlay,
+            );
+            return;
+        }
+    }
+    draw_circle_piece_argon(assets, list, m, obj, accent, alpha, number, with_outer_fill, judged, hit, ht, t)
+}
+
+/// `LegacyMainCirclePiece`: tinted `hitcircle` sprite, `hitcircleoverlay`,
+/// digit-sprite number (under the overlay when
+/// `HitCircleOverlayAboveNumber`), and the hit transforms
+/// (`updateStateTransforms`: 240ms Out fade + 1.4x scale; skins v2.0+
+/// fade the number over 240/4, older skins pop it like the sprites).
+#[allow(clippy::too_many_arguments)]
+fn draw_circle_piece_legacy(
+    lg: &LegacyCache,
+    assets: &Assets,
+    list: &mut DrawList,
+    m: &Mapper,
+    obj: &ObjView,
+    accent: Colour,
+    alpha: f32,
+    number: u32,
+    judged: bool,
+    hit: bool,
+    ht: f64,
+    t: f64,
+    circle: SkinTexture,
+    overlay: Option<SkinTexture>,
+) {
+    let centre = m.pf(obj.position);
+    let s = obj.scale * m.pf;
+    let x = t - ht;
+
+    // Sprite transforms: 1 -> 1.4 scale over 240ms Out when hit; the
+    // fade comes in through `alpha` (240ms linear on hit, 100ms miss).
+    let sprite_scale = if judged && hit {
+        value_at(x, 0.0, 240.0, 1.0, 1.4, Easing::Out) as f32
+    } else {
+        1.0
+    };
+
+    // `LegacyColourCompatibility.DisallowZeroAlpha` - near-black accents
+    // are lifted so the tint never disappears.
+    let tint = Colour::rgb(accent.r.max(0.05), accent.g.max(0.05), accent.b.max(0.05));
+
+    let draw_sprite = |list: &mut DrawList, tex: SkinTexture, colour: Colour| {
+        let w = tex.display_width() * s * sprite_scale;
+        let h = tex.display_height() * s * sprite_scale;
+        list.image(assets.atlas, tex.region, centre, [w, h], 0.0, colour.opacity(alpha), Blend::Alpha);
+    };
+
+    draw_sprite(list, circle, tint);
+
+    // Number: digit sprites at their authored size, fading per the
+    // skin's legacy version on hit.
+    if let Some(digits) = &lg.hitcircle_digits && number > 0 {
+        let number_alpha = if judged && hit {
+            if lg.version > 1.0 {
+                value_at(x, 0.0, 240.0 / 4.0, 1.0, 0.0, Easing::Linear) as f32
+            } else {
+                value_at(x, 0.0, 240.0, 1.0, 0.0, Easing::Linear) as f32
+            }
+        } else {
+            1.0
+        };
+        if number_alpha > 0.003 {
+            let text = number.to_string();
+            draw_legacy_number(
+                list,
+                assets.atlas,
+                digits,
+                &text,
+                centre,
+                s * sprite_scale,
+                Colour::WHITE.opacity(alpha * number_alpha),
+                Blend::Alpha,
+            );
+        }
+    }
+
+    if let Some(overlay) = overlay {
+        draw_sprite(list, overlay, Colour::WHITE);
+    }
+}
+
+fn draw_circle_piece_argon(
     assets: &Assets,
     list: &mut DrawList,
     m: &Mapper,
@@ -1327,6 +2085,8 @@ fn draw_circle_piece(
 }
 
 fn draw_slider_tick(
+    legacy: Option<&LegacyCache>,
+    assets: &Assets,
     list: &mut DrawList,
     m: &Mapper,
     obj: &ObjView,
@@ -1371,6 +2131,16 @@ fn draw_slider_tick(
     }
 
     let pos = m.pf(position);
+    // Legacy: `sliderscorepoint` sprite at its authored size.
+    if let Some(lg) = legacy
+        && let Some(tex) = lg.scorepoint
+    {
+        let w = tex.display_width() * obj.scale * m.pf * scale as f32;
+        let h = tex.display_height() * obj.scale * m.pf * scale as f32;
+        list.image(assets.atlas, tex.region, pos, [w, h], 0.0, Colour::WHITE.opacity(alpha as f32), Blend::Alpha);
+        return;
+    }
+
     let size = 6.0 * obj.scale * m.pf * scale as f32;
     list.ring(pos, size, 3.0 * obj.scale * m.pf, obj.colour.opacity(alpha as f32), obj.colour.opacity(alpha as f32), Blend::Alpha);
 }
@@ -1396,6 +2166,7 @@ fn repeat_fade(
 }
 
 fn draw_repeat_arrow(
+    legacy: Option<&LegacyCache>,
     assets: &Assets,
     list: &mut DrawList,
     m: &Mapper,
@@ -1453,6 +2224,35 @@ fn draw_repeat_arrow(
 
     let pos = m.pf(position);
     let s = obj.scale * m.pf;
+
+    // `LegacyReverseArrow`: the skin's `reversearrow` sprite replaces the
+    // whole argon assembly. v1.0 skins wobble the rotation (+-5.625 deg
+    // over the 300ms loop) and pulse the scale linearly; newer skins only
+    // pulse the scale (Out). On hit the arrow pops 1 -> 1.4 over
+    // min(300, spanDuration) Out.
+    if let Some(lg) = legacy
+        && let Some(tex) = lg.reversearrow
+    {
+        let loop_t = (t - anim_start).max(0.0) % 300.0;
+        let old_skin = lg.version <= 1.0;
+        let (mut scale, wobble) = if old_skin {
+            (
+                value_at(loop_t, 0.0, 300.0, 1.3, 1.0, Easing::Linear),
+                value_at(loop_t, 0.0, 300.0, 5.625, -5.625, Easing::Linear) as f32,
+            )
+        } else {
+            (value_at(loop_t, 0.0, 300.0, 1.3, 1.0, Easing::Out), 0.0)
+        };
+        if let Some(jt) = j_time {
+            if j_hit && t >= jt {
+                scale = value_at(t, jt, jt + anim_duration, 1.0, 1.4, Easing::Out);
+            }
+        }
+        let w = tex.display_width() * s * scale as f32;
+        let h = tex.display_height() * s * scale as f32;
+        list.image(assets.atlas, tex.region, pos, [w, h], rot + wobble, Colour::WHITE.opacity(alpha as f32), Blend::Alpha);
+        return;
+    }
 
     let mut scale = 1.0f64;
     if let Some(jt) = j_time {
@@ -1668,6 +2468,7 @@ mod tests {
             fade_in: 400.0,
             new_combo: true,
             colour: Colour::WHITE,
+            combo_colour_index: 0,
             number: 1,
             slider_points: vec![[0.0, 0.0], [100.0, 0.0], [100.0, 100.0]],
             slider_distance: 200.0,
@@ -1991,7 +2792,14 @@ fn damp_half(current: f64, target: f64, half_time_ms: f64, dt_ms: f64) -> f64 {
 // Follow points
 // ---------------------------------------------------------------------------
 
-fn draw_follow_points(game: &GameData, m: &Mapper, list: &mut DrawList, t: f64) {
+fn draw_follow_points(
+    legacy: Option<&LegacyCache>,
+    game: &GameData,
+    m: &Mapper,
+    list: &mut DrawList,
+    atlas: &Atlas,
+    t: f64,
+) {
     let objs = &game.objects;
     for w in objs.windows(2) {
         let (start, end) = (&w[0], &w[1]);
@@ -2032,6 +2840,19 @@ fn draw_follow_points(game: &GameData, m: &Mapper, list: &mut DrawList, t: f64) 
                     let pos = [start_pos[0] + dv[0] * f as f32, start_pos[1] + dv[1] * f as f32];
                     let scale = value_at(t, fade_in, fade_in + end.fade_in, 1.5, 1.0, Easing::Out);
                     let sp = m.pf(pos);
+
+                    // Legacy: the skin's `followpoint` sprite (untinted),
+                    // rotated along the connection.
+                    if let Some(lg) = legacy
+                        && let Some(tex) = lg.followpoint
+                    {
+                        let w = tex.display_width() * m.pf * end.scale * scale as f32;
+                        let h = tex.display_height() * m.pf * end.scale * scale as f32;
+                        list.image(atlas, tex.region, sp, [w, h], rotation, Colour::WHITE.opacity(alpha as f32), Blend::Alpha);
+                        d += FOLLOW_POINT_SPACING;
+                        continue;
+                    }
+
                     let size = 8.0 * m.pf * end.scale * scale as f32;
                     // fa-chevron-right stroke ~47.7/512 of the glyph height.
                     let thickness = size * 0.094;
@@ -2106,9 +2927,97 @@ fn draw_judgement_explosion(list: &mut DrawList, m: &Mapper, ev: &EventView, t: 
     }
 }
 
-fn draw_judgement_text(assets: &Assets, list: &mut DrawList, m: &Mapper, ev: &EventView, t: f64) {
+fn draw_judgement_text(
+    legacy: Option<&LegacyCache>,
+    assets: &Assets,
+    list: &mut DrawList,
+    m: &Mapper,
+    ev: &EventView,
+    t: f64,
+) {
     let x = t - ev.time;
     if x < 0.0 {
+        return;
+    }
+
+    // Legacy judgement bursts (`LegacyJudgementPieceOld`): fade in over
+    // 120ms, fade out from 500ms over 600ms. Multi-frame animations play
+    // WITHOUT the scale transforms; single sprites pop: hits 0.6 -> 1.1
+    // (0.8x120ms) -> hold -> 0.9 -> 0.95 -> 1.0, misses 1.6 -> 1 over
+    // 100ms In with the v2.0+ rise/fall and a random +-8.6 deg tilt.
+    // Missed ticks (LargeTickMiss/IgnoreMiss) get the reduced animation.
+    if let Some(lg) = legacy
+        && let Some(idx) = judgement_index(ev.result)
+        && let Some(anim) = &lg.judgement[idx]
+    {
+        let frame = anim.frame_at(x.max(0.0));
+        let fade_in_length = 120.0f64;
+        let fade_out_delay = 500.0f64;
+        let fade_out_length = 600.0f64;
+
+        let is_miss = !hit_result_ext::is_hit(ev.result);
+        let is_missed_tick = is_miss && ev.result != HitResult::Miss;
+
+        let (alpha, fade_end) = if is_missed_tick {
+            (value_at(x, 0.0, fade_in_length, 0.0, 1.0, Easing::Linear)
+                * value_at(x, fade_out_delay / 2.0, fade_out_delay / 2.0 + fade_out_length, 1.0, 0.0, Easing::Linear),
+             fade_out_delay / 2.0 + fade_out_length)
+        } else {
+            (value_at(x, 0.0, fade_in_length, 0.0, 1.0, Easing::Linear)
+                * value_at(x, fade_out_delay, fade_out_delay + fade_out_length, 1.0, 0.0, Easing::Linear),
+             fade_out_delay + fade_out_length)
+        };
+        if alpha <= 0.003 {
+            return;
+        }
+        if x > fade_end {
+            return;
+        }
+
+        let centre = m.pf(ev.position);
+        let unit = m.pf * ev.scale;
+
+        // Single-frame sprites take the scale/rotation transforms;
+        // animations only fade.
+        let multi_frame = anim.frames.len() > 1;
+        let (mut scale, mut offset_y, mut rotation) = (1.0f64, 0.0f64, 0.0f32);
+        if !multi_frame {
+            if is_miss {
+                if is_missed_tick {
+                    scale = value_at(x, 0.0, 100.0, 1.2, 1.0, Easing::In);
+                } else {
+                    scale = value_at(x, 0.0, 100.0, 1.6, 1.0, Easing::In);
+                    if lg.version > 1.0 {
+                        // Rise from -5 by +80 over the fade-out tail.
+                        offset_y = -5.0
+                            + value_at(x, 0.0, fade_out_delay + fade_out_length, 0.0, 80.0, Easing::In);
+                    }
+                    // Deterministic per-event tilt (RNG.NextSingle(-8.6, 8.6)).
+                    let mut rng = (ev.time as u64).wrapping_mul(0x9E3779B97F4A7C15) | 1;
+                    rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    let tilt = ((rng >> 33) as f64 / u64::from(u32::MAX >> 1) as f64) as f32 * 17.2 - 8.6;
+                    rotation = tilt * value_at(x, 0.0, fade_in_length, 0.0, 1.0, Easing::Linear) as f32
+                        + tilt * value_at(x, fade_in_length, fade_out_delay + fade_out_length, 0.0, 1.0, Easing::In) as f32;
+                }
+            } else {
+                // 0.6 -> 1.1 over 96ms, hold to 120ms, 0.9 over 24ms,
+                // jump to 0.95, then 1.0 over 24ms.
+                scale = if x < 96.0 {
+                    value_at(x, 0.0, 96.0, 0.6, 1.1, Easing::Linear)
+                } else if x < 120.0 {
+                    value_at(x, 96.0, 120.0, 1.1, 0.9, Easing::Linear)
+                } else if x < 144.0 {
+                    value_at(x, 120.0, 144.0, 0.95, 1.0, Easing::Linear)
+                } else {
+                    1.0
+                };
+            }
+        }
+
+        let pos = [centre[0], centre[1] + offset_y as f32 * unit];
+        let w = frame.display_width() * unit * scale as f32;
+        let h = frame.display_height() * unit * scale as f32;
+        list.image(assets.atlas, frame.region, pos, [w, h], rotation, Colour::WHITE.opacity(alpha as f32), Blend::Alpha);
         return;
     }
 
@@ -2179,6 +3088,7 @@ fn draw_judgement_text(assets: &Assets, list: &mut DrawList, m: &Mapper, ev: &Ev
 /// `hd`: HD is active and this is the first adjustable object - the only
 /// approach circle kept. Its fade window uses the HD-adjusted TimeFadeIn.
 fn draw_approach_circle(
+    legacy: Option<&LegacyCache>,
     assets: &Assets,
     list: &mut DrawList,
     m: &Mapper,
@@ -2218,9 +3128,21 @@ fn draw_approach_circle(
     // over the preempt, tinted with the combo colour (DisallowZeroAlpha).
     let scale = value_at(t, appear, obj.start_time, 4.0, 1.0, Easing::Linear) as f32;
     let centre = m.pf(obj.position);
-    let size = 128.0 * (128.0 / 118.0) * obj.scale * scale * m.pf;
     let c = obj.colour;
     let col = Colour::rgb(c.r.max(0.05), c.g.max(0.05), c.b.max(0.05)).opacity(alpha as f32);
+
+    // Legacy: the skin's `approachcircle` sprite at its authored size
+    // (`LegacyApproachCircle`, same tint and 4x -> 1x scaling).
+    if let Some(lg) = legacy
+        && let Some(tex) = lg.approachcircle
+    {
+        let w = tex.display_width() * obj.scale * m.pf * scale;
+        let h = tex.display_height() * obj.scale * m.pf * scale;
+        list.image(assets.atlas, tex.region, centre, [w, h], 0.0, col, Blend::Alpha);
+        return;
+    }
+
+    let size = 128.0 * (128.0 / 118.0) * obj.scale * scale * m.pf;
     list.image(
         assets.atlas,
         crate::draw::Region::ApproachCircle,
@@ -2236,7 +3158,41 @@ fn draw_approach_circle(
 // Cursor
 // ---------------------------------------------------------------------------
 
-fn draw_cursor(list: &mut DrawList, pos: [f32; 2], scale: f32) {
+fn draw_cursor(
+    legacy: Option<&LegacyCache>,
+    assets: &Assets,
+    list: &mut DrawList,
+    pos: [f32; 2],
+    scale: f32,
+    t: f64,
+) {
+    // `LegacyCursor`: a 50-unit box holding the `cursor` sprite (the only
+    // expanding layer) with `cursormiddle` on top; press pops to 1.3x
+    // (100ms Out), `CursorRotate` spins the sprite a revolution per 10s.
+    if let Some(lg) = legacy
+        && let Some(cursor) = lg.cursor
+    {
+        let rotation = if lg.cursor_rotate {
+            ((t % LEGACY_CURSOR_REVOLUTION) / LEGACY_CURSOR_REVOLUTION * 360.0) as f32
+        } else {
+            0.0
+        };
+        let unit = 50.0 * scale / 1.0;
+        let draw = |list: &mut DrawList, tex: SkinTexture, factor: f32, rotation: f32| {
+            // Sprites fill the box relative to their aspect: the long axis
+            // maps to `unit` (stable squares off against square sprites).
+            let long = tex.display_width().max(tex.display_height());
+            let w = tex.display_width() / long * unit * factor;
+            let h = tex.display_height() / long * unit * factor;
+            list.image(assets.atlas, tex.region, pos, [w, h], rotation, Colour::WHITE, Blend::Alpha);
+        };
+        draw(list, cursor, 1.0, rotation);
+        if let Some(middle) = lg.cursormiddle {
+            draw(list, middle, 1.0, 0.0);
+        }
+        return;
+    }
+
     let r = CURSOR_SIZE * 0.5 * scale;
 
     let top = Colour::from_hex(0xFC618F);
