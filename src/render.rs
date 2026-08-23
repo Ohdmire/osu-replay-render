@@ -57,14 +57,21 @@ struct VsOut2 {
     @location(2) radius: f32,
 };
 
+struct PrepassIn {
+    @location(0) pos: vec2<f32>,
+    @location(1) start: vec2<f32>,
+    @location(2) end: vec2<f32>,
+    @location(3) radius: f32,
+};
+
 @vertex
-fn vs_body_pre(in: VsIn) -> VsOut2 {
+fn vs_body_pre(in: PrepassIn) -> VsOut2 {
     var out: VsOut2;
     let ndc = vec2<f32>(in.pos.x / screen.size.x * 2.0 - 1.0, 1.0 - in.pos.y / screen.size.y * 2.0);
     out.pos = vec4<f32>(ndc, 0.0, 1.0);
-    out.start = in.color.xy;
-    out.end = in.color.zw;
-    out.radius = in.aux.y;
+    out.start = in.start;
+    out.end = in.end;
+    out.radius = in.radius;
     return out;
 }
 
@@ -711,6 +718,16 @@ impl Renderer {
             bind_group_layouts: &[&screen_layout],
             push_constant_ranges: &[],
         });
+        let prepass_vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<PrepassVertex>() as u64, // 28
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x2 },
+                wgpu::VertexAttribute { offset: 8, shader_location: 1, format: wgpu::VertexFormat::Float32x2 },
+                wgpu::VertexAttribute { offset: 16, shader_location: 2, format: wgpu::VertexFormat::Float32x2 },
+                wgpu::VertexAttribute { offset: 24, shader_location: 3, format: wgpu::VertexFormat::Float32 },
+            ],
+        };
         let body_pre_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("body prepass"),
             layout: Some(&prepass_layout),
@@ -718,7 +735,7 @@ impl Renderer {
                 module: &module,
                 entry_point: Some("vs_body_pre"),
                 compilation_options: Default::default(),
-                buffers: &[vertex_layout.clone()],
+                buffers: &[prepass_vertex_layout.clone()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &module,
@@ -820,7 +837,9 @@ impl Renderer {
         });
         let body_vbo = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("body vbo"),
-            size: 4 << 20,
+            // 16 MiB ÷ (4 verts × 28 B) ≈ 149k slider segments per frame;
+            // the observed dense-map spike was ~15k.
+            size: 16 << 20,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -906,7 +925,7 @@ impl Renderer {
         // own field pass so overlapping bodies never share distance values.
         let mut body_quads: Vec<Vertex> = Vec::new();
         let mut body_indices: Vec<u32> = Vec::new();
-        let mut prepass_verts: Vec<Vertex> = Vec::new();
+        let mut prepass_verts: Vec<PrepassVertex> = Vec::new();
         let mut prepass_indices: Vec<u32> = Vec::new();
         // Index range of each body's segments inside the prepass buffers.
         let mut prepass_ranges: Vec<(u32, u32)> = Vec::new();
@@ -930,13 +949,11 @@ impl Renderer {
                     [a[0].max(b[0]) + pad, a[1].max(b[1]) + pad],
                     [a[0].min(b[0]) - pad, a[1].max(b[1]) + pad],
                 ] {
-                    prepass_verts.push(Vertex {
+                    prepass_verts.push(PrepassVertex {
                         pos: corner,
-                        local: [0.0; 2],
-                        color: [a[0], a[1], b[0], b[1]],
-                        color2: [0.0; 4],
-                        uv: [0.0; 4],
-                        aux: [crate::draw::MODE_CAPSULE, body.radius, 0.0, 0.0],
+                        start: [a[0], a[1]],
+                        end: [b[0], b[1]],
+                        radius: body.radius,
                     });
                 }
                 prepass_indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -1472,9 +1489,21 @@ impl Renderer {
     }
 }
 
+/// Compact slider-body prepass vertex: 28 bytes (the fat 80-byte scene
+/// Vertex wastes 60+ bytes per prepass corner).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PrepassVertex {
+    pos: [f32; 2],
+    start: [f32; 2],
+    end: [f32; 2],
+    radius: f32,
+}
+
 // Minimal bytemuck-style cast (avoids the extra dependency).
 unsafe trait Pod {}
 unsafe impl Pod for Vertex {}
+unsafe impl Pod for PrepassVertex {}
 unsafe impl Pod for u32 {}
 unsafe impl Pod for f32 {}
 
