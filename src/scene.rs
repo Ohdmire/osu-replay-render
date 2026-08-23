@@ -383,6 +383,12 @@ impl SceneState {
         // 6. Approach circles.
         if std::env::var("NO_APPROACH").is_err() {
             for obj in &game.objects {
+                // Spinners have no approach circle in lazer: neither
+                // `DrawableSpinner` nor any Argon spinner component defines
+                // one (only legacy skins draw `spinner-approachcircle`).
+                if obj.kind == ObjKind::Spinner {
+                    continue;
+                }
                 // HD hides approach circles everywhere except the first
                 // adjustable object (`IncreaseFirstObjectVisibility`,
                 // default on; spinners never qualify as the first object).

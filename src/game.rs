@@ -329,7 +329,7 @@ pub fn load(map_path: &str, replay_path: &str) -> Result<GameData, String> {
     let mods = Mods::from_legacy(rep.header.mods, classic)?;
     let difficulty = process::apply_difficulty_mods(map.difficulty, mods.hard_rock, mods.easy);
     let hp = difficulty.hp;
-    let processed = process::process(&map, difficulty, classic);
+    let processed = process::process(&map, difficulty, classic, mods.hard_rock);
 
     let mut engine = Engine::new(processed, &mods);
     engine.run(&rep.frames);
@@ -352,7 +352,7 @@ pub fn load_autoplay(map_path: &str) -> Result<GameData, String> {
     let classic = false;
     let difficulty = process::apply_difficulty_mods(map.difficulty, false, false);
     let hp = difficulty.hp;
-    let processed = process::process(&map, difficulty, classic);
+    let processed = process::process(&map, difficulty, classic, false);
 
     let frames = crate::autoplay::AutoGenerator::new(&processed.objects, difficulty.ar as f64).generate();
 
