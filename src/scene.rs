@@ -334,6 +334,11 @@ struct LegacyCache {
     scorepoint: Option<SkinTexture>,
     cursor: Option<SkinTexture>,
     cursormiddle: Option<SkinTexture>,
+    /// `CursorExpand` (default true): skins may disable the press pop.
+    cursor_expand: bool,
+    /// `CursorCentre` (default true): anchor the sprite's centre vs its
+    /// top-left corner at the cursor position.
+    cursor_centre: bool,
     cursortrail: Option<SkinTexture>,
     /// Stable picks the trail style from the cursor texture's provider:
     /// disjoint (no `cursormiddle`) vs continuous additive.
@@ -452,6 +457,8 @@ impl LegacyCache {
             scorepoint: skin.get_texture("sliderscorepoint"),
             cursor,
             cursormiddle,
+            cursor_expand: generic_bool("CursorExpand", true),
+            cursor_centre: generic_bool("CursorCentre", true),
             cursortrail: skin.get_texture("cursortrail"),
             disjoint_trail,
             followpoint: skin::get_animation(skin, "followpoint", true, true, true, "-"),
@@ -585,11 +592,13 @@ impl SceneState {
             self.legacy = Some(LegacyCache::new(assets.skin));
         }
 
-        // Cursor expand animation. Legacy cursors pop to 1.3 over 100ms
-        // Out both ways (`LegacyCursor.Expand/Contract`); argon to 1.2
+        // Cursor expand animation. `CursorExpand: 0` skins disable the pop
+        // entirely (`OsuCursor.Expand` early-returns). Legacy cursors pop
+        // to 1.3 over 100ms Out both ways (`LegacyCursor`); argon to 1.2
         // with an elastic pop.
         let pressed = snap.left || snap.right;
-        if pressed != self.was_pressed {
+        let expand_enabled = self.legacy.as_ref().map(|l| l.cursor_expand).unwrap_or(true);
+        if expand_enabled && pressed != self.was_pressed {
             let (target, dur, easing) = if self.legacy.is_some() {
                 (if pressed { 1.3 } else { 1.0 }, 100.0, Easing::Out)
             } else if pressed {
@@ -598,6 +607,8 @@ impl SceneState {
                 (1.0, 400.0, Easing::OutQuad)
             };
             self.cursor_anim = Some((t, t + dur, self.cursor_expand, target, easing));
+            self.was_pressed = pressed;
+        } else {
             self.was_pressed = pressed;
         }
         if let Some((a, b, from, to, e)) = self.cursor_anim {
@@ -772,13 +783,19 @@ impl SceneState {
                 // `Texture.ScaleAdjust *= STABLE_MAGIC_SCALE_FACTOR` on
                 // load: like the cursor, the 1.6 cancels against the
                 // playfield scale, so the sprite shows at its display
-                // size in WINDOW units.
+                // size in WINDOW units. `TrailOrigin` follows
+                // `CursorCentre` (centre vs top-left anchor).
                 let w = tex.display_width() * self.mapper.virt;
                 let h = tex.display_height() * self.mapper.virt;
+                let at = if lg.cursor_centre {
+                    p.pos
+                } else {
+                    [p.pos[0] + w * 0.5, p.pos[1] + h * 0.5]
+                };
                 list.image(
                     assets.atlas,
                     tex.region,
-                    p.pos,
+                    at,
                     [w, h],
                     0.0,
                     Colour::WHITE.opacity(alpha),
@@ -3221,7 +3238,14 @@ fn draw_cursor(
         let draw = |list: &mut DrawList, tex: SkinTexture, expand: f32, rotation: f32| {
             let w = tex.display_width() * virt * expand;
             let h = tex.display_height() * virt * expand;
-            list.image(assets.atlas, tex.region, pos, [w, h], rotation, Colour::WHITE, Blend::Alpha);
+            // `CursorCentre: 0` anchors the sprite's top-left at the
+            // cursor position instead of its centre.
+            let at = if lg.cursor_centre {
+                pos
+            } else {
+                [pos[0] + w * 0.5, pos[1] + h * 0.5]
+            };
+            list.image(assets.atlas, tex.region, at, [w, h], rotation, Colour::WHITE, Blend::Alpha);
         };
         draw(list, cursor, scale, rotation);
         if let Some(middle) = lg.cursormiddle {
