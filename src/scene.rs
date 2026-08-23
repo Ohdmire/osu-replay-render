@@ -3138,6 +3138,12 @@ fn draw_approach_circle(
     {
         let w = tex.display_width() * obj.scale * m.pf * scale;
         let h = tex.display_height() * obj.scale * m.pf * scale;
+        if std::env::var("APPROACH_DEBUG").is_ok() {
+            eprintln!(
+                "APPROACH obj={} t={} tex={}x{} adjust={} display={:.0} objscale={:.2} pf={:.2} scale={:.2} -> w={:.0} alpha={:.2}",
+                obj.index, t, tex.width, tex.height, tex.scale_adjust, tex.display_width(), obj.scale, m.pf, scale, w, alpha
+            );
+        }
         list.image(assets.atlas, tex.region, centre, [w, h], 0.0, col, Blend::Alpha);
         return;
     }

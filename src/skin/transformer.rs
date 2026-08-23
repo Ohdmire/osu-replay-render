@@ -87,10 +87,21 @@ impl Skin for ResolvedSkin {
 
 impl SkinTextureSource for ResolvedSkin {
     fn texture_images(&self) -> Vec<(String, crate::draw::Image)> {
-        // User skin first: on name clashes the user's files win (the
-        // fallback would never be reached at lookup time either).
+        // User skin first; builtin sprites whose names the user skin
+        // already provides are DROPPED. `assign_regions` keys by name, so
+        // a duplicate would make the later (builtin) handle overwrite the
+        // user's inside the skin's texture table - a user `approachcircle`
+        // (140px) would silently become the builtin 256px one and render
+        // oversized. Dropping matches the lookup chain: `get_texture`
+        // never reaches the builtin for a name the legacy skin serves.
         let mut images = self.legacy.as_ref().map(|l| l.texture_images()).unwrap_or_default();
-        images.extend(self.builtin.texture_images());
+        let taken: std::collections::HashSet<String> = images.iter().map(|(n, _)| n.clone()).collect();
+        images.extend(
+            self.builtin
+                .texture_images()
+                .into_iter()
+                .filter(|(n, _)| !taken.contains(n)),
+        );
         images
     }
 
