@@ -36,8 +36,12 @@ pub const LEGACY_SPINNER_TOP_OFFSET: f32 = 45.0 - 16.0;
 pub const LEGACY_SPINNER_Y_CENTRE: f32 = LEGACY_SPINNER_TOP_OFFSET + 219.0;
 /// `LegacyCursor.REVOLUTION_DURATION`.
 pub const LEGACY_CURSOR_REVOLUTION: f64 = 10_000.0;
-/// `LegacySliderBody` gradient `border_portion` - border band width as a
-/// fraction of the body radius.
+/// `LegacyDrawableSliderPath` gradient stops (position 0 = path EDGE,
+/// 1 = centre, per `DefaultDrawableSliderPath`): a faint transparent-black
+/// rim over `[0, shadow]`, the border colour over `(shadow, border]`,
+/// then the darkened->lightened body gradient. `shadow = 1 -
+/// LEGACY_CIRCLE_RADIUS / OBJECT_RADIUS`.
+pub const LEGACY_SLIDER_SHADOW_PORTION: f32 = 1.0 - LEGACY_CIRCLE_RADIUS / 64.0; // 0.078
 pub const LEGACY_SLIDER_BORDER_PORTION: f32 = 0.1875;
 
 const FOLLOW_AREA: f32 = 2.4;
@@ -698,7 +702,7 @@ impl SceneState {
 
         // 7. Cursor + trail.
         self.draw_trail(list, assets);
-        draw_cursor(self.legacy.as_ref(), assets, list, cursor_screen, self.cursor_expand as f32, t);
+        draw_cursor(self.legacy.as_ref(), assets, list, cursor_screen, self.cursor_expand as f32, self.mapper.virt, t);
 
         // 8. HUD.
         self.hud.draw(game, assets, list, &self.mapper, t);
@@ -766,9 +770,11 @@ impl SceneState {
                     continue;
                 }
                 // `Texture.ScaleAdjust *= STABLE_MAGIC_SCALE_FACTOR` on
-                // load: trail sprites display at px / 1.6.
-                let w = tex.display_width() / 1.6;
-                let h = tex.display_height() / 1.6;
+                // load: like the cursor, the 1.6 cancels against the
+                // playfield scale, so the sprite shows at its display
+                // size in WINDOW units.
+                let w = tex.display_width() * self.mapper.virt;
+                let h = tex.display_height() * self.mapper.virt;
                 list.image(
                     assets.atlas,
                     tex.region,
@@ -1031,9 +1037,13 @@ impl SceneState {
         }
 
         // --- Body -------------------------------------------------------------
+        // `PlaySliderBody`: `PathRadius = OsuHitObject.OBJECT_RADIUS * scale`
+        // for every skin (the `SliderPathRadius` legacy lookup only feeds
+        // the vector slider ball). Argon narrows the visual body to its
+        // OUTER_GRADIENT_SIZE design; legacy bodies are the full radius.
         let legacy = self.legacy.as_ref();
         let path_radius = match legacy {
-            Some(_) => LEGACY_CIRCLE_RADIUS, // OsuLegacySkinTransformer.LEGACY_CIRCLE_RADIUS
+            Some(_) => 64.0, // OsuHitObject.OBJECT_RADIUS
             None => OUTER_GRADIENT_SIZE / 2.0,
         } * obj.scale;
         let sub = obj.sub_path(p0, p1);
@@ -1069,13 +1079,25 @@ impl SceneState {
             }
             let cap_r = path_radius * m.pf;
             let (cap_border, border_col, body_col) = match legacy {
-                Some(lg) => (
-                    LEGACY_SLIDER_BORDER_PORTION * cap_r,
-                    lg.slider_border_colour.opacity(fade),
-                    lg.slider_track_colour
-                        .unwrap_or(obj.colour)
-                        .opacity(0.7 * fade),
-                ),
+                Some(lg) => {
+                    // `LegacyDrawableSliderPath.ColourAt`: from the edge
+                    // inward - transparent-black rim over
+                    // `[0, LEGACY_SLIDER_SHADOW_PORTION]`, the border
+                    // colour over `(shadow, 0.1875]`, then the
+                    // darken(0.1) -> lighten(0.5) body gradient carrying
+                    // the 0.7 track alpha. The SDF body renders the border
+                    // band and a flat body colour: the rim (5px at r=64)
+                    // and the radial body gradient are approximated away;
+                    // the border band keeps its exact `(0.1875 - shadow)`
+                    // width.
+                    (
+                        (LEGACY_SLIDER_BORDER_PORTION - LEGACY_SLIDER_SHADOW_PORTION) * cap_r,
+                        lg.slider_border_colour.opacity(fade),
+                        lg.slider_track_colour
+                            .unwrap_or(obj.colour)
+                            .opacity(0.7 * fade),
+                    )
+                }
                 None => {
                     let body_alpha = if self.pro_skin { 0.92 } else { 0.98 };
                     (
@@ -3177,11 +3199,17 @@ fn draw_cursor(
     list: &mut DrawList,
     pos: [f32; 2],
     scale: f32,
+    virt: f32,
     t: f64,
 ) {
-    // `LegacyCursor`: a 50-unit box holding the `cursor` sprite (the only
-    // expanding layer) with `cursormiddle` on top; press pops to 1.3x
-    // (100ms Out), `CursorRotate` spins the sprite a revolution per 10s.
+    // `LegacyCursor`: the `cursor` sprite (the only expanding layer) with
+    // `cursormiddle` on top; press pops to 1.3x (100ms Out),
+    // `CursorRotate` spins the sprite a revolution per 10s. Sizing per
+    // `NonPlayfieldSprite`: the texture's `ScaleAdjust` gains the 1.6
+    // stable factor, which CANCELS the playfield's own 1.6 scale - the
+    // net on-screen size is the texture's display size in WINDOW units
+    // (`display * virt`), not a 50-unit box stretch (the 50 box is just
+    // the receptor container; sprites auto-size).
     if let Some(lg) = legacy
         && let Some(cursor) = lg.cursor
     {
@@ -3190,16 +3218,12 @@ fn draw_cursor(
         } else {
             0.0
         };
-        let unit = 50.0 * scale / 1.0;
-        let draw = |list: &mut DrawList, tex: SkinTexture, factor: f32, rotation: f32| {
-            // Sprites fill the box relative to their aspect: the long axis
-            // maps to `unit` (stable squares off against square sprites).
-            let long = tex.display_width().max(tex.display_height());
-            let w = tex.display_width() / long * unit * factor;
-            let h = tex.display_height() / long * unit * factor;
+        let draw = |list: &mut DrawList, tex: SkinTexture, expand: f32, rotation: f32| {
+            let w = tex.display_width() * virt * expand;
+            let h = tex.display_height() * virt * expand;
             list.image(assets.atlas, tex.region, pos, [w, h], rotation, Colour::WHITE, Blend::Alpha);
         };
-        draw(list, cursor, 1.0, rotation);
+        draw(list, cursor, scale, rotation);
         if let Some(middle) = lg.cursormiddle {
             draw(list, middle, 1.0, 0.0);
         }
