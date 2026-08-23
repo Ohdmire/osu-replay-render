@@ -101,12 +101,40 @@ fn fs_body_main(in: VsOut) -> @location(0) vec4<f32> {
     let d = textureSampleLevel(tex, samp, uv, 0.0).r * in.aux.y;
     let r = in.aux.y;
     let b = in.aux.z;
+
+    if (in.aux.w > 0.5) {
+        // Legacy radial gradient (`LegacyDrawableSliderPath.ColourAt`,
+        // position 0 = path edge, 1 = centre): transparent-black rim over
+        // [0, shadow], the border colour over (shadow, border], then the
+        // sRGB lerp accent.Darken(0.1) -> lighten(accent, 0.5). The inner
+        // colour rides in local.xy + uv.z; its alpha equals the outer
+        // (body) alpha. The shadow/border segment alphas take the fade
+        // from the border alpha (borders ship opaque).
+        let position = clamp(1.0 - d / r, 0.0, 1.0);
+        let SHADOW = 0.078125;  // 1 - 59/64
+        let BORDER = 0.1875;
+        var col: vec4<f32>;
+        if (position <= BORDER) {
+            if (position <= SHADOW) {
+                col = vec4<f32>(0.0, 0.0, 0.0, 0.25 * (position / SHADOW) * in.color2.a);
+            } else {
+                col = in.color2;
+            }
+        } else {
+            let t = clamp((position - BORDER) / (1.0 - BORDER), 0.0, 1.0);
+            let inner = vec3<f32>(in.local.x, in.local.y, in.uv.z);
+            col = vec4<f32>(mix(in.color.rgb, inner, t), in.color.a);
+        }
+        let aa_a = aa(r - d) * col.a;
+        return vec4<f32>(col.rgb * aa_a, aa_a);
+    }
+
     var col = in.color;
     if (d > r - b) {
         col = in.color2;
     }
-    let a = aa(r - d) * col.a;
-    return vec4<f32>(col.rgb * a, a);
+    let alpha = aa(r - d) * col.a;
+    return vec4<f32>(col.rgb * alpha, alpha);
 }
 
 @fragment
@@ -961,14 +989,20 @@ impl Renderer {
             prepass_ranges.push((start, prepass_indices.len() as u32));
 
             let base = body_quads.len() as u32;
+            // Legacy gradient bodies smuggle the inner colour through the
+            // idle channels: local.xy + uv.z (uv.w stays unused).
+            let inner = body.inner_colour;
             for corner in [[minx, miny], [maxx, miny], [maxx, maxy], [minx, maxy]] {
                 body_quads.push(Vertex {
                     pos: corner,
-                    local: [0.0; 2],
+                    local: match inner {
+                        Some(c) => [c.r, c.g],
+                        None => [0.0; 2],
+                    },
                     color: [body.body.r, body.body.g, body.body.b, body.body.a],
                     color2: [body.border_colour.r, body.border_colour.g, body.border_colour.b, body.border_colour.a],
-                    uv: [corner[0], corner[1], 0.0, 0.0],
-                    aux: [crate::draw::MODE_CAPSULE, body.radius, body.border, 0.0],
+                    uv: [corner[0], corner[1], inner.map(|c| c.b).unwrap_or(0.0), 0.0],
+                    aux: [crate::draw::MODE_CAPSULE, body.radius, body.border, if inner.is_some() { 1.0 } else { 0.0 }],
                 });
             }
             body_indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
