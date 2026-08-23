@@ -255,8 +255,9 @@ pub struct SceneState {
     slider_anims: Vec<SliderAnim>,
     spinner_anims: Vec<SpinnerAnim>,
     pub hud: hud::HudState,
-    /// Hidden mod active (from `GameData::hidden`).
-    hidden: bool,
+    /// Hidden mod active (from `GameData::hidden`); pub so a host can
+    /// force HD visuals live on top of the replay's own mods.
+    pub hidden: bool,
     last_t: f64,
 }
 
