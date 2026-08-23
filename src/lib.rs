@@ -9,6 +9,9 @@ pub mod hitsound;
 pub mod hud;
 pub mod render;
 pub mod scene;
+/// osu!(lazer) skinning abstraction port: user skin directories
+/// (`--skin <dir>`) with the built-in argon skin as fallback.
+pub mod skin;
 /// 原生窗口直渲(窗口 surface,跨平台:Windows Win32 / Linux Xlib)。
 /// 宿主以 raw window handle 传入自己的窗口;句柄类型经
 /// [`raw_window_handle`] 再导出,宿主无需直接依赖该 crate。
@@ -17,6 +20,7 @@ pub mod surface;
 pub use raw_window_handle;
 
 use draw::{Atlas, Image, Region, TtfFont};
+use skin::SkinTexture;
 
 const TORUS_BOLD_TTF: &[u8] = include_bytes!("../assets/fonts/TorusPro-Bold.ttf");
 const TORUS_SEMI_BOLD_TTF: &[u8] = include_bytes!("../assets/fonts/TorusPro-SemiBold.ttf");
@@ -41,9 +45,15 @@ const COUNTER_PERCENT_PNG: &[u8] = include_bytes!("../assets/counter/argon-count
 const COUNTER_X_PNG: &[u8] = include_bytes!("../assets/counter/argon-counter-x.png");
 const COUNTER_WIREFRAMES_PNG: &[u8] = include_bytes!("../assets/counter/argon-counter-wireframes.png");
 
-/// Builds the atlas (fonts, counter digits, cursor pieces, optional
-/// background) plus the two font wrappers needed by the scene builder.
-pub fn build_atlas(bg_image: Option<Image>) -> (Atlas, TtfFont, TtfFont) {
+/// Builds the atlas (fonts, counter digits, cursor pieces, skin
+/// textures, optional background) plus the two font wrappers needed by
+/// the scene builder. Skin textures are packed as `Region::Skin(i)`
+/// entries and their handles handed back to the skin so its
+/// `get_texture` serves atlas regions.
+pub fn build_atlas(
+    bg_image: Option<Image>,
+    skin: &mut dyn skin::SkinTextureSource,
+) -> (Atlas, TtfFont, TtfFont) {
     let (mut bold, mut bold_images) = TtfFont::rasterize(TORUS_BOLD_TTF, true);
     let (mut semibold, mut semibold_images) = TtfFont::rasterize(TORUS_SEMI_BOLD_TTF, false);
 
@@ -79,6 +89,20 @@ pub fn build_atlas(bg_image: Option<Image>) -> (Atlas, TtfFont, TtfFont) {
         let (w, h, rgba) = decode_png_bytes(APPROACH_CIRCLE_PNG);
         images.push((Region::ApproachCircle, Image { width: w, height: h, rgba }));
     }
+
+    // Skin textures (`--skin <dir>` / built-in argon sprites): decode,
+    // pack, then hand the atlas handles back to the skin.
+    let skin_images = skin.texture_images();
+    let mut skin_regions: Vec<(String, SkinTexture)> = Vec::with_capacity(skin_images.len());
+    for (i, (name, img)) in skin_images.iter().enumerate() {
+        let region = Region::Skin(i as u32);
+        images.push((region, img.clone()));
+        skin_regions.push((
+            name.clone(),
+            SkinTexture { region, width: img.width, height: img.height, scale_adjust: 1.0 },
+        ));
+    }
+    skin.assign_regions(&skin_regions);
 
     let atlas = Atlas::build(&images);
     if std::env::var("ATLAS_DEBUG").is_ok() {
@@ -181,7 +205,10 @@ pub fn osu_background_file(map_path: &str) -> Option<String> {
 }
 
 fn decode_png_bytes(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
-    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    // EXPAND: paletted (Indexed) skins decode to RGB, their tRNS chunks
+    // to a real alpha channel - old skins ship both.
+    decoder.set_transformations(png::Transformations::EXPAND);
     let mut reader = decoder.read_info().expect("png read info");
     let mut buf = vec![0u8; reader.output_buffer_size()];
     let info = reader.next_frame(&mut buf).expect("png decode");

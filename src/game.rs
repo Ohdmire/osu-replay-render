@@ -58,6 +58,9 @@ pub struct ObjView {
     /// Whether this object starts a new combo (`IHasCombo.NewCombo`).
     pub new_combo: bool,
     pub colour: Colour,
+    /// `IHasComboInformation.ComboIndexWithOffsets` - the index skin combo
+    /// colour lookups use (`SkinComboColourLookup.ColourIndex`).
+    pub combo_colour_index: u32,
     pub number: u32,
     /// Slider: full piecewise-linear path in playfield coords (relative to
     /// the slider position, i.e. ready to add to `position`).
@@ -451,6 +454,7 @@ fn build(
                 )
             },
             number: obj.index_in_current_combo + 1,
+            combo_colour_index: obj.combo_index_with_offsets as u32,
             slider_points,
             slider_distance: match &obj.kind {
                 ProcKind::Slider { path, .. } => path.distance(),
@@ -795,4 +799,30 @@ pub fn health_at(game: &GameData, t: f64) -> f64 {
         health -= game.drain_rate * (ct - lt);
     }
     health.clamp(0.0, 1.0)
+}
+
+/// Re-map object colours through a loaded skin's combo colours
+/// (`SkinComboColourLookup`). A legacy user skin always overrides the
+/// beatmap's `[Colours]` (stable behaviour: any installed skin replaces
+/// them, falling back to the default stable colours when the skin ships
+/// none); without a user skin the beatmap/argon colours stay.
+pub fn apply_skin_combo_colours(game: &mut GameData, skin: &crate::skin::ResolvedSkin) {
+    use crate::skin::Skin as _;
+    let Some(colours) = skin
+        .get_config(crate::skin::SkinLookup::GlobalColour(
+            crate::skin::GlobalSkinColours::ComboColours,
+        ))
+        .and_then(|v| match v {
+            crate::skin::SkinValue::ComboColours(c) => Some(c),
+            _ => None,
+        })
+    else {
+        return;
+    };
+    if colours.is_empty() || !skin.is_legacy() {
+        return;
+    }
+    for obj in &mut game.objects {
+        obj.colour = colours[(obj.combo_colour_index as usize) % colours.len()];
+    }
 }
