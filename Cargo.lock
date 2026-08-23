@@ -188,9 +188,9 @@ checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
 name = "crc32fast"
-version = "1.5.0"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
+checksum = "8498c871161e1742aaa9d52551b2d6ebdd4c3d45a3be423e3728f33b955be550"
 dependencies = [
  "cfg-if",
 ]
@@ -231,9 +231,9 @@ dependencies = [
 
 [[package]]
 name = "either"
-version = "1.17.0"
+version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
+checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
 name = "equivalent"
@@ -535,9 +535,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.33"
+version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
+checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "lzma-rs"
@@ -650,14 +650,14 @@ dependencies = [
 [[package]]
 name = "osu_replay_judge"
 version = "0.1.1"
-source = "git+https://github.com/Ohdmire/osu-replay-judge.git?branch=master#a275b3b7d99bb2a5d563e2d9b262eaf4e85f309e"
+source = "git+https://github.com/Ohdmire/osu-replay-judge.git?branch=master#43956b16431653614cbecf1e59ad15244787a9d2"
 dependencies = [
  "lzma-rs",
 ]
 
 [[package]]
 name = "osu_replay_render"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ab_glyph",
  "jpeg-decoder",
