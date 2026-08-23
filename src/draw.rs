@@ -62,6 +62,20 @@ impl Colour {
         Colour { r: self.r * f, g: self.g * f, b: self.b * f, a: self.a }
     }
 
+    /// `LegacyDrawableSliderPath.lighten`: "lightens in a way more
+    /// friendly to dark or strong colours" - `amount *= 0.5`, then each
+    /// channel is `min(1, c * (1 + 0.5 * amount) + amount)` in sRGB
+    /// (additive lift, keeps alpha).
+    pub fn lighten(self, amount: f32) -> Colour {
+        let amount = amount * 0.5;
+        Colour {
+            r: (self.r * (1.0 + 0.5 * amount) + amount).min(1.0),
+            g: (self.g * (1.0 + 0.5 * amount) + amount).min(1.0),
+            b: (self.b * (1.0 + 0.5 * amount) + amount).min(1.0),
+            a: self.a,
+        }
+    }
+
     pub fn opacity(self, a: f32) -> Colour {
         Colour { a: self.a * a, ..self }
     }
@@ -245,6 +259,11 @@ pub struct BodyDraw {
     pub border: f32,
     pub body: Colour,
     pub border_colour: Colour,
+    /// Legacy skin gradient (`LegacyDrawableSliderPath.ColourAt`): the
+    /// inner end of the radial body gradient (`lighten(accent, 0.5)`),
+    /// with `body` as the outer end (`accent.Darken(0.1)`). None renders
+    /// the flat two-band body.
+    pub inner_colour: Option<Colour>,
 }
 
 #[allow(dead_code)]
