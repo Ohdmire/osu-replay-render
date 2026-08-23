@@ -1078,24 +1078,22 @@ impl SceneState {
                 fade *= value_at(t, bt, bt + 40.0, 1.0, 0.0, Easing::Linear) as f32;
             }
             let cap_r = path_radius * m.pf;
-            let (cap_border, border_col, body_col) = match legacy {
+            let (cap_border, border_col, body_col, inner_col) = match legacy {
                 Some(lg) => {
                     // `LegacyDrawableSliderPath.ColourAt`: from the edge
-                    // inward - transparent-black rim over
-                    // `[0, LEGACY_SLIDER_SHADOW_PORTION]`, the border
-                    // colour over `(shadow, 0.1875]`, then the
-                    // darken(0.1) -> lighten(0.5) body gradient carrying
-                    // the 0.7 track alpha. The SDF body renders the border
-                    // band and a flat body colour: the rim (5px at r=64)
-                    // and the radial body gradient are approximated away;
-                    // the border band keeps its exact `(0.1875 - shadow)`
-                    // width.
+                    // inward - transparent-black rim over `[0, 0.078]`,
+                    // the border colour over `(0.078, 0.1875]`, then the
+                    // sRGB lerp `accent.Darken(0.1) -> lighten(accent,
+                    // 0.5)` carrying the 0.7 track alpha. The composite
+                    // shader evaluates the full gradient per fragment;
+                    // `border` (the flat-mode band width) stays for the
+                    // join discs only.
+                    let accent = lg.slider_track_colour.unwrap_or(obj.colour).opacity(0.7 * fade);
                     (
                         (LEGACY_SLIDER_BORDER_PORTION - LEGACY_SLIDER_SHADOW_PORTION) * cap_r,
                         lg.slider_border_colour.opacity(fade),
-                        lg.slider_track_colour
-                            .unwrap_or(obj.colour)
-                            .opacity(0.7 * fade),
+                        accent.darken(0.1),
+                        Some(accent.lighten(0.5)),
                     )
                 }
                 None => {
@@ -1104,6 +1102,7 @@ impl SceneState {
                         GRADIENT_THICKNESS * obj.scale * m.pf,
                         obj.colour.opacity(fade),
                         obj.colour.darken(4.0).opacity(fade * body_alpha),
+                        None,
                     )
                 }
             };
@@ -1117,6 +1116,7 @@ impl SceneState {
                 border: cap_border,
                 body: body_col,
                 border_colour: border_col,
+                inner_colour: inner_col,
             });
             // Layer anchor: in lazer the body is part of the DrawableSlider,
             // so an earlier slider's body covers later objects (and its own
