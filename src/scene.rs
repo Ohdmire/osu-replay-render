@@ -536,6 +536,13 @@ pub struct SceneState {
     pub bg_opacity: Option<f32>,
     /// 物件之间的引导线(follow points);默认开,实时预览可关。
     pub follow_points: bool,
+    /// 光标尺寸倍率(lazer `OsuSetting.GameplayCursorSize`:默认 1.0,
+    /// 范围 0.1..=2)。lazer 把它乘在光标容器的整体 Scale 上——argon 与
+    /// legacy 皮肤光标、拖尾部件尺寸全部生效;legacy 拖尾的部件间隔
+    /// 同时按 `1/max(size,1)` 稀疏化(`LegacyCursorTrail.IntervalMultiplier`,
+    /// 部件变大时间距不再继续变密)。皮肤层面没有尺寸配置(skin.ini 只有
+    /// CursorExpand/CursorRotate/CursorCentre 三个布尔),故默认值内置于此。
+    pub cursor_size: f32,
     cursor_expand: f64,
     cursor_anim: Option<(f64, f64, f64, f64, Easing)>,
     was_pressed: bool,
@@ -559,6 +566,7 @@ impl SceneState {
             mapper: Mapper::new(width, height),
             bg_opacity: None,
             follow_points: true,
+            cursor_size: 1.0,
             cursor_expand: 1.0,
             cursor_anim: None,
             was_pressed: false,
@@ -713,7 +721,7 @@ impl SceneState {
 
         // 7. Cursor + trail.
         self.draw_trail(list, assets);
-        draw_cursor(self.legacy.as_ref(), assets, list, cursor_screen, self.cursor_expand as f32, self.mapper.virt, t);
+        draw_cursor(self.legacy.as_ref(), assets, list, cursor_screen, self.cursor_expand as f32, self.cursor_size, self.mapper.virt, t);
 
         // 8. HUD.
         self.hud.draw(game, assets, list, &self.mapper, t);
@@ -733,13 +741,21 @@ impl SceneState {
         if jumped {
             self.trail.clear();
         }
+        // Part spacing follows the cursor size like the interpolated adds
+        // of `CursorTrail.AddTrail` (interval ∝ `CursorScale`), with the
+        // legacy `IntervalMultiplier = 1/max(size,1)` clamping it above 1
+        // (bigger parts don't also densify).
+        let spacing = match self.legacy.as_ref().map(|l| l.cursortrail).flatten() {
+            Some(_) => TRAIL_SPACING * self.cursor_size / self.cursor_size.max(1.0),
+            None => TRAIL_SPACING * self.cursor_size,
+        };
         let last_pos = if jumped { None } else { self.trail.last().map(|p| p.pos) };
         if let Some(last) = last_pos {
             let dx = cursor[0] - last[0];
             let dy = cursor[1] - last[1];
             let dist = (dx * dx + dy * dy).sqrt();
-            if dist > TRAIL_SPACING {
-                let steps = ((dist / TRAIL_SPACING) as usize).min(600);
+            if dist > spacing {
+                let steps = ((dist / spacing) as usize).min(600);
                 for s in 1..=steps {
                     let f = s as f32 / steps as f32;
                     self.trail.push(TrailPart {
@@ -784,9 +800,11 @@ impl SceneState {
                 // load: like the cursor, the 1.6 cancels against the
                 // playfield scale, so the sprite shows at its display
                 // size in WINDOW units. `TrailOrigin` follows
-                // `CursorCentre` (centre vs top-left anchor).
-                let w = tex.display_width() * self.mapper.virt;
-                let h = tex.display_height() * self.mapper.virt;
+                // `CursorCentre` (centre vs top-left anchor). Part size
+                // carries the user cursor scale (`CursorTrail`'s
+                // `cursorScale` uniform, fed `ActiveCursor.CursorScale`).
+                let w = tex.display_width() * self.mapper.virt * self.cursor_size;
+                let h = tex.display_height() * self.mapper.virt * self.cursor_size;
                 let at = if lg.cursor_centre {
                     p.pos
                 } else {
@@ -809,7 +827,7 @@ impl SceneState {
             let age = (t - p.time).clamp(0.0, TRAIL_DURATION) / TRAIL_DURATION;
             let alpha = (1.0 - age as f32).powf(TRAIL_FADE_EXPONENT) * TRAIL_ALPHA;
             if alpha > 0.004 {
-                list.glow(p.pos, TRAIL_SIZE * expand, Colour::WHITE.opacity(alpha));
+                list.glow(p.pos, TRAIL_SIZE * expand * self.cursor_size, Colour::WHITE.opacity(alpha));
             }
         }
     }
@@ -3224,6 +3242,7 @@ fn draw_cursor(
     list: &mut DrawList,
     pos: [f32; 2],
     scale: f32,
+    user_size: f32,
     virt: f32,
     t: f64,
 ) {
@@ -3234,7 +3253,9 @@ fn draw_cursor(
     // stable factor, which CANCELS the playfield's own 1.6 scale - the
     // net on-screen size is the texture's display size in WINDOW units
     // (`display * virt`), not a 50-unit box stretch (the 50 box is just
-    // the receptor container; sprites auto-size).
+    // the receptor container; sprites auto-size). `user_size` is the
+    // `cursorScaleContainer` Scale (`GameplayCursorSize`), multiplying
+    // the whole cursor either skin path.
     if let Some(lg) = legacy
         && let Some(cursor) = lg.cursor
     {
@@ -3244,8 +3265,8 @@ fn draw_cursor(
             0.0
         };
         let draw = |list: &mut DrawList, tex: SkinTexture, expand: f32, rotation: f32| {
-            let w = tex.display_width() * virt * expand;
-            let h = tex.display_height() * virt * expand;
+            let w = tex.display_width() * virt * expand * user_size;
+            let h = tex.display_height() * virt * expand * user_size;
             // `CursorCentre: 0` anchors the sprite's top-left at the
             // cursor position instead of its centre.
             let at = if lg.cursor_centre {
@@ -3262,17 +3283,24 @@ fn draw_cursor(
         return;
     }
 
-    let r = CURSOR_SIZE * 0.5 * scale;
+    // The argon cursor lives INSIDE the playfield (`Playfield` base adds
+    // `Cursor` internally), so `OsuCursor.SIZE = 28` is in PLAYFIELD
+    // units: on-screen diameter = 28 * pf (= H/480 via the 0.8 x 4:3
+    // adjustment chain), scaling with the render resolution. The ring
+    // thicknesses and glow radius are local sizes too and scale the same
+    // way. Container Scale (user size) multiplies them all.
+    let pf = virt * PLAYFIELD_SCALE;
+    let r = CURSOR_SIZE * 0.5 * pf * scale * user_size;
 
     let top = Colour::from_hex(0xFC618F);
     let bottom = Colour::from_hex(0xBB1A41);
-    list.ring(pos, r, 6.0 * scale, top, bottom, Blend::Alpha);
+    list.ring(pos, r, 6.0 * pf * scale * user_size, top, bottom, Blend::Alpha);
 
     let fill = top.darken(0.6).opacity(0.4);
     list.disc(pos, r, fill, fill, Blend::Alpha);
 
-    list.ring(pos, r, 2.0 * scale, Colour::WHITE.opacity(0.8), Colour::WHITE.opacity(0.8), Blend::Alpha);
+    list.ring(pos, r, 2.0 * pf * scale * user_size, Colour::WHITE.opacity(0.8), Colour::WHITE.opacity(0.8), Blend::Alpha);
 
-    list.glow(pos, 20.0 * scale, Colour::rgba_bytes(171, 255, 255, 100));
+    list.glow(pos, 20.0 * pf * scale * user_size, Colour::rgba_bytes(171, 255, 255, 100));
     list.disc(pos, r * 0.2, Colour::WHITE, Colour::WHITE, Blend::Alpha);
 }

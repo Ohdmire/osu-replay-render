@@ -72,6 +72,9 @@ struct Options {
     bg: bool,
     /// Background opacity 0..1 (lazer: 1 - DimLevel, default DimLevel 0.7).
     bg_opacity: f32,
+    /// Cursor size multiplier 0.1..=2 (lazer `GameplayCursorSize`,
+    /// default 1). Scales the cursor and trail for every skin path.
+    cursor_size: f32,
     /// Optional manual audio offset in ms (audio file position =
     /// replay_time - offset). Default 0; `--audio-offset` overrides.
     audio_offset: Option<f64>,
@@ -109,7 +112,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
     let autoplay = args.iter().any(|a| a == "--autoplay");
     let min_args = if autoplay { 2 } else { 3 };
     if args.len() < min_args {
-        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--hd] [--no-hd] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro] [--no-guides] [--audio [file.mp3]] [--audio-offset ms] [--bg] [--bg-opacity 0..1] [--hitsounds] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
+        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--hd] [--no-hd] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro] [--no-guides] [--audio [file.mp3]] [--audio-offset ms] [--bg] [--bg-opacity 0..1] [--cursor-size 0.1..=2] [--hitsounds] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
     }
     let map_path = args[1].clone();
     let replay_path = if autoplay { None } else { Some(args[2].clone()) };
@@ -133,6 +136,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
         audio: None,
         bg: false,
         bg_opacity: 0.3,
+        cursor_size: 1.0,
         audio_offset: None,
         autoplay,
         hd: HdMode::Auto,
@@ -242,6 +246,16 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
                     .ok_or("bad --bg-opacity (expected 0..1)")?;
                 if !(0.0..=1.0).contains(&opts.bg_opacity) {
                     return Err("--bg-opacity must be within 0..1".into());
+                }
+            }
+            "--cursor-size" => {
+                i += 1;
+                opts.cursor_size = args
+                    .get(i)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("bad --cursor-size (expected 0.1..=2)")?;
+                if !(0.1..=2.0).contains(&opts.cursor_size) {
+                    return Err("--cursor-size must be within 0.1..=2 (lazer GameplayCursorSize)".into());
                 }
             }
             "--audio-offset" => {
@@ -535,6 +549,7 @@ fn main() {
     state.pro_skin = opts.skin == "argon-pro";
     state.hud.ur_guides = opts.guides;
     state.bg_opacity = if has_bg { Some(opts.bg_opacity) } else { None };
+    state.cursor_size = opts.cursor_size;
     if opts.classic_score {
         state.hud.use_classic_score();
     }
