@@ -1548,6 +1548,14 @@ impl SceneState {
         } else {
             1.0
         };
+        // Legacy spinners fade the whole sprite stack in over TimeFadeIn
+        // (`LegacyOldStyleSpinner.UpdateStateTransforms`: FadeOut at
+        // StartTime - preempt, then FadeInFromZero(TimeFadeIn) reaching
+        // full alpha at StartTime). The argon spinner appears through its
+        // disc/centre pop-in scale instead.
+        if self.legacy.is_some() {
+            alpha *= value_at(t, obj.start_time - obj.fade_in, obj.start_time, 0.0, 1.0, Easing::Linear);
+        }
         if self.hidden {
             alpha *= value_at(
                 t,
