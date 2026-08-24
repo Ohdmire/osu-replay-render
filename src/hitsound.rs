@@ -644,8 +644,9 @@ impl Clip {
     }
 }
 
-/// Minimal RIFF/PCM16 decoder with linear resampling to the output rate;
-/// mono sources are duplicated to both channels.
+/// Minimal RIFF PCM decoder (16/24-bit, plain or WAVE_FORMAT_EXTENSIBLE)
+/// with linear resampling to the output rate; mono sources are duplicated
+/// to both channels.
 fn decode_wav(bytes: &[u8]) -> Option<Clip> {
     let rd = |i: usize| -> u16 {
         u16::from_le_bytes([*bytes.get(i).unwrap_or(&0), *bytes.get(i + 1).unwrap_or(&0)])
@@ -665,10 +666,19 @@ fn decode_wav(bytes: &[u8]) -> Option<Clip> {
         }
         match id {
             b"fmt " => {
-                let audio_format = rd(body);
+                let mut audio_format = rd(body);
                 let channels = rd(body + 2);
                 let rate = u32::from_le_bytes([bytes[body + 4], bytes[body + 5], bytes[body + 6], bytes[body + 7]]);
                 let bits = rd(body + 14);
+                // WAVE_FORMAT_EXTENSIBLE: the real tag is the SubFormat
+                // GUID's Data1 (1 = PCM) at offset 24. The shipped
+                // soft-hitnormal is such a file.
+                if audio_format == 0xFFFE && size >= 40 {
+                    let sub = u32::from_le_bytes([
+                        bytes[body + 24], bytes[body + 25], bytes[body + 26], bytes[body + 27],
+                    ]);
+                    audio_format = sub as u16;
+                }
                 fmt = Some((audio_format, channels, rate, bits));
             }
             b"data" => data = Some((body, size)),
@@ -679,13 +689,20 @@ fn decode_wav(bytes: &[u8]) -> Option<Clip> {
     let (format, channels, rate, bits) = fmt?;
     let (body, size) = data?;
     let channels = channels as usize;
-    if format != 1 || bits != 16 || channels == 0 || channels > 2 || rate == 0 {
+    if format != 1 || (bits != 16 && bits != 24) || channels == 0 || channels > 2 || rate == 0 {
         return None;
     }
-    let frames = size / 2 / channels;
+    let width = bits as usize / 8;
+    let frames = size / width / channels;
     let src = |f: usize, c: usize| -> f32 {
-        let v = rd(body + (f * channels + c) * 2) as i16;
-        v as f32 / 32768.0
+        let off = body + (f * channels + c) * width;
+        if bits == 16 {
+            rd(off) as i16 as f32 / 32768.0
+        } else {
+            // 3 bytes LE, sign-extended to i32.
+            let v = ((rd(off) as u32) | ((rd(off + 1) as u32) << 8) | ((*bytes.get(off + 2).unwrap_or(&0) as u32) << 16)) << 8;
+            (v as i32 >> 8) as f32 / 8388608.0
+        }
     };
     let mut data = Vec::with_capacity(frames * 2);
     if rate == SAMPLE_RATE {
@@ -863,12 +880,26 @@ fn render_track(game: &GameData, map_content: &str, t0: f64, wall_secs: f64, rat
     let total = (wall_secs.max(0.0) * SAMPLE_RATE as f64).round() as usize;
     let mut buf = vec![0.0f32; total * 2];
 
-    // Decode each distinct (bank, name) once.
+    // Decode each distinct (bank, name) once; a sample that fails to
+    // decode warns once and drops only its own placements (a silent
+    // `continue` here hid a 24-bit asset mismatch before).
     let mut cache: Vec<(HitSample, Clip)> = Vec::new();
+    let mut missing: Vec<HitSample> = Vec::new();
     for p in &placements {
-        if cache.iter().all(|(s, _)| s.name != p.sample.name || s.bank != p.sample.bank) {
-            if let Some(clip) = sample_clip(p.sample) {
-                cache.push((p.sample, clip));
+        if cache.iter().any(|(s, _)| s.name == p.sample.name && s.bank == p.sample.bank)
+            || missing.iter().any(|s| s.name == p.sample.name && s.bank == p.sample.bank)
+        {
+            continue;
+        }
+        match sample_clip(p.sample) {
+            Some(clip) => cache.push((p.sample, clip)),
+            None => {
+                eprintln!(
+                    "hitsound warning: no decodable sample for {}-{}, its hitsounds are silent",
+                    p.sample.bank.as_str(),
+                    p.sample.name
+                );
+                missing.push(p.sample);
             }
         }
     }
@@ -953,4 +984,34 @@ fn encode_wav(interleaved: &[f32], limit: bool) -> Vec<u8> {
         out.extend_from_slice(&((s * 32767.0) as i16).to_le_bytes());
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shipped `soft-hitnormal` is the set's only 24-bit
+    /// WAVE_FORMAT_EXTENSIBLE file; the decoder must carry it (it was
+    /// silently dropped before, muting every soft-bank hit).
+    #[test]
+    fn decodes_24bit_extensible_wav() {
+        let clip = decode_wav(wav!("soft-hitnormal")).expect("24-bit EXTENSIBLE wav decodes");
+        assert!((930.0..950.0).contains(&clip.duration_ms()));
+        let peak = clip.data.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(peak > 0.5, "decoded content should be loud, peak={peak}");
+    }
+
+    #[test]
+    fn decodes_16bit_wav() {
+        let clip = decode_wav(wav!("normal-hitnormal")).expect("16-bit wav decodes");
+        assert!(clip.duration_ms() > 500.0);
+        assert!(!clip.data.is_empty());
+    }
+
+    /// The API-level regression: soft hitnormal resolves to a playable clip.
+    #[test]
+    fn soft_hitnormal_resolves_to_clip() {
+        let sample = HitSample { name: "hitnormal", bank: Bank::Soft, volume: 100 };
+        assert!(sample_clip(sample).is_some());
+    }
 }
