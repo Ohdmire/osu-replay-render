@@ -104,12 +104,20 @@ impl SurfaceRenderer {
         let frame_aspect = width as f32 / height as f32;
 
         let caps = surface.get_capabilities(renderer.adapter());
-        let surface_format = caps
-            .formats
-            .iter()
-            .find(|f| **f == wgpu::TextureFormat::Bgra8Unorm)
-            .copied()
-            .unwrap_or(caps.formats.first().copied().unwrap_or(wgpu::TextureFormat::Bgra8Unorm));
+        // The scene target stores display-encoded (sRGB) byte values and
+        // the blit copies them verbatim, so the swapchain must be a plain
+        // UNORM variant: an `*Srgb` format would re-encode on store and
+        // wash the whole image out. Bgra8Unorm first (desktop GL/DX12
+        // list it); Android Vulkan offers only Rgba8* — then any non-sRGB
+        // format beats `formats.first()`, which is driver-order and
+        // commonly the Srgb twin.
+        let surface_format = if caps.formats.iter().any(|f| *f == wgpu::TextureFormat::Bgra8Unorm) {
+            wgpu::TextureFormat::Bgra8Unorm
+        } else if let Some(f) = caps.formats.iter().find(|f| !f.is_srgb()) {
+            *f
+        } else {
+            caps.formats.first().copied().unwrap_or(wgpu::TextureFormat::Bgra8Unorm)
+        };
         let alpha_mode = caps
             .alpha_modes
             .iter()
