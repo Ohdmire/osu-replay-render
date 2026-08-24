@@ -1506,6 +1506,16 @@ impl Renderer {
     /// Maps the OLDEST pending YUV frame and copies it into `out`
     /// (`yuv_frame_bytes()` bytes). Mirror of [`Renderer::read_oldest_into`].
     pub fn read_oldest_yuv_into(&mut self, out: &mut Vec<u8>) {
+        out.clear();
+        out.resize(self.yuv_frame_bytes(), 0);
+        self.read_oldest_yuv_into_slice(out);
+    }
+
+    /// [`Self::read_oldest_yuv_into`] writing straight into a caller-owned
+    /// buffer (exactly `yuv_frame_bytes()` bytes) — the JNI export path
+    /// hands its direct buffer over directly, skipping the extra
+    /// full-frame copy through a staging Vec.
+    pub fn read_oldest_yuv_into_slice(&mut self, out: &mut [u8]) {
         let slot = self
             .yuv
             .as_mut()
@@ -1516,8 +1526,7 @@ impl Renderer {
         slice.map_async(wgpu::MapMode::Read, |_| {});
         self.device.poll(wgpu::Maintain::Wait);
         let data = slice.get_mapped_range();
-        out.clear();
-        out.extend_from_slice(&data);
+        out.copy_from_slice(&data);
         drop(data);
         buffer.unmap();
     }
