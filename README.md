@@ -31,12 +31,12 @@ osu_replay_render <beatmap.osu> [replay.osr] [options]
 | `--encoder <auto\|x264\|x265\|nvenc>` | 视频编码器：默认 `auto`（探测 NVENC 可用则用之，否则回退 x264）；NVENC 硬件编码（bgr0 直喂 + p5/hq/vbr/cq，**端到端约比 x264 快 1.7×、比 x265 快 3.2×**）；libx264 / libx265（preset medium + crf） |
 | `--quality <n>` | crf（软件）/ cq（nvenc），默认 18 |
 | `--no-guides` | 关闭 UR 条的窗口引导线（判定色色轴），默认开启渲染 |
-| `--audio [file]` | 输出混入 BGM（AAC 192k）：带路径用指定文件；不带值自动取谱面 `[General] AudioFilename`（相对谱面目录）。音频位置 = 回放时间 − 偏移；负的起始位置用前置静音（adelay）补齐（复刻 lazer 负时间不播歌的行为）。DT/NC/HT 自动 `asetrate` 变速变调 |
+| `--audio [file]` | 输出混入 BGM（AAC 192k）：带路径用指定文件；不带值自动取谱面 `[General] AudioFilename`（相对谱面目录）。音频位置 = 回放时间 − 偏移；负的起始位置用前置静音（adelay）补齐（复刻 lazer 负时间不播歌的行为）。DT/HT 自动 `atempo` 变速**不变调**（时长随 rate 压缩、音调保持原曲,刻意偏离游戏内变调行为）;NC 保持游戏内 `asetrate` 变速**变调**（nightcore 的升调是其本体,音效仍原速） |
 | `--audio-offset <ms>` | BGM 对齐偏移，默认 **0**；需要时手动传入（内部按 lazer 语义 ×rate） |
 | `--bgm-volume <0..1>` | BGM 增益,默认 **0.6**(osu! 默认 `VolumeMusic`,`OsuGame.GetFrameworkConfigDefaults` 覆盖 framework 的 1.0) |
 | `--hitsounds-volume <0..1>` | 音效总线增益,默认 **0.6**(osu! 默认 `VolumeEffect`)。音效按谱面 authored 电平播放,仅在编码处以 tanh 软拐点代替硬削波 |
 | `--master-volume <0..1>` | 混合后主音量,默认 **0.6**(osu! 默认 `VolumeUniversal`)。游戏链路为通道×主音量(0.6×0.6=每总线 0.36),默认下音乐+音效峰约 0.72,基本不削波;要更响的成片可提到 1.0 |
-| `--hitsounds` | 导出时离线合成**单独一条音效轨**并混入输出(与 `--audio` BGM 经 `amix` 求和,`normalize=0` 保持原始比例;无 BGM 时音效轨即音轨)。复刻 lazer 游戏音频语义:仅命中判定触发(`ArmedState.Hit`,miss 不发声);音色/音量按 .osu 采样数据解析(时间点 bank/音量、对象 hitSample、滑条 edgeSounds/edgeSets;采样点取 `CONTROL_POINT_LENIENCY` 5ms 语义);圆点=hitnormal+whistle/finish/clap,滑条=头/反复/尾节点音+slidertick+跟踪期 sliderslide/sliderwhistle 循环(跟踪断开即截断);音量下限 5%、声像随物件 X(`PositionalHitsoundsLevel` 0.8)、DT/HT 变速变调;MISS 不触发物件音,连击归零播 `combobreak`(`ComboEffects`:旧 combo>20 或首次中断,`AlwaysPlayFirstComboBreak` 默认开;该样本 ArgonPro 集没有,按查找链取 Argon 集)。音源为 **ArgonPro** 资源集(内嵌):所有 gameplay 查找都命中该集、查找链不再下落——其滑条滑动循环音(sliderslide/sliderwhistle)是空条目=**静音**,即 ArgonPro 不播滑条滑动声;头/尾/反复节点音与 slidertick 为真采样,正常播放 |
+| `--hitsounds` | 导出时离线合成**单独一条音效轨**并混入输出(与 `--audio` BGM 经 `amix` 求和,`normalize=0` 保持原始比例;无 BGM 时音效轨即音轨)。复刻 lazer 游戏音频语义:仅命中判定触发(`ArmedState.Hit`,miss 不发声);音色/音量按 .osu 采样数据解析(时间点 bank/音量、对象 hitSample、滑条 edgeSounds/edgeSets;采样点取 `CONTROL_POINT_LENIENCY` 5ms 语义);圆点=hitnormal+whistle/finish/clap,滑条=头/反复/尾节点音+slidertick+跟踪期 sliderslide/sliderwhistle 循环(跟踪断开即截断);音量下限 5%、声像随物件 X(`PositionalHitsoundsLevel` 0.8)、采样**原速回放**——任何 mod 下都不变调(含 NC),DT/HT/NC 只压缩触发时机;MISS 不触发物件音,连击归零播 `combobreak`(`ComboEffects`:旧 combo>20 或首次中断,`AlwaysPlayFirstComboBreak` 默认开;该样本 ArgonPro 集没有,按查找链取 Argon 集)。音源为 **ArgonPro** 资源集(内嵌):所有 gameplay 查找都命中该集、查找链不再下落——其滑条滑动循环音(sliderslide/sliderwhistle)是空条目=**静音**,即 ArgonPro 不播滑条滑动声;头/尾/反复节点音与 slidertick 为真采样,正常播放 |
 | `--bg` | 绘制谱面背景图（`[Events]` 的 `0,0,"..."`，相对谱面目录，PNG/JPEG），全屏铺满 |
 | `--bg-opacity <0..1>` | 背景不透明度，默认 **0.3** = 1 − DimLevel（lazer `OsuSetting.DimLevel` 默认 0.7，与游戏内"背景暗度"语义一致） |
 | `--limit <n>` | 最多渲染 n 帧（测试用） |

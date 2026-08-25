@@ -267,6 +267,10 @@ pub struct GameData {
     pub snapshots: Vec<FrameSnap>,
     pub combo_colours: Vec<Colour>,
     pub rate: f64,
+    /// Nightcore mod (rate 1.5 like DT, but the export keeps the game's
+    /// pitch-up on the BGM — nightcore without the pitch isn't nightcore).
+    /// Hitsounds stay at their natural rate regardless.
+    pub nightcore: bool,
     pub classic: bool,
     pub drain_rate: f64,
     pub drain_start: f64,
@@ -655,6 +659,7 @@ fn build(
         snapshots: with_lead_in(engine.snapshots.clone()),
         combo_colours,
         rate: mods.rate,
+        nightcore: mods.nightcore,
         classic,
         drain_rate,
         drain_start,
