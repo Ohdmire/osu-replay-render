@@ -65,7 +65,7 @@ pub fn build_atlas(
     images.append(&mut semibold_images);
 
     for (d, png) in COUNTER_DIGITS.iter().enumerate() {
-        let (w, h, rgba) = decode_png_bytes(png);
+        let (w, h, rgba) = decode_png_bytes(png).expect("embedded png");
         images.push((Region::CounterDigit(b'0' + d as u8), Image { width: w, height: h, rgba }));
     }
     for (png, region) in [
@@ -74,19 +74,19 @@ pub fn build_atlas(
         (COUNTER_X_PNG, Region::CounterX),
         (COUNTER_WIREFRAMES_PNG, Region::CounterWireframes),
     ] {
-        let (w, h, rgba) = decode_png_bytes(png);
+        let (w, h, rgba) = decode_png_bytes(png).expect("embedded png");
         images.push((region, Image { width: w, height: h, rgba }));
     }
     {
-        let (w, h, rgba) = decode_png_bytes(CURSOR_TRAIL_PNG);
+        let (w, h, rgba) = decode_png_bytes(CURSOR_TRAIL_PNG).expect("embedded png");
         images.push((Region::CursorTrail, Image { width: w, height: h, rgba }));
     }
     {
-        let (w, h, rgba) = decode_png_bytes(REPEAT_EDGE_PNG);
+        let (w, h, rgba) = decode_png_bytes(REPEAT_EDGE_PNG).expect("embedded png");
         images.push((Region::RepeatEdge, Image { width: w, height: h, rgba }));
     }
     {
-        let (w, h, rgba) = decode_png_bytes(APPROACH_CIRCLE_PNG);
+        let (w, h, rgba) = decode_png_bytes(APPROACH_CIRCLE_PNG).expect("embedded png");
         images.push((Region::ApproachCircle, Image { width: w, height: h, rgba }));
     }
 
@@ -127,36 +127,51 @@ pub fn build_atlas(
 }
 
 /// Decodes a PNG or JPEG file into an atlas image (RGBA).
+///
+/// Malformed or placeholder-empty files (some skins ship 0-byte pngs to
+/// disable an element) surface as `Err` instead of panicking - the
+/// framework's `TextureLoaderStore.Get` swallows decode exceptions and
+/// reports the texture as missing, so callers skip them the same way.
+/// ImageSharp detects the format from the file content rather than the
+/// extension, so a png-extension miss retries as jpeg.
 pub fn decode_image_file(path: &std::path::Path) -> Result<Image, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
     let lower = path.to_string_lossy().to_lowercase();
-    if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-        let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(&bytes));
-        let pixels = decoder.decode().map_err(|e| format!("jpeg decode {}: {}", path.display(), e))?;
-        let info = decoder.info().ok_or("jpeg missing info")?;
-        let (w, h) = (info.width as u32, info.height as u32);
-        let rgba = match info.pixel_format {
-            jpeg_decoder::PixelFormat::L8 => {
-                let mut v = Vec::with_capacity((w * h * 4) as usize);
-                for px in &pixels {
-                    v.extend_from_slice(&[*px, *px, *px, 255]);
-                }
-                v
-            }
-            jpeg_decoder::PixelFormat::RGB24 => {
-                let mut v = Vec::with_capacity((w * h * 4) as usize);
-                for px in pixels.chunks_exact(3) {
-                    v.extend_from_slice(&[px[0], px[1], px[2], 255]);
-                }
-                v
-            }
-            other => return Err(format!("unsupported jpeg pixel format {:?}", other)),
-        };
-        Ok(Image { width: w, height: h, rgba })
-    } else {
-        let (w, h, rgba) = decode_png_bytes(&bytes);
-        Ok(Image { width: w, height: h, rgba })
+    if !lower.ends_with(".png") {
+        if let Ok(img) = decode_jpeg_bytes(&bytes) {
+            return Ok(img);
+        }
     }
+    match decode_png_bytes(&bytes) {
+        Ok((w, h, rgba)) => Ok(Image { width: w, height: h, rgba }),
+        Err(png_err) => decode_jpeg_bytes(&bytes)
+            .map_err(|jpeg_err| format!("{}: png: {}; jpeg: {}", path.display(), png_err, jpeg_err)),
+    }
+}
+
+fn decode_jpeg_bytes(bytes: &[u8]) -> Result<Image, String> {
+    let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(bytes));
+    let pixels = decoder.decode().map_err(|e| e.to_string())?;
+    let info = decoder.info().ok_or("jpeg missing info")?;
+    let (w, h) = (info.width as u32, info.height as u32);
+    let rgba = match info.pixel_format {
+        jpeg_decoder::PixelFormat::L8 => {
+            let mut v = Vec::with_capacity((w * h * 4) as usize);
+            for px in &pixels {
+                v.extend_from_slice(&[*px, *px, *px, 255]);
+            }
+            v
+        }
+        jpeg_decoder::PixelFormat::RGB24 => {
+            let mut v = Vec::with_capacity((w * h * 4) as usize);
+            for px in pixels.chunks_exact(3) {
+                v.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+            v
+        }
+        other => return Err(format!("unsupported jpeg pixel format {:?}", other)),
+    };
+    Ok(Image { width: w, height: h, rgba })
 }
 
 /// A value from the beatmap's `[General]` section (e.g. `AudioFilename`).
@@ -204,38 +219,38 @@ pub fn osu_background_file(map_path: &str) -> Option<String> {
     None
 }
 
-fn decode_png_bytes(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
+fn decode_png_bytes(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     // EXPAND: paletted (Indexed) skins decode to RGB, their tRNS chunks
     // to a real alpha channel - old skins ship both.
     decoder.set_transformations(png::Transformations::EXPAND);
-    let mut reader = decoder.read_info().expect("png read info");
+    let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
     let mut buf = vec![0u8; reader.output_buffer_size()];
-    let info = reader.next_frame(&mut buf).expect("png decode");
+    let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
     let (w, h) = (info.width, info.height);
     match info.color_type {
-        png::ColorType::Rgba => (w, h, buf),
+        png::ColorType::Rgba => Ok((w, h, buf)),
         png::ColorType::GrayscaleAlpha => {
             let mut rgba = Vec::with_capacity((w * h * 4) as usize);
             for px in buf.chunks_exact(2) {
                 rgba.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
             }
-            (w, h, rgba)
+            Ok((w, h, rgba))
         }
         png::ColorType::Grayscale => {
             let mut rgba = Vec::with_capacity((w * h * 4) as usize);
             for px in &buf {
                 rgba.extend_from_slice(&[*px, *px, *px, 255]);
             }
-            (w, h, rgba)
+            Ok((w, h, rgba))
         }
         png::ColorType::Rgb => {
             let mut rgba = Vec::with_capacity((w * h * 4) as usize);
             for px in buf.chunks_exact(3) {
                 rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
             }
-            (w, h, rgba)
+            Ok((w, h, rgba))
         }
-        other => panic!("unsupported png colour type {:?}", other),
+        other => Err(format!("unsupported png colour type {:?}", other)),
     }
 }

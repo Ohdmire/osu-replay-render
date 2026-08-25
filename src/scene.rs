@@ -189,6 +189,16 @@ impl Mapper {
     pub fn win_unit(&self) -> f32 {
         self.screen_h / 480.0
     }
+
+    /// Window-space horizontal scale (screen px per 640-unit width). The
+    /// 640x480 spinner window covers the FULL window (lazer's
+    /// `LegacySpinner` inverts the playfield adjustment "to make this
+    /// area take up the entire window space", stable's screen-space
+    /// spinner elements stretch the same way), so at non-4:3 aspects the
+    /// two axes differ and sprites must take width from this one.
+    pub fn win_unit_x(&self) -> f32 {
+        self.screen_w / 640.0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -395,9 +405,20 @@ impl LegacyCache {
             .and_then(|v| v.as_f64())
             .unwrap_or(skin::configuration::LATEST_VERSION);
 
+        // Element presence is decided on the USER skin alone (lazer's
+        // OsuLegacySkinTransformer wraps only the legacy skin; a missing
+        // element falls to the default skin's own components with their own
+        // sizing, e.g. DefaultApproachCircle fills the 128-unit object box
+        // instead of drawing a texture at its authored size).
+        let ltex = |name: &str| skin.legacy_texture(name);
+        let lanim = |name: &str, looping: bool, apply_rate: bool, sep: &str| {
+            skin.legacy_skin()
+                .and_then(|l| skin::get_animation(l, name, true, looping, apply_rate, sep))
+        };
+
         let circle_pair = |name: &str| -> Option<(SkinTexture, Option<SkinTexture>)> {
-            let circle = skin.get_texture(name)?;
-            let overlay = skin.get_texture(&format!("{}overlay", name));
+            let circle = ltex(name)?;
+            let overlay = ltex(&format!("{}overlay", name));
             Some((circle, overlay))
         };
         let hitcircle = circle_pair("hitcircle");
@@ -406,16 +427,16 @@ impl LegacyCache {
         // LegacySliderBall: `GetTextures("sliderb", animatable: true,
         // separator: "")`; frame rate follows the slider velocity per
         // frame at draw time, so the cached 60fps base is re-scaled there.
-        let sliderball = skin::get_animation(skin, "sliderb", true, true, false, "");
-        let followcircle = skin::get_animation(skin, "sliderfollowcircle", true, true, true, "-");
+        let sliderball = lanim("sliderb", true, false, "");
+        let followcircle = lanim("sliderfollowcircle", true, true, "-");
 
         let judgement_names = ["hit0", "hit50", "hit100", "hit300"];
-        let judgement = judgement_names.map(|name| skin::get_animation(skin, name, true, false, false, "-"));
+        let judgement = judgement_names.map(|name| lanim(name, false, false, "-"));
 
         // Stable picks the disjoint trail style based on the provider of
         // the cursor texture: no cursormiddle there => disjoint.
-        let cursor = skin.get_texture("cursor");
-        let cursormiddle = skin.get_texture("cursormiddle");
+        let cursor = ltex("cursor");
+        let cursormiddle = ltex("cursormiddle");
         let disjoint_trail = match (&cursor, &cursormiddle) {
             // A skin without any cursor sprite keeps the argon cursor;
             // its trail style is irrelevant then.
@@ -429,7 +450,7 @@ impl LegacyCache {
             let mut out: [Option<SkinTexture>; 10] = Default::default();
             let mut any = false;
             for (d, slot) in out.iter_mut().enumerate() {
-                *slot = skin.get_texture(&format!("{}-{}", prefix, d));
+                *slot = ltex(&format!("{}-{}", prefix, d));
                 any |= slot.is_some();
             }
             any.then(|| LegacyDigits { prefix, digits: out, overlap: skin::get_font_overlap(skin, font) })
@@ -439,11 +460,11 @@ impl LegacyCache {
             version,
             hitcircle,
             sliderstartcircle,
-            approachcircle: skin.get_texture("approachcircle"),
-            reversearrow: skin.get_texture("reversearrow"),
+            approachcircle: ltex("approachcircle"),
+            reversearrow: ltex("reversearrow"),
             sliderball,
-            sliderball_nd: skin.get_texture("sliderb-nd"),
-            sliderball_spec: skin.get_texture("sliderb-spec"),
+            sliderball_nd: ltex("sliderb-nd"),
+            sliderball_spec: ltex("sliderb-spec"),
             sliderball_tint: skin
                 .get_config(skin::SkinLookup::LegacySetting(
                     skin::configuration::LegacySetting::AllowSliderBallTint,
@@ -454,22 +475,22 @@ impl LegacyCache {
             slider_border_colour: custom_colour("SliderBorder").unwrap_or(Colour::WHITE),
             slider_track_colour: custom_colour("SliderTrackOverride"),
             followcircle,
-            scorepoint: skin.get_texture("sliderscorepoint"),
+            scorepoint: ltex("sliderscorepoint"),
             cursor,
             cursormiddle,
             cursor_expand: generic_bool("CursorExpand", true),
             cursor_centre: generic_bool("CursorCentre", true),
-            cursortrail: skin.get_texture("cursortrail"),
+            cursortrail: ltex("cursortrail"),
             disjoint_trail,
-            followpoint: skin::get_animation(skin, "followpoint", true, true, true, "-"),
+            followpoint: lanim("followpoint", true, true, "-"),
             judgement,
-            spinner_glow: skin.get_texture("spinner-glow"),
-            spinner_background: skin.get_texture("spinner-background"),
-            spinner_circle: skin.get_texture("spinner-circle"),
-            spinner_metre: skin.get_texture("spinner-metre"),
-            spinner_approachcircle: skin.get_texture("spinner-approachcircle"),
-            spinner_spin: skin.get_texture("spinner-spin"),
-            spinner_clear: skin.get_texture("spinner-clear"),
+            spinner_glow: ltex("spinner-glow"),
+            spinner_background: ltex("spinner-background"),
+            spinner_circle: ltex("spinner-circle"),
+            spinner_metre: ltex("spinner-metre"),
+            spinner_approachcircle: ltex("spinner-approachcircle"),
+            spinner_spin: ltex("spinner-spin"),
+            spinner_clear: ltex("spinner-clear"),
             spinner_background_colour: custom_colour("SpinnerBackground")
                 .unwrap_or(Colour::rgba_bytes(100, 100, 100, 255)),
             spinner_blink: !generic_bool("SpinnerNoBlink", false),
@@ -995,8 +1016,15 @@ impl SceneState {
         if self.legacy.is_some() {
             let remaining = (obj.end_time - t).max(0.0);
             if tracking && !anim.was_tracking {
-                anim.fc_scale_anim = Some((t, t + remaining.min(180.0), anim.fc_scale, 2.0, Easing::Out));
-                anim.fc_alpha_anim = Some((t, t + remaining.min(60.0), anim.fc_alpha, 1.0, Easing::Linear));
+                // `OnSliderPress` starts with INSTANT `ScaleTo(1f)` /
+                // `FadeTo(0)`: a re-track after a mid-slider break resets
+                // the half-finished 4x break transform instead of
+                // animating down from it (which showed the ring rushing
+                // in oversized and shrinking to size).
+                anim.fc_scale = 1.0;
+                anim.fc_alpha = 0.0;
+                anim.fc_scale_anim = Some((t, t + remaining.min(180.0), 1.0, 2.0, Easing::Out));
+                anim.fc_alpha_anim = Some((t, t + remaining.min(60.0), 0.0, 1.0, Easing::Linear));
             } else if !tracking && anim.was_tracking {
                 if slider_ended {
                     anim.fc_scale_anim = Some((t, t + 200.0, anim.fc_scale, 1.6, Easing::Out));
@@ -1791,11 +1819,16 @@ fn draw_spinner_legacy(
     bonus_flash: Option<(f64, bool)>,
 ) {
     let unit = m.win_unit();
+    // The 640x480 spinner window spans the FULL window: at non-4:3 aspects
+    // the horizontal unit differs from the vertical one, and every sprite's
+    // WIDTH must use it (using the vertical unit shrinks elements by 25% at
+    // 16:9 and slides the left-anchored metre off its background).
+    let unit_x = m.win_unit_x();
     let centre = m.win([320.0, LEGACY_SPINNER_Y_CENTRE]);
     let scale = LEGACY_SPINNER_SCALE;
 
     let draw_sprite = |list: &mut DrawList, tex: SkinTexture, pos: [f32; 2], s: f32, rotation: f32, colour: Colour, blend: Blend| {
-        let w = tex.display_width() * scale * unit * s;
+        let w = tex.display_width() * scale * unit_x * s;
         let h = tex.display_height() * scale * unit * s;
         list.image(assets.atlas, tex.region, pos, [w, h], rotation, colour, blend);
     };
@@ -1837,7 +1870,7 @@ fn draw_spinner_legacy(
         if visible > 0.5 {
             let metre_display_h = metre.display_height() as f64 * scale as f64;
             let top = m.win([0.0, LEGACY_SPINNER_TOP_OFFSET]);
-            let w = metre.display_width() * scale * unit;
+            let w = metre.display_width() * scale * unit_x;
             let h = visible as f32 * unit;
             let fraction_full = (final_height / metre_display_h).min(1.0) as f32;
             let visible_fraction = (visible / metre_display_h).min(1.0) as f32;
@@ -1860,6 +1893,13 @@ fn draw_spinner_legacy(
     // Approach circle: 1.86x -> 0.1x linearly over the spinner duration.
     if let Some(approach) = lg.spinner_approachcircle {
         let s = value_at(t, obj.start_time, obj.start_time + obj.duration, 1.86, 0.1, Easing::Linear) as f32;
+        if std::env::var("SPINNER_DEBUG").is_ok() {
+            eprintln!(
+                "SPINNER obj={} t={} start={} end={} dur={} s={:.3} alpha={:.2} tex={}x{} adjust={}",
+                obj.index, t, obj.start_time, obj.end_time, obj.duration, s, alpha,
+                approach.width, approach.height, approach.scale_adjust
+            );
+        }
         draw_sprite(list, approach, centre, s, 0.0, Colour::WHITE.opacity(alpha), Blend::Alpha);
     }
 
@@ -3220,7 +3260,26 @@ fn draw_approach_circle(
         return;
     }
 
-    let size = 128.0 * (128.0 / 118.0) * obj.scale * scale * m.pf;
+    // Fallback ring (skin does not provide `approachcircle`). Size it
+    // INK-aware: lazer's `DefaultApproachCircle` expands the classic ring
+    // (ink 118 of a 128 canvas) by 128/118 so its ink lands on the full
+    // 128 clickable circle - but the embedded ring's ink runs to its
+    // canvas edge, so applying that expansion blindly overshoots. Target
+    // the ink directly instead: stable's default ring sinks onto the
+    // circle (ink 118 over the 128 box - a 119px skin circle matches it
+    // exactly), lazer's lands on the full 128 for argon's full-size
+    // circles.
+    let rect = assets.atlas.region_rect(crate::draw::Region::ApproachCircle);
+    let ink = assets.atlas.ink(crate::draw::Region::ApproachCircle);
+    let ink_ratio = ((ink[2] - ink[0]) / (rect.x1 - rect.x0)).clamp(0.01, 1.0);
+    let target_ink = if legacy.is_some() { 118.0 } else { 128.0 };
+    let size = target_ink / ink_ratio * obj.scale * scale * m.pf;
+    if std::env::var("APPROACH_DEBUG").is_ok() {
+        eprintln!(
+            "APPROACH-fallback obj={} t={} appear={} start={} preempt={} fade_in={} ink_ratio={:.3} target={} scale={:.2} size={:.0} alpha={:.2} pos={:?}",
+            obj.index, t, appear, obj.start_time, obj.preempt, obj.fade_in, ink_ratio, target_ink, scale, size, alpha, obj.position
+        );
+    }
     list.image(
         assets.atlas,
         crate::draw::Region::ApproachCircle,

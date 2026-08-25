@@ -37,6 +37,27 @@ impl ResolvedSkin {
     pub fn is_legacy(&self) -> bool {
         self.legacy.is_some()
     }
+
+    /// A stable-element texture lookup against the USER legacy skin only.
+    ///
+    /// lazer's ruleset transformers (`OsuLegacySkinTransformer` etc.) wrap
+    /// the legacy skin alone and decide element presence on it
+    /// (`GetTexture("approachcircle") != null` gates `LegacyApproachCircle`).
+    /// A missing element makes the transformer return null, and the outer
+    /// default skin then provides its own component with its own sizing
+    /// (e.g. `DefaultApproachCircle` fills the 128-unit object box) - the
+    /// default skin's textures never feed legacy authored-size drawing.
+    /// [`Self::get_texture`] chains to the builtin for other callers, so
+    /// legacy element slots must use this instead to keep that split.
+    pub fn legacy_texture(&self, name: &str) -> Option<SkinTexture> {
+        self.legacy.as_ref().and_then(|l| l.get_texture(name))
+    }
+
+    /// The user legacy skin, for animation probing under the same
+    /// legacy-only rule as [`Self::legacy_texture`].
+    pub fn legacy_skin(&self) -> Option<&LegacySkin> {
+        self.legacy.as_ref()
+    }
 }
 
 impl Skin for ResolvedSkin {
@@ -107,7 +128,17 @@ impl SkinTextureSource for ResolvedSkin {
 
     fn assign_regions(&mut self, regions: &[(String, SkinTexture)]) {
         if let Some(l) = &mut self.legacy {
-            l.assign_regions(regions);
+            // Only hand the legacy skin the regions its own files produced:
+            // `regions` also carries the builtin sprites packed for the
+            // argon fallback, and a builtin "approachcircle"/"cursortrail"
+            // inside the legacy table would be drawn with legacy
+            // authored-size semantics (the oversized-fallback-ring bug).
+            let own: Vec<(String, SkinTexture)> = regions
+                .iter()
+                .filter(|(name, _)| l.provides(name))
+                .cloned()
+                .collect();
+            l.assign_regions(&own);
         }
         self.builtin.assign_regions(regions);
     }
@@ -130,5 +161,69 @@ pub fn load_skin(path: Option<&Path>) -> Result<ResolvedSkin, String> {
             Ok(ResolvedSkin { legacy: Some(legacy), builtin })
         }
         None => Ok(ResolvedSkin { legacy: None, builtin }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_png(path: &Path, w: u32, h: u32) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().unwrap().write_image_data(&[255; 16]).unwrap();
+    }
+
+    fn assign_atlas(skin: &mut ResolvedSkin) {
+        let images = super::super::SkinTextureSource::texture_images(skin);
+        let regions: Vec<(String, SkinTexture)> = images
+            .iter()
+            .enumerate()
+            .map(|(i, (name, img))| {
+                (
+                    name.clone(),
+                    SkinTexture {
+                        region: crate::draw::Region::Skin(i as u32),
+                        width: img.width,
+                        height: img.height,
+                        scale_adjust: 1.0,
+                    },
+                )
+            })
+            .collect();
+        super::super::SkinTextureSource::assign_regions(skin, &regions);
+    }
+
+    /// A skin without `approachcircle` must NOT pick the builtin sprite up
+    /// through the legacy element path - neither at lookup time nor inside
+    /// the legacy skin's texture table after the merged atlas assignment
+    /// (the argon 256px ring drawn with legacy authored-size semantics is
+    /// the oversized-approach-circle bug; lazer's transformer decides
+    /// presence on the user skin alone).
+    #[test]
+    fn legacy_texture_does_not_leak_builtin_sprites() {
+        let dir = std::env::temp_dir().join(format!("orr_resolved_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Empty skin: after the atlas round the builtin sprites are packed
+        // (for the argon fallback chain) but must not enter the legacy
+        // skin's table.
+        let mut skin = load_skin(Some(&dir)).unwrap();
+        assign_atlas(&mut skin);
+        assert!(skin.legacy_texture("approachcircle").is_none());
+        assert!(skin.legacy_texture("cursortrail").is_none());
+        // The chained lookup still serves the builtin fallback.
+        assert!(skin.get_texture("approachcircle").is_some());
+
+        // An element the skin ships resolves through the legacy path.
+        write_png(&dir.join("approachcircle.png"), 2, 2);
+        let mut skin = load_skin(Some(&dir)).unwrap();
+        assign_atlas(&mut skin);
+        assert!(skin.legacy_texture("approachcircle").is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
