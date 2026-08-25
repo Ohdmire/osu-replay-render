@@ -52,7 +52,11 @@ const GRAYSCALE_SPRITES: [&str; 4] =
     ["taiko-bar-right", "taikobigcircle", "taikohitcircle", "taikohitcircleoverlay"];
 
 /// A user skin directory. File lookups are case-insensitive (stable
-/// behaviour); the directory is scanned flat, like an extracted `.osk`.
+/// behaviour) and walk subdirectories, keyed by each file's path relative
+/// to the skin dir without extension (lazer's `RealmBackedResourceStore`
+/// keys imported files by their full standardised filename, so skin.ini
+/// prefixes may name subdirectories, e.g. `HitCirclePrefix:
+/// Assets/default/default`).
 pub struct LegacySkin {
     name: String,
     dir: PathBuf,
@@ -70,50 +74,89 @@ pub struct LegacySkin {
     textures: HashMap<String, SkinTexture>,
 }
 
+/// The extension ranking shared by textures and samples: the first
+/// extension in lookup order (`ResourceStore.GetFilenames` probes
+/// `searchExtensions` in registration order) wins for a given key.
+fn extension_rank(ext: &str, order: &[&str]) -> Option<usize> {
+    order.iter().position(|x| x.eq_ignore_ascii_case(ext))
+}
+
+/// Walk the skin tree, mapping each file's relative path (no extension,
+/// lowercased, `/`-separated - the lookup-key form of
+/// `RealmBackedResourceStore`'s standardised filenames) to its absolute
+/// path, split by texture / sample use.
+fn visit_skin_tree(
+    dir: &Path,
+    rel: &str,
+    files: &mut HashMap<String, PathBuf>,
+    samples: &mut HashMap<String, PathBuf>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if file_type.is_dir() {
+            let child_rel = if rel.is_empty() { name.to_string() } else { format!("{}/{}", rel, name) };
+            visit_skin_tree(&path, &child_rel, files, samples);
+            continue;
+        }
+        let Some(ext) = path.extension().and_then(|e| e.to_str()).map(str::to_lowercase) else {
+            continue;
+        };
+        let is_texture = TEXTURE_EXTENSIONS.contains(&ext.as_str());
+        let order: &[&str] = if is_texture { &TEXTURE_EXTENSIONS } else { &SAMPLE_EXTENSIONS };
+        let key = if rel.is_empty() {
+            name.to_lowercase()
+        } else {
+            format!("{}/{}", rel, name).to_lowercase()
+        };
+        // Strip the extension from the key ("hitcircle.png" -> "hitcircle",
+        // "Assets/x/default-0.png" -> "assets/x/default-0"); `@2x` stays,
+        // it is part of the stem.
+        let key = match key.rfind('.') {
+            Some(i) => key[..i].to_string(),
+            None => key,
+        };
+        let better = |store: &HashMap<String, PathBuf>| match extension_rank(&ext, order) {
+            Some(rank) => match store.get(&key) {
+                Some(existing) => existing
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .and_then(|cur| extension_rank(cur, order))
+                    .map(|r| rank < r)
+                    .unwrap_or(true),
+                None => true,
+            },
+            None => false,
+        };
+        if is_texture {
+            if better(files) {
+                files.insert(key, path);
+            }
+        } else if SAMPLE_EXTENSIONS.contains(&ext.as_str()) {
+            if better(samples) {
+                samples.insert(key, path);
+            }
+        }
+    }
+}
+
 impl LegacySkin {
     /// Construct from a skin directory. Parses `skin.ini` when present
     /// (both decoder passes, like `LegacySkin.ParseConfigurationStream`);
     /// a missing ini leaves the `LATEST_VERSION` default of the `Skin`
     /// constructor. Fails only when `dir` is not a directory.
     pub fn from_directory(dir: &Path) -> Result<LegacySkin, String> {
-        let entries = std::fs::read_dir(dir).map_err(|e| format!("cannot read skin dir {}: {}", dir.display(), e))?;
-
         let mut files = HashMap::new();
         let mut samples = HashMap::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let Some(ext) = path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) else {
-                continue;
-            };
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            if TEXTURE_EXTENSIONS.contains(&ext.as_str()) {
-                files.insert(stem.to_lowercase(), path.clone());
-            } else if SAMPLE_EXTENSIONS.contains(&ext.as_str()) {
-                // First extension in stable's order wins for a given stem.
-                let current_rank = |p: &PathBuf| {
-                    p.extension()
-                        .and_then(|e| e.to_str())
-                        .and_then(|cur| SAMPLE_EXTENSIONS.iter().position(|x| x.eq_ignore_ascii_case(cur)))
-                };
-                let better = match current_rank(&path) {
-                    Some(rank) => match samples.get(&stem.to_lowercase()) {
-                        Some(existing) => {
-                            current_rank(existing).map(|r| rank < r).unwrap_or(true)
-                        }
-                        None => true,
-                    },
-                    None => false,
-                };
-                if better {
-                    samples.insert(stem.to_lowercase(), path.clone());
-                }
-            }
-        }
+        visit_skin_tree(dir, "", &mut files, &mut samples);
 
         // skin.ini: the store lookup is case-insensitive.
         let ini_path = ["skin.ini", "Skin.ini", "SKIN.INI"]
@@ -164,6 +207,15 @@ impl LegacySkin {
     /// The skin directory (for diagnostics).
     pub fn directory(&self) -> &Path {
         &self.dir
+    }
+
+    /// Whether the skin directory actually contains a file for this
+    /// (lookup-key form) texture name - `assign_regions` filters against
+    /// this so builtin fallback sprites never leak into the legacy skin's
+    /// texture table (they would be drawn with legacy authored-size
+    /// semantics and render oversized).
+    pub fn provides(&self, name: &str) -> bool {
+        self.files.contains_key(&name.to_lowercase().replace('\\', "/"))
     }
 
     /// Number of image files discovered (diagnostics).
@@ -409,7 +461,10 @@ impl Skin for LegacySkin {
 
     /// `LegacySkin.GetTexture` (`AllowHighResolutionSprites` = true):
     /// alias, strip `@2x`, try the `@2x` sprite first with
-    /// `ScaleAdjust = 2`, then the base sprite.
+    /// `ScaleAdjust = 2`, then the base sprite. The lookup name is
+    /// lowercased first - `RealmBackedResourceStore.getPathForFile`
+    /// lowercases lookups, making file access case-insensitive (mixed-case
+    /// font prefixes from skin.ini rely on this).
     fn get_texture(&self, component_name: &str) -> Option<SkinTexture> {
         let mut component_name = match component_name {
             "Menu/fountain-star" => "star2",
@@ -421,6 +476,10 @@ impl Skin for LegacySkin {
         // Some component names (user-controlled ones like mania `HitX`)
         // may contain `@2x` scale specifications; stable strips them.
         component_name = component_name.replace("@2x", "");
+        // `RealmBackedResourceStore` lowercases lookups and standardises
+        // their separators (`ToStandardisedPath`), making file access
+        // case-insensitive and letting ini prefixes name subdirectories.
+        let component_name = component_name.to_lowercase().replace('\\', "/");
 
         let lookup = |name: &str| self.textures.get(name).copied();
 
@@ -564,6 +623,7 @@ impl LegacySkin {
                 .and_then(|v| v.into_string())
                 .unwrap_or_else(|| default.to_string())
                 .to_lowercase()
+                .replace('\\', "/")
         };
         for font_prefix in [
             prefix(LegacySetting::HitCirclePrefix, "default"),
@@ -693,6 +753,27 @@ mod tests {
         enc.set_color(png::ColorType::Rgba);
         enc.set_depth(png::BitDepth::Eight);
         enc.write_header().unwrap().write_image_data(rgba).unwrap();
+    }
+
+    /// Decode + hand back atlas regions so `get_texture` serves handles.
+    fn assign_atlas(skin: &mut LegacySkin) {
+        let images = SkinTextureSource::texture_images(skin);
+        let regions: Vec<(String, SkinTexture)> = images
+            .iter()
+            .enumerate()
+            .map(|(i, (name, img))| {
+                (
+                    name.clone(),
+                    SkinTexture {
+                        region: Region::Skin(i as u32),
+                        width: img.width,
+                        height: img.height,
+                        scale_adjust: 1.0,
+                    },
+                )
+            })
+            .collect();
+        SkinTextureSource::assign_regions(skin, &regions);
     }
 
     #[test]
@@ -839,6 +920,80 @@ mod tests {
         assert!(skin.get_sample("normal-hitnormal").unwrap().ends_with("normal-hitnormal.wav"));
         assert!(skin.get_sample("soft-hitclap").unwrap().ends_with("soft-hitclap.ogg"));
         assert!(skin.get_sample("nope").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Placeholder-empty and corrupt pngs (skins ship them to disable an
+    /// element) must be skipped like the framework's `TextureLoaderStore`
+    /// swallowing decode exceptions - not panic.
+    #[test]
+    fn invalid_pngs_are_skipped() {
+        let dir = skin_dir("invalid_png");
+        std::fs::write(dir.join("hitcircle.png"), b"").unwrap(); // 0 bytes
+        std::fs::write(dir.join("cursor.png"), b"not a png at all").unwrap(); // garbage
+        write_png(&dir.join("reversearrow.png"), 2, 2, &[255; 4 * 4]); // one valid file
+        let mut skin = LegacySkin::from_directory(&dir).unwrap();
+        let images = SkinTextureSource::texture_images(&skin);
+        let names: Vec<&str> = images.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, &["reversearrow"]);
+        assign_atlas(&mut skin);
+        assert!(skin.get_texture("hitcircle").is_none());
+        assert!(skin.get_texture("cursor").is_none());
+        assert!(skin.get_texture("reversearrow").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `RealmBackedResourceStore` lowercases lookups: a mixed-case
+    /// `HitCirclePrefix` from skin.ini must still find `Mine-0.png`.
+    #[test]
+    fn mixed_case_prefix_resolves() {
+        let dir = skin_dir("case_prefix");
+        std::fs::write(dir.join("skin.ini"), "[General]\nVersion: 2.5\nHitCirclePrefix: Mine\n").unwrap();
+        write_png(&dir.join("Mine-0.png"), 2, 2, &[255; 4 * 4]);
+        write_png(&dir.join("Mine-9.png"), 2, 2, &[255; 4 * 4]);
+        let mut skin = LegacySkin::from_directory(&dir).unwrap();
+        assign_atlas(&mut skin);
+        assert_eq!(
+            super::super::texture::get_font_prefix(&skin, super::super::texture::LegacyFont::HitCircle),
+            "Mine"
+        );
+        assert!(skin.get_texture("Mine-0").is_some());
+        assert!(skin.get_texture("MINE-9").is_some());
+        assert!(super::super::texture::has_font(&skin, super::super::texture::LegacyFont::HitCircle));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Prefixes may name subdirectories (`HitCirclePrefix:
+    /// Assets/default/default` - Arona-style skins); files are keyed by
+    /// their relative path like lazer's realm store.
+    #[test]
+    fn subfolder_prefix_digits_resolve() {
+        let dir = skin_dir("subfolder_prefix");
+        std::fs::create_dir_all(dir.join("Assets/default")).unwrap();
+        std::fs::write(
+            dir.join("skin.ini"),
+            "[General]\nVersion: 2.5\nHitCirclePrefix: Assets/default/default\nScorePrefix: Assets\\score\\score\n",
+        )
+        .unwrap();
+        write_png(&dir.join("Assets/default/default-0.png"), 2, 2, &[255; 4 * 4]);
+        write_png(&dir.join("Assets/default/default-1@2x.png"), 4, 4, &[255; 4 * 16]);
+        std::fs::create_dir_all(dir.join("Assets/score")).unwrap();
+        write_png(&dir.join("Assets/score/score-0.png"), 2, 2, &[255; 4 * 4]);
+        let mut skin = LegacySkin::from_directory(&dir).unwrap();
+        assign_atlas(&mut skin);
+        // Mixed case + subpath resolve through the lowercased relative key.
+        assert!(skin.get_texture("Assets/default/default-0").is_some());
+        assert!(skin.get_texture("assets/DEFAULT/default-1").is_some()); // prefers the @2x file
+        let hit = skin.get_texture("Assets/default/default-1").unwrap();
+        assert_eq!(hit.scale_adjust, 2.0);
+        // Backslash form of the prefix (Windows-authored ini) normalises.
+        assert!(skin.get_texture("Assets\\score\\score-0").is_some());
+        // Subfolder digit frames get packed (consumed_names probes them).
+        let images = SkinTextureSource::texture_images(&skin);
+        let names: Vec<&str> = images.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"assets/default/default-0"));
+        assert!(names.contains(&"assets/default/default-1@2x"));
+        assert!(names.contains(&"assets/score/score-0"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
