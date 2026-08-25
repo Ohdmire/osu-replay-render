@@ -90,8 +90,8 @@ struct Options {
     hd: HdMode,
     /// Synthesize the hitsound track (ArgonPro skin samples, lazer
     /// gameplay-audio parity: hit-only judgements, beatmap volumes/banks,
-    /// slider loops, DT/HT pitch) and mix it into the export
-    /// (`--hitsounds`).
+    /// slider loops, samples at their natural rate — no DT/HT pitch
+    /// shift) and mix it into the export (`--hitsounds`).
     hitsounds: bool,
     /// Hitsound bus gain 0..1 (`--hitsounds-volume`, default 0.6 =
     /// `VolumeEffect`, see `OsuGame.GetFrameworkConfigDefaults`).
@@ -417,8 +417,8 @@ impl Output {
 /// Bound of the frame queue to the ffmpeg writer thread (frames).
 const WRITER_QUEUE: usize = 3;
 
-/// First audio stream's sample rate (Hz), for the rate-mod `asetrate`
-/// speed-up. Falls back to 44100 when ffprobe is missing or fails.
+/// First audio stream's sample rate (Hz), for the Nightcore `asetrate`
+/// pitch-up. Falls back to 44100 when ffprobe is missing or fails.
 fn probe_sample_rate(path: &str) -> u32 {
     std::process::Command::new("ffprobe")
         .args(["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=sample_rate", "-of", "csv=p=0"])
@@ -592,7 +592,8 @@ fn main() {
 
     // Hitsound track (`--hitsounds`): synthesized offline from the
     // judgement timeline plus the .osu sample data (hit-only triggers,
-    // beatmap banks/volumes, slider slide loops, DT/HT pitch), on the
+    // beatmap banks/volumes, slider slide loops, samples at their
+    // natural rate — rate mods only compress the trigger times), on the
     // export's wall timeline so it muxes 1:1 with the video. Written as a
     // temp WAV, mixed into the output in the second pass below.
     let hits_path: Option<String> = if opts.hitsounds && opts.out.is_some() {
@@ -790,10 +791,12 @@ fn main() {
     // here by delaying the audio with leading silence (adelay) instead of
     // clamping the seek to 0 (the clamp started the music |t0| early and
     // silently disabled the offset for renders starting at t=0). Rate
-    // mods (DT/NC 1.5, HT 0.75) resample the track — pitch and tempo
-    // scale together, like lazer's Track rate adjustment. The hitsound
-    // track is a separate audio stream: with BGM present both are summed
-    // with amix (normalize=0 keeps the levels as authored).
+    // mods tempo-stretch the track with atempo — the pitch stays intact,
+    // a deliberate deviation from lazer's Track rate adjustment (which
+    // resamples, pitch and tempo together) — except Nightcore, which
+    // keeps the game's resampled pitch-up. The hitsound track is a
+    // separate audio stream: with BGM present both are summed with amix
+    // (normalize=0 keeps the levels as authored).
     if audio_path.is_some() || hits_path.is_some() {
         if let Some(out) = &opts.out {
             let offset = opts.audio_offset.unwrap_or(0.0);
@@ -813,18 +816,33 @@ fn main() {
                 if (opts.bgm_volume - 1.0).abs() > 1e-6 {
                     bgm_filters.push(format!("volume={:.4}", opts.bgm_volume));
                 }
-                if (rate - 1.0).abs() > 1e-9 {
-                    let sr = probe_sample_rate(audio);
-                    bgm_filters.push(format!("asetrate={},aresample={}", (sr as f64 * rate).round() as i64, sr));
-                }
                 if seek_ms >= 0.0 {
                     cmd.arg("-ss").arg(format!("{:.3}", seek_ms / 1000.0));
                 } else {
                     // Negative file position: pad silence so the music
                     // begins exactly when the replay clock reaches the
-                    // offset. adelay runs after the speed filter, i.e. in
-                    // the output (wall) timeline: ms = -seek/rate.
-                    bgm_filters.push(format!("adelay={}:all=1", (-seek_ms / rate).round() as i64));
+                    // offset. The delay is inserted on the file (map)
+                    // timeline and must be pushed BEFORE atempo, which
+                    // compresses it to -seek/rate wall ms; atempo ahead
+                    // of adelay stalls the graph's inter-stream sync
+                    // under -shortest (ffmpeg 9) and mangles the mux.
+                    bgm_filters.push(format!("adelay={}:all=1", (-seek_ms).round() as i64));
+                }
+                if (rate - 1.0).abs() > 1e-9 {
+                    if game.nightcore {
+                        // Nightcore keeps the game's pitch-up: resampling,
+                        // tempo and pitch scale together (rate 1.5) —
+                        // nightcore without the pitch isn't nightcore.
+                        let sr = probe_sample_rate(audio);
+                        bgm_filters.push(format!("asetrate={},aresample={}", (sr as f64 * rate).round() as i64, sr));
+                    } else {
+                        // DT/HT: tempo-only stretch — atempo keeps the
+                        // music's pitch, a deliberate deviation from the
+                        // game, whose track rate adjustment resamples
+                        // (pitch and tempo together). DT 1.5 / HT 0.75
+                        // are within atempo's 0.5..100 range.
+                        bgm_filters.push(format!("atempo={:.6}", rate));
+                    }
                 }
                 cmd.arg("-i").arg(audio);
             }

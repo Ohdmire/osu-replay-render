@@ -18,8 +18,12 @@
 //!   `sliderwhistle` when the whistle flag is set) while tracked;
 //! - playback volume = `max(volume, 5)%` (`MINIMUM_SAMPLE_VOLUME`),
 //!   stereo balance follows the playfield X (`PositionalHitsoundsLevel`
-//!   0.8 → `round2(1.6 * (x/512 - 0.5))`), and rate mods pitch samples up
-//!   like the rest of lazer's gameplay audio mixer;
+//!   0.8 → `round2(1.6 * (x/512 - 0.5))`). Samples always play at their
+//!   natural rate, under every mod — rate mods only compress the trigger
+//!   times onto the wall timeline, the pitch never shifts (a deliberate
+//!   deviation from lazer, whose gameplay mixer resamples samples with
+//!   the rate; this holds under Nightcore too, whose BGM does keep the
+//!   game's pitch-up);
 //! - a combo drop to zero plays `Gameplay/combobreak` (`ComboEffects`:
 //!   old combo > 20, or the first break while `AlwaysPlayFirstComboBreak`
 //!   is on — the default), at full volume, centered.
@@ -482,18 +486,18 @@ fn build_placements(game: &GameData, data: &SampleData, t0: f64, t_map_end: f64)
                             }
                             _ => {
                                 if let Some((a, b)) = run.take() {
-                                    tile_loop(&mut out, obj, a, b, slide, slide_len_ms, t0, t_map_end);
+                                    tile_loop(&mut out, obj, a, b, slide, slide_len_ms, game.rate, t0, t_map_end);
                                     if let Some(w) = whistle {
-                                        tile_loop(&mut out, obj, a, b, w, whistle_len_ms, t0, t_map_end);
+                                        tile_loop(&mut out, obj, a, b, w, whistle_len_ms, game.rate, t0, t_map_end);
                                     }
                                 }
                             }
                         }
                     }
                     if let Some((a, b)) = run.take() {
-                        tile_loop(&mut out, obj, a, b, slide, slide_len_ms, t0, t_map_end);
+                        tile_loop(&mut out, obj, a, b, slide, slide_len_ms, game.rate, t0, t_map_end);
                         if let Some(w) = whistle {
-                            tile_loop(&mut out, obj, a, b, w, whistle_len_ms, t0, t_map_end);
+                            tile_loop(&mut out, obj, a, b, w, whistle_len_ms, game.rate, t0, t_map_end);
                         }
                     }
                     if dbg {
@@ -545,8 +549,10 @@ fn build_placements(game: &GameData, data: &SampleData, t0: f64, t_map_end: f64)
     out
 }
 
-/// Tiles a loop sample across the tracked interval [a, b] (map ms) at its
-/// natural length; balance follows the ball position per tile.
+/// Tiles a loop sample across the tracked interval [a, b] (map ms) so it
+/// loops seamlessly at its natural rate on the wall timeline: each tile
+/// rings for `len_ms` wall ms, i.e. `len_ms * rate` map ms apart.
+/// Balance follows the ball position per tile.
 fn tile_loop(
     out: &mut Vec<Placement>,
     obj: &crate::game::ObjView,
@@ -554,6 +560,7 @@ fn tile_loop(
     b: f64,
     sample: HitSample,
     len_ms: f64,
+    rate: f64,
     t0: f64,
     t_map_end: f64,
 ) {
@@ -567,7 +574,7 @@ fn tile_loop(
             let x = obj.slider_ball_at(progress.clamp(0.0, 1.0))[0];
             out.push(Placement { time: t, sample, x, until: Some(b.min(t_map_end)) });
         }
-        t += len_ms;
+        t += len_ms * rate;
     }
 }
 
@@ -732,17 +739,17 @@ fn decode_wav(bytes: &[u8]) -> Option<Clip> {
     Some(Clip { data })
 }
 
-/// Mixes one placement into `buf` (interleaved stereo f32). `speed`
-/// resamples the clip (rate mods pitch samples up, like lazer's gameplay
-/// audio adjustments); `until_sec` truncates loop tiles where lazer would
-/// stop the looping sample.
-fn place(buf: &mut [f32], clip: &Clip, start_sec: f64, speed: f64, gl: f32, gr: f32, until_sec: Option<f64>) {
+/// Mixes one placement into `buf` (interleaved stereo f32) at the clip's
+/// natural rate — samples never pitch-shift with rate mods, DT/HT only
+/// move the trigger times. `until_sec` truncates loop tiles where lazer
+/// would stop the looping sample.
+fn place(buf: &mut [f32], clip: &Clip, start_sec: f64, gl: f32, gr: f32, until_sec: Option<f64>) {
     let frames = clip.data.len() / 2;
-    if frames == 0 || speed <= 0.0 {
+    if frames == 0 {
         return;
     }
     let dst_start = (start_sec * SAMPLE_RATE as f64).round() as isize;
-    let mut dst_len = (frames as f64 / speed).ceil() as usize;
+    let mut dst_len = frames;
     if let Some(until) = until_sec {
         let cut = ((until * SAMPLE_RATE as f64).round() as isize - dst_start).max(0) as usize;
         dst_len = dst_len.min(cut);
@@ -756,17 +763,8 @@ fn place(buf: &mut [f32], clip: &Clip, start_sec: f64, speed: f64, gl: f32, gr: 
         if dst * 2 + 1 >= buf.len() {
             break;
         }
-        let t = n as f64 * speed;
-        let i = t.floor() as usize;
-        if i >= frames {
-            break;
-        }
-        let frac = (t - i as f64) as f32;
-        let j = (i + 1).min(frames - 1);
-        let l = clip.data[i * 2] * (1.0 - frac) + clip.data[j * 2] * frac;
-        let r = clip.data[i * 2 + 1] * (1.0 - frac) + clip.data[j * 2 + 1] * frac;
-        buf[dst * 2] += l * gl;
-        buf[dst * 2 + 1] += r * gr;
+        buf[dst * 2] += clip.data[n * 2] * gl;
+        buf[dst * 2 + 1] += clip.data[n * 2 + 1] * gr;
     }
 }
 
@@ -914,7 +912,7 @@ fn render_track(game: &GameData, map_content: &str, t0: f64, wall_secs: f64, rat
         let gr = volume * (1.0 - (-bal).max(0.0));
         let wall = (p.time - t0) / rate / 1000.0;
         let until = p.until.map(|u| (u - t0) / rate / 1000.0);
-        place(&mut buf, clip, wall, rate, gl, gr, until);
+        place(&mut buf, clip, wall, gl, gr, until);
     }
 
     // Master gain / headroom scale (`--hitsounds-volume`, or the linear
@@ -1013,5 +1011,25 @@ mod tests {
     fn soft_hitnormal_resolves_to_clip() {
         let sample = HitSample { name: "hitnormal", bank: Bank::Soft, volume: 100 };
         assert!(sample_clip(sample).is_some());
+    }
+
+    /// Samples land sample-for-sample at their natural rate — rate mods
+    /// move trigger times only, never the playback speed/pitch — and
+    /// `until` truncates loop tiles at the wall-time cutoff.
+    #[test]
+    fn place_copies_at_natural_rate() {
+        // 100-frame ramp, one channel duplicated to stereo.
+        let clip = Clip { data: (0..100).flat_map(|i| [i as f32 / 100.0; 2]).collect() };
+        let mut buf = vec![0.0f32; 30000 * 2];
+        place(&mut buf, &clip, 0.5, 1.0, 1.0, None);
+        for f in 0..100 {
+            assert_eq!(buf[(22050 + f) * 2], clip.data[f * 2]);
+        }
+        assert_eq!(buf[(22050 + 100) * 2], 0.0, "must not ring past the natural length");
+
+        let mut cut = vec![0.0f32; 30000 * 2];
+        place(&mut cut, &clip, 0.5, 1.0, 1.0, Some(0.5 + 50.0 / SAMPLE_RATE as f64));
+        assert_eq!(cut[(22050 + 49) * 2], clip.data[49 * 2]);
+        assert_eq!(cut[(22050 + 50) * 2], 0.0, "cut at until");
     }
 }
