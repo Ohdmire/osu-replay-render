@@ -564,6 +564,11 @@ const CONSUMED_TEXTURE_NAMES: &[&str] = &[
     "spinner-circle",
     "spinner-metre",
     "spinner-approachcircle",
+    "spinner-top",
+    "spinner-bottom",
+    "spinner-middle",
+    "spinner-middle2",
+    "spinner-rpm",
     "spinner-spin",
     "spinner-clear",
 ];

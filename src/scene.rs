@@ -172,32 +172,28 @@ impl Mapper {
         ]
     }
 
-    /// Legacy spinner coordinates: stable's 640x480 WINDOW space
-    /// (`LegacySpinner`: the container fills the window and shifts up by
-    /// 8 window units, cancelling the playfield's downwards shift). The
-    /// space stretches to the full screen on both axes.
+    /// Legacy spinner coordinates: stable's 640x480 window space. Lazer
+    /// keeps this box SQUARE: `DrawableSpinner` hosts the skin component
+    /// inside an `AspectContainer` (`RelativeSizeAxes = Y`, 384x384
+    /// gamefield units) and the virtual screen itself scales uniformly
+    /// (`DrawSizePreservingFillContainer`, `Minimum` strategy), so the box
+    /// lands at full screen HEIGHT with a 4:3 aspect, centred on screen —
+    /// never stretched to the window edges. The spinner's own
+    /// `Position = (0, -8)` exactly cancels the playfield's +8*1.6 shift,
+    /// putting the box centre at the screen centre.
     pub fn win(&self, v: [f32; 2]) -> [f32; 2] {
-        let cx = self.screen_w * 0.5;
-        let cy = self.screen_h * 0.5 - 8.0 * self.screen_h / 480.0;
+        let u = self.win_unit();
         [
-            cx + (v[0] - 320.0) / 640.0 * self.screen_w,
-            cy + (v[1] - 240.0) / 480.0 * self.screen_h,
+            self.screen_w * 0.5 + (v[0] - 320.0) * u,
+            self.screen_h * 0.5 + (v[1] - 240.0) * u,
         ]
     }
 
-    /// Window-space scale (screen px per 640x480 unit, height axis).
+    /// Window-space scale (screen px per 640x480 unit). Uniform on both
+    /// axes: the box is width-constrained below 4:3 and height-constrained
+    /// at 4:3 and wider (`Minimum` strategy semantics).
     pub fn win_unit(&self) -> f32 {
-        self.screen_h / 480.0
-    }
-
-    /// Window-space horizontal scale (screen px per 640-unit width). The
-    /// 640x480 spinner window covers the FULL window (lazer's
-    /// `LegacySpinner` inverts the playfield adjustment "to make this
-    /// area take up the entire window space", stable's screen-space
-    /// spinner elements stretch the same way), so at non-4:3 aspects the
-    /// two axes differ and sprites must take width from this one.
-    pub fn win_unit_x(&self) -> f32 {
-        self.screen_w / 640.0
+        (self.screen_w / 640.0).min(self.screen_h / 480.0)
     }
 }
 
@@ -360,13 +356,23 @@ struct LegacyCache {
     followpoint: Option<SkinAnimation>,
     /// Judgement bursts (`LegacySkin.getJudgementAnimation`).
     judgement: [Option<SkinAnimation>; 4], // hit0, hit50, hit100, hit300
-    /// Old-style spinner sprites (most skins); `new_style` selects the
-    /// `spinner-top/bottom/middle` glow layout when `spinner-glow` exists.
+    /// Spinner sprites. `OsuLegacySkinTransformer.SpinnerBody`: a skin
+    /// with `spinner-background` always uses the OLD style
+    /// (`LegacyOldStyleSpinner`); `spinner-top` WITHOUT a background
+    /// selects the NEW style (`LegacyNewStyleSpinner`). The old style
+    /// never draws `spinner-glow` — that sprite belongs to the new style
+    /// only.
+    spinner_new_style: bool,
     spinner_glow: Option<SkinTexture>,
     spinner_background: Option<SkinTexture>,
     spinner_circle: Option<SkinTexture>,
     spinner_metre: Option<SkinTexture>,
     spinner_approachcircle: Option<SkinTexture>,
+    spinner_top: Option<SkinTexture>,
+    spinner_bottom: Option<SkinTexture>,
+    spinner_middle: Option<SkinTexture>,
+    spinner_middle2: Option<SkinTexture>,
+    spinner_rpm: Option<SkinTexture>,
     spinner_spin: Option<SkinTexture>,
     spinner_clear: Option<SkinTexture>,
     spinner_background_colour: Colour,
@@ -484,11 +490,17 @@ impl LegacyCache {
             disjoint_trail,
             followpoint: lanim("followpoint", true, true, "-"),
             judgement,
+            spinner_new_style: ltex("spinner-top").is_some() && ltex("spinner-background").is_none(),
             spinner_glow: ltex("spinner-glow"),
             spinner_background: ltex("spinner-background"),
             spinner_circle: ltex("spinner-circle"),
             spinner_metre: ltex("spinner-metre"),
             spinner_approachcircle: ltex("spinner-approachcircle"),
+            spinner_top: ltex("spinner-top"),
+            spinner_bottom: ltex("spinner-bottom"),
+            spinner_middle: ltex("spinner-middle"),
+            spinner_middle2: ltex("spinner-middle2"),
+            spinner_rpm: ltex("spinner-rpm"),
             spinner_spin: ltex("spinner-spin"),
             spinner_clear: ltex("spinner-clear"),
             spinner_background_colour: custom_colour("SpinnerBackground")
@@ -506,6 +518,14 @@ fn skin_lookup_generic(key: &str) -> skin::SkinLookup {
     skin::SkinLookup::Generic(key.to_string())
 }
 
+/// Horizontal anchor for [`draw_legacy_number`] (`LegacySpriteText`
+/// Origin semantics).
+#[derive(Clone, Copy, PartialEq)]
+enum NumAlign {
+    Centre,
+    Right,
+}
+
 /// Draws a number with legacy digit sprites (`LegacySpriteText` layout:
 /// advance = glyph width - overlap, positive overlap pulls closer).
 #[allow(clippy::too_many_arguments)]
@@ -514,10 +534,11 @@ fn draw_legacy_number(
     atlas: &Atlas,
     digits: &LegacyDigits,
     text: &str,
-    center: [f32; 2],
+    pos: [f32; 2],
     scale: f32,
     colour: Colour,
     blend: Blend,
+    align: NumAlign,
 ) {
     let glyph = |c: char| digits.digits.get(c.to_digit(10).unwrap_or(0) as usize).copied().flatten();
     let widths: Vec<(f32, SkinTexture)> = text
@@ -534,13 +555,16 @@ fn draw_legacy_number(
         .map(|&(w, _)| w - digits.overlap * scale)
         .sum::<f32>()
         + digits.overlap * scale;
-    let mut pen = center[0] - total * 0.5;
+    let mut pen = match align {
+        NumAlign::Centre => pos[0] - total * 0.5,
+        NumAlign::Right => pos[0] - total,
+    };
     for (w, tex) in widths {
         let h = tex.display_height() * scale;
         list.image(
             atlas,
             tex.region,
-            [pen + w * 0.5, center[1]],
+            [pen + w * 0.5, pos[1]],
             [w, h],
             0.0,
             colour,
@@ -1617,9 +1641,11 @@ impl SceneState {
         }
         let a = alpha as f32;
 
-        // Legacy spinner (`LegacySpinner` + `LegacyOldStyleSpinner`): the
-        // skin's sprites laid out in stable's 640x480 window space.
+        // Legacy spinner (`LegacySpinner` + `LegacyOldStyleSpinner` /
+        // `LegacyNewStyleSpinner`): the skin's sprites laid out in
+        // stable's 640x480 window space.
         if let Some(lg) = &self.legacy {
+            let hit_time = if judged && hit { Some(jt) } else { None };
             draw_spinner_legacy(
                 lg,
                 assets,
@@ -1631,8 +1657,10 @@ impl SceneState {
                 progress,
                 anim.complete_at,
                 anim.display_rotation,
+                anim.spm,
                 anim.bonus_score,
                 anim.bonus_flash,
+                hit_time,
             );
             return;
         }
@@ -1798,11 +1826,13 @@ impl SceneState {
     }
 }
 
-/// `LegacyOldStyleSpinner`: glow (new-style only), tinted background,
-/// spinning disc, top-down masked metre, approach circle shrinking
-/// 1.86x -> 0.1x over the duration, the spin/clear sprites and the
-/// bonus counter in score digits. All positions in the 640x480 window
-/// space via [`Mapper::win`].
+/// Legacy skinned spinner (`LegacySpinner` base + `LegacyOldStyleSpinner`
+/// / `LegacyNewStyleSpinner`): the skin's sprites laid out in stable's
+/// 640x480 window space via [`Mapper::win`] (UNIFORM scale — the window
+/// box stays 4:3 on screen, sprites never stretch). Draw order mirrors
+/// the framework's depth sort: the style sprites first, then the
+/// base-class overlay (rpm background, spm counter, spin, clear, bonus
+/// counter — added inside a `Depth = float.MinValue` container) in front.
 #[allow(clippy::too_many_arguments)]
 fn draw_spinner_legacy(
     lg: &LegacyCache,
@@ -1815,82 +1845,130 @@ fn draw_spinner_legacy(
     progress: f64,
     complete_at: Option<f64>,
     display_rotation: f64,
+    spm: f64,
     bonus_score: i64,
     bonus_flash: Option<(f64, bool)>,
+    hit_time: Option<f64>,
 ) {
     let unit = m.win_unit();
-    // The 640x480 spinner window spans the FULL window: at non-4:3 aspects
-    // the horizontal unit differs from the vertical one, and every sprite's
-    // WIDTH must use it (using the vertical unit shrinks elements by 25% at
-    // 16:9 and slides the left-anchored metre off its background).
-    let unit_x = m.win_unit_x();
     let centre = m.win([320.0, LEGACY_SPINNER_Y_CENTRE]);
     let scale = LEGACY_SPINNER_SCALE;
 
+    // A `Sprite` with `Scale = new Vector2(SPRITE_SCALE)`: both axes take
+    // the same window unit (the legacy spinner window is aspect-locked).
     let draw_sprite = |list: &mut DrawList, tex: SkinTexture, pos: [f32; 2], s: f32, rotation: f32, colour: Colour, blend: Blend| {
-        let w = tex.display_width() * scale * unit_x * s;
+        let w = tex.display_width() * scale * unit * s;
         let h = tex.display_height() * scale * unit * s;
         list.image(assets.atlas, tex.region, pos, [w, h], rotation, colour, blend);
     };
 
-    // Glow (new-style skins ship `spinner-glow`): additive, brightness
-    // follows the spin progress.
-    if let Some(glow) = lg.spinner_glow {
-        let glow_a = (0.2 + 0.6 * progress as f32) * alpha;
-        draw_sprite(list, glow, centre, 1.0, 0.0, Colour::WHITE.opacity(glow_a), Blend::Additive);
-    }
+    if lg.spinner_new_style {
+        // --- LegacyNewStyleSpinner -----------------------------------------
+        // scaleContainer wraps glow/bottom/top/middle2/middle:
+        // `SPRITE_SCALE * (0.8 + ApplyEasing(Out, progress) * 0.2)`.
+        let eased = 1.0 - (1.0 - progress as f32).powi(2);
+        let stack_s = 0.8 + eased * 0.2;
 
-    if let Some(background) = lg.spinner_background {
-        draw_sprite(list, background, centre, 1.0, 0.0, lg.spinner_background_colour.opacity(alpha), Blend::Alpha);
-    }
-
-    if let Some(disc) = lg.spinner_circle {
-        draw_sprite(list, disc, centre, 1.0, display_rotation as f32, Colour::WHITE.opacity(alpha), Blend::Alpha);
-    }
-
-    // Metre: 10 bars; `getMetreHeight` blinks the partial bar (capped at
-    // 99% progress so it keeps blinking at full) - deterministic here.
-    if let Some(metre) = lg.spinner_metre {
-        const TOTAL_BARS: f64 = 10.0;
-        let final_height = 692.0 * scale as f64; // window units
-        let mut p = progress * 100.0;
-        if lg.spinner_blink {
-            p = p.min(99.0);
+        if let Some(glow) = lg.spinner_glow {
+            // Additive, tinted (3, 151, 255); alpha tracks the raw
+            // progress, flashes white per bonus tick hit, and fades out
+            // over 300ms from the hit state.
+            let mut glow_a = (progress as f32).clamp(0.0, 1.0);
+            if let Some(ht) = hit_time {
+                glow_a *= 1.0 - ((t - ht) / 300.0).clamp(0.0, 1.0) as f32;
+            }
+            let mut col = Colour::rgba_bytes(3, 151, 255, 255);
+            if let Some((bt, _)) = bonus_flash {
+                // `FlashColour(White, 200)`: snaps to white, back over 200ms.
+                let k = 1.0 - ((t - bt) / 200.0).clamp(0.0, 1.0) as f32;
+                col = Colour::lerp(col, Colour::WHITE, k);
+            }
+            draw_sprite(list, glow, centre, stack_s, 0.0, col.opacity(glow_a * alpha), Blend::Additive);
         }
-        let mut bars = (p as i64) / 10;
-        if lg.spinner_blink && p > 0.0 {
-            let fraction = (p as i64 % 10) as f64 / 10.0;
-            // RNG.NextBool(fraction): deterministic per (time, bar).
-            let hash = (t as i64 as u64).wrapping_mul(2654435761).wrapping_add(p as u64);
-            if (hash % 1000) as f64 / 1000.0 < fraction {
-                bars += 1;
+
+        // Rotations: `discTop = Rotation * turnRatio` (half speed when
+        // `spinner-middle2` exists), `discBottom = discTop / 3`,
+        // `spinningMiddle` full speed; glow/middle stay static.
+        let rot = display_rotation as f32;
+        let turn_ratio = if lg.spinner_middle2.is_some() { 0.5 } else { 1.0 };
+        if let Some(bottom) = lg.spinner_bottom {
+            draw_sprite(list, bottom, centre, stack_s, rot * turn_ratio / 3.0, Colour::WHITE.opacity(alpha), Blend::Alpha);
+        }
+        if let Some(top) = lg.spinner_top {
+            draw_sprite(list, top, centre, stack_s, rot * turn_ratio, Colour::WHITE.opacity(alpha), Blend::Alpha);
+        }
+        if let Some(middle2) = lg.spinner_middle2 {
+            draw_sprite(list, middle2, centre, stack_s, rot, Colour::WHITE.opacity(alpha), Blend::Alpha);
+        }
+        if let Some(middle) = lg.spinner_middle {
+            // `fixedMiddle.FadeColour(Red, Duration)` from StartTime.
+            let red = value_at(t, obj.start_time, obj.start_time + obj.duration, 0.0, 1.0, Easing::Linear) as f32;
+            let col = Colour::lerp(Colour::WHITE, Colour::rgba_bytes(255, 0, 0, 255), red);
+            draw_sprite(list, middle, centre, stack_s, 0.0, col.opacity(alpha), Blend::Alpha);
+        }
+    } else {
+        // --- LegacyOldStyleSpinner ----------------------------------------
+        // (No glow: that sprite belongs to the new-style layout only.)
+        if let Some(background) = lg.spinner_background {
+            draw_sprite(list, background, centre, 1.0, 0.0, lg.spinner_background_colour.opacity(alpha), Blend::Alpha);
+        }
+
+        // The ONLY rotating element: `disc.Rotation = RotationTracker.Rotation`.
+        if let Some(disc) = lg.spinner_circle {
+            draw_sprite(list, disc, centre, 1.0, display_rotation as f32, Colour::WHITE.opacity(alpha), Blend::Alpha);
+        }
+
+        // Metre (`getMetreHeight` + the masking hack): 10 bars; the partial
+        // bar blinks (progress capped at 99 so it keeps blinking at full).
+        // The mask reveals texture rows [692 - h .. tex_h] — the metre
+        // fills UPWARD from the bottom of the 692-unit bars region, and
+        // any texture content below 692 units stays permanently visible.
+        if let Some(metre) = lg.spinner_metre {
+            const TOTAL_BARS: f64 = 10.0;
+            const BARS_HEIGHT: f64 = 692.0; // texture units, `final_metre_height / SPRITE_SCALE`
+            let mut p = progress * 100.0;
+            if lg.spinner_blink {
+                p = p.min(99.0);
+            }
+            let mut bars = (p as i64) / 10;
+            if lg.spinner_blink && p > 0.0 {
+                let fraction = (p as i64 % 10) as f64 / 10.0;
+                // RNG.NextBool(fraction): deterministic per (time, bar).
+                let hash = (t as i64 as u64).wrapping_mul(2654435761).wrapping_add(p as u64);
+                if (hash % 1000) as f64 / 1000.0 < fraction {
+                    bars += 1;
+                }
+            }
+            let revealed = bars as f64 / TOTAL_BARS * BARS_HEIGHT; // texture units
+            let tex_h = metre.display_height() as f64;
+            let v0 = ((BARS_HEIGHT - revealed) / tex_h).clamp(0.0, 1.0) as f32;
+            let vis_px = (tex_h - (BARS_HEIGHT - revealed).max(0.0)) as f32 * scale * unit;
+            if vis_px > 0.5 {
+                let w = metre.display_width() * scale * unit;
+                // Sprite top pinned at SPINNER_TOP_OFFSET; the revealed
+                // slice starts (692 - h) units down and runs to the
+                // texture bottom.
+                let top = m.win([0.0, LEGACY_SPINNER_TOP_OFFSET]);
+                let slice_top = top[1] + (BARS_HEIGHT - revealed).max(0.0) as f32 * scale * unit;
+                list.image_sub(
+                    assets.atlas,
+                    metre.region,
+                    [top[0] + w * 0.5, slice_top + vis_px * 0.5],
+                    [w, vis_px],
+                    0.0,
+                    Colour::WHITE.opacity(alpha),
+                    Blend::Alpha,
+                    0.0,
+                    v0,
+                    1.0,
+                    1.0,
+                );
             }
         }
-        let visible = bars as f64 / TOTAL_BARS * final_height;
-        if visible > 0.5 {
-            let metre_display_h = metre.display_height() as f64 * scale as f64;
-            let top = m.win([0.0, LEGACY_SPINNER_TOP_OFFSET]);
-            let w = metre.display_width() * scale * unit_x;
-            let h = visible as f32 * unit;
-            let fraction_full = (final_height / metre_display_h).min(1.0) as f32;
-            let visible_fraction = (visible / metre_display_h).min(1.0) as f32;
-            list.image_sub(
-                assets.atlas,
-                metre.region,
-                [top[0] + w * 0.5, top[1] + h * 0.5],
-                [w, h],
-                0.0,
-                Colour::WHITE.opacity(alpha),
-                Blend::Alpha,
-                0.0,
-                0.0,
-                1.0,
-                (visible_fraction / fraction_full).min(1.0),
-            );
-        }
     }
 
-    // Approach circle: 1.86x -> 0.1x linearly over the spinner duration.
+    // Approach circle (both styles): starts at 1.86x and ScaleTo's to 0.1x
+    // linearly over the spinner duration.
     if let Some(approach) = lg.spinner_approachcircle {
         let s = value_at(t, obj.start_time, obj.start_time + obj.duration, 1.86, 0.1, Easing::Linear) as f32;
         if std::env::var("SPINNER_DEBUG").is_ok() {
@@ -1901,6 +1979,26 @@ fn draw_spinner_legacy(
             );
         }
         draw_sprite(list, approach, centre, s, 0.0, Colour::WHITE.opacity(alpha), Blend::Alpha);
+    }
+
+    // --- LegacySpinner base overlay (rendered in front) -------------------
+
+    // spinner-rpm background + spm counter: hidden 50 units below their
+    // resting spot, sliding up over the fade-in (`spm_hide_offset`).
+    let spm_slide = value_at(t, obj.start_time - obj.fade_in, obj.start_time, 0.0, 1.0, Easing::Out) as f32;
+    if let Some(rpm) = lg.spinner_rpm {
+        let pos = m.win([320.0 - 87.0, 445.0 + 50.0 * (1.0 - spm_slide)]);
+        let w = rpm.display_width() * scale * unit;
+        let h = rpm.display_height() * scale * unit;
+        list.image(assets.atlas, rpm.region, [pos[0] + w * 0.5, pos[1] + h * 0.5], [w, h], 0.0, Colour::WHITE.opacity(alpha), Blend::Alpha);
+    }
+    if let Some(digits) = &lg.score_digits {
+        let spm_scale = scale * 0.9;
+        let glyph_h = digits.digits.iter().flatten().next().map(|d| d.display_height()).unwrap_or(0.0);
+        let pos = m.win([320.0 + 80.0, 448.0 + 50.0 * (1.0 - spm_slide)]);
+        let centre_y = pos[1] + glyph_h * spm_scale * 0.5;
+        let text = (spm.trunc() as i64).to_string();
+        draw_legacy_number(list, assets.atlas, digits, &text, [pos[0], centre_y], unit * spm_scale, Colour::WHITE.opacity(alpha), Blend::Alpha, NumAlign::Right);
     }
 
     // "spin" sprite: fades in over the second half of the fade-in,
@@ -1935,8 +2033,10 @@ fn draw_spinner_legacy(
         }
     }
 
-    // Bonus counter in score digits (`bonusCounter`): 1.4x -> 1.8x / 500ms
-    // fade at max, else 2x -> 1.28x over an 800ms fade.
+    // Bonus counter in score digits (`bonusCounter`): at max scale jumps
+    // to 1.4 then eases to 1.8 (1000 Out) fading over 500ms; otherwise
+    // SPRITE_SCALE*2 -> SPRITE_SCALE*1.28 over the 800ms fade (absolute
+    // `ScaleTo`s — the max case has no 0.625 factor in lazer).
     if let (Some(digits), Some((bt, is_max))) = (&lg.score_digits, bonus_flash) {
         if bonus_score > 0 {
             let x = t - bt;
@@ -1947,14 +2047,14 @@ fn draw_spinner_legacy(
                 )
             } else {
                 (
-                    value_at(x, 0.0, 800.0, 2.0, 1.28, Easing::Out) as f32,
+                    value_at(x, 0.0, 800.0, 2.0 * scale as f64, 1.28 * scale as f64, Easing::Out) as f32,
                     value_at(x, 0.0, 800.0, 1.0, 0.0, Easing::Out) as f32,
                 )
             };
             if ba > 0.003 {
                 let pos = m.win([320.0, LEGACY_SPINNER_TOP_OFFSET + 299.0]);
                 let text = bonus_score.to_string();
-                draw_legacy_number(list, assets.atlas, digits, &text, pos, unit * scale * s, Colour::WHITE.opacity(ba * alpha), Blend::Alpha);
+                draw_legacy_number(list, assets.atlas, digits, &text, pos, unit * s, Colour::WHITE.opacity(ba * alpha), Blend::Alpha, NumAlign::Centre);
             }
         }
     }
@@ -2079,6 +2179,7 @@ fn draw_circle_piece_legacy(
                 s * sprite_scale,
                 Colour::WHITE.opacity(alpha * number_alpha),
                 Blend::Alpha,
+                NumAlign::Centre,
             );
         }
     }
