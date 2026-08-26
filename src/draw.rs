@@ -1150,8 +1150,31 @@ fn ink_bbox(img: &Image) -> (f32, f32, f32, f32) {
 }
 
 impl Atlas {
+    /// Pack into at most `max_dim` on both axes: try widths 4096 → up to
+    /// `max_dim` (doubling), taking the first whose packed height fits.
+    /// Returns `None` when even the widest allowed layout overflows — the
+    /// caller decides whether to downscale and retry (see `build_atlas`).
+    pub fn try_build(images: &[(Region, Image)], max_dim: u32) -> Option<Atlas> {
+        let mut width = 4096u32.min(max_dim);
+        loop {
+            let atlas = pack(images, width);
+            if atlas.height <= max_dim {
+                return Some(atlas);
+            }
+            if width >= max_dim {
+                return None;
+            }
+            width = (width * 2).min(max_dim);
+        }
+    }
+
     pub fn build(images: &[(Region, Image)]) -> Atlas {
-        let width = 4096u32;
+        pack(images, 4096)
+    }
+}
+
+fn pack(images: &[(Region, Image)], width: u32) -> Atlas {
+    {
         let mut packer = ShelfPacker::new(width);
         let mut rects = HashMap::new();
 
@@ -1192,7 +1215,9 @@ impl Atlas {
 
         Atlas { width, height, rgba, rects, inks }
     }
+}
 
+impl Atlas {
     pub fn region_rect(&self, region: Region) -> Rect {
         *self.rects.get(&region).expect("atlas region")
     }
@@ -1202,3 +1227,37 @@ impl Atlas {
     }
 }
 
+
+
+#[cfg(test)]
+mod atlas_tests {
+    use super::*;
+
+    fn solid(region: Region, w: u32, h: u32) -> (Region, Image) {
+        (region, Image { width: w, height: h, rgba: vec![255; (w * h * 4) as usize] })
+    }
+
+    /// The width ladder: content that overflows 8192 in height at 4096
+    /// wide must re-pack wider instead of failing.
+    #[test]
+    fn ladder_widens_instead_of_overflowing() {
+        // Three 4000x4000 slabs: at 4096 wide they stack 12000 tall
+        // (> 8192); at 8192 wide two fit per shelf -> <= 8192 tall.
+        let images = vec![
+            solid(Region::Skin(0), 4000, 4000),
+            solid(Region::Skin(1), 4000, 4000),
+            solid(Region::Skin(2), 4000, 4000),
+        ];
+        let atlas = Atlas::try_build(&images, 8192).expect("fits when widened");
+        assert_eq!(atlas.width, 8192);
+        assert!(atlas.height <= 8192, "height {}", atlas.height);
+    }
+
+    /// Content that cannot fit even at max width reports None (the
+    /// caller downscale loop's trigger).
+    #[test]
+    fn reports_overflow_at_max_width() {
+        let images = vec![solid(Region::Skin(0), 9000, 9000)];
+        assert!(Atlas::try_build(&images, 8192).is_none());
+    }
+}

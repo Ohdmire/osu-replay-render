@@ -53,6 +53,7 @@ const COUNTER_WIREFRAMES_PNG: &[u8] = include_bytes!("../assets/counter/argon-co
 pub fn build_atlas(
     bg_image: Option<Image>,
     skin: &mut dyn skin::SkinTextureSource,
+    max_dim: u32,
 ) -> (Atlas, TtfFont, TtfFont) {
     let (mut bold, mut bold_images) = TtfFont::rasterize(TORUS_BOLD_TTF, true);
     let (mut semibold, mut semibold_images) = TtfFont::rasterize(TORUS_SEMI_BOLD_TTF, false);
@@ -92,19 +93,40 @@ pub fn build_atlas(
 
     // Skin textures (`--skin <dir>` / built-in argon sprites): decode,
     // pack, then hand the atlas handles back to the skin.
+    // Skin textures (`--skin <dir>` / built-in argon sprites): decode,
+    // pack, then hand the atlas handles back to the skin. Packing is
+    // capped at `max_dim` per axis (the GPU texture limit of the target
+    // device): the packer first widens 4096 -> max_dim, and a skin that
+    // still overflows is uniformly downscaled (lazer's
+    // `MaxDimensionLimitedTextureLoaderStore` semantics: the display size
+    // shrinks with the pixels) until it fits.
     let skin_images = skin.texture_images();
-    let mut skin_regions: Vec<(String, SkinTexture)> = Vec::with_capacity(skin_images.len());
-    for (i, (name, img)) in skin_images.iter().enumerate() {
-        let region = Region::Skin(i as u32);
-        images.push((region, img.clone()));
-        skin_regions.push((
-            name.clone(),
-            SkinTexture { region, width: img.width, height: img.height, scale_adjust: 1.0 },
-        ));
-    }
+    let mut scale = 1.0f32;
+    let (atlas, skin_regions) = loop {
+        let mut images = images.clone();
+        let mut skin_regions: Vec<(String, SkinTexture)> = Vec::with_capacity(skin_images.len());
+        for (i, (name, img)) in skin_images.iter().enumerate() {
+            let region = Region::Skin(i as u32);
+            let scaled = if scale >= 1.0 { img.clone() } else { skin::legacy::downscale(img, scale) };
+            images.push((region, scaled.clone()));
+            skin_regions.push((
+                name.clone(),
+                SkinTexture { region, width: scaled.width, height: scaled.height, scale_adjust: 1.0 },
+            ));
+        }
+        match Atlas::try_build(&images, max_dim) {
+            Some(atlas) => break (atlas, skin_regions),
+            None => {
+                let new_scale = scale * 0.9;
+                eprintln!(
+                    "atlas: {}x{} overflow at max_dim {max_dim}, downscaling skin textures to {:.0}%",
+                    max_dim, max_dim, new_scale * 100.0
+                );
+                scale = new_scale;
+            }
+        }
+    };
     skin.assign_regions(&skin_regions);
-
-    let atlas = Atlas::build(&images);
     if std::env::var("ATLAS_DEBUG").is_ok() {
         for r in [Region::CounterDigit(b'5'), Region::Glyph { bold: true, c: 'G', em: 24 }, Region::Glyph { bold: true, c: 'G', em: 96 }, Region::Glyph { bold: false, c: '5', em: 48 }, Region::CounterWireframes] {
             let rect = atlas.region_rect(r);

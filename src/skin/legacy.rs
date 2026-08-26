@@ -698,7 +698,7 @@ impl SkinTextureSource for LegacySkin {
 
 /// Bilinear downscale (lazer's ImageSharp resize uses a box-pass; for
 /// atlas fitting the filter choice is invisible at these ratios).
-fn downscale(image: &Image, scale: f32) -> Image {
+pub(crate) fn downscale(image: &Image, scale: f32) -> Image {
     let w = ((image.width as f32 * scale).ceil() as u32).max(1);
     let h = ((image.height as f32 * scale).ceil() as u32).max(1);
     let mut rgba = vec![0u8; (w * h * 4) as usize];
