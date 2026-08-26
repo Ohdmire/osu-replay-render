@@ -22,9 +22,11 @@
 //!                          missing elements fall back to the built-in
 //!                          argon visuals)
 //!   --audio-offset <ms>    BGM alignment offset (default 0)
-//!   --hitsounds            Synthesize the ArgonPro hitsound track (lazer
-//!                          gameplay-audio parity) and mix it into the
-//!                          export, amix-summed with --audio when present
+//!   --hitsounds            Synthesize the hitsound track (user skin
+//!                          samples mixed with the built-in ArgonPro set,
+//!                          lazer gameplay-audio parity) and mix it into
+//!                          the export, amix-summed with --audio when
+//!                          present
 //!   --limit <n>            Render at most n frames (testing)
 
 use osu_replay_render::{build_atlas, decode_image_file, draw, draw::Image, game, hitsound, osu_background_file, osu_general_value, render::Renderer, scene, skin};
@@ -601,10 +603,10 @@ fn main() {
             Ok(content) => {
                 let t0 = frame_times[0];
                 let wall_secs = frame_times.len() as f64 / opts.fps;
-                let wav = hitsound::render_track_wav(&game, &content, t0, wall_secs, game.rate, opts.hitsounds_volume);
+                let wav = hitsound::render_track_wav(&game, &content, t0, wall_secs, game.rate, opts.hitsounds_volume, &resolved_skin);
                 let p = format!("{}.hits.wav", opts.out.as_ref().unwrap());
                 std::fs::write(&p, wav).unwrap_or_else(|e| panic!("write {}: {}", p, e));
-                eprintln!("hitsounds: {} (ArgonPro samples, {:.1}s)", p, wall_secs);
+                eprintln!("hitsounds: {} ({} samples, {:.1}s)", p, if resolved_skin.is_legacy() { "user skin mixed with ArgonPro" } else { "ArgonPro" }, wall_secs);
                 Some(p)
             }
             Err(e) => {

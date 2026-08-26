@@ -35,10 +35,19 @@
 //! loops (`sliderslide`/`sliderwhistle`), which the set ships as empty
 //! PCM entries: ArgonPro plays NO sliding sounds. Node hit sounds
 //! (head/repeat/tail) and `slidertick` have real samples and play.
+//!
+//! When a user skin is active (`--skin <dir>`) its own samples take
+//! priority per element, with the ArgonPro set filling every slot the
+//! skin leaves open (see [`SampleResolver`]). Beatmap skins are never
+//! parsed — the renderer's deliberate deviation from lazer's chain,
+//! which would consult them first.
 
 use crate::game::{GameData, ObjKind};
 use osu_replay_judge::process::NestedKind;
 use osu_replay_judge::score::hit_result_ext;
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
 
 /// Output sample rate (Hz). All shipped skin samples are 44.1k; foreign
 /// rates are linearly resampled on decode.
@@ -56,7 +65,7 @@ const POSITIONAL_HITSOUNDS_LEVEL: f64 = 0.8;
 // .osu sample-side parsing
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Bank {
     Normal,
     Soft,
@@ -359,7 +368,7 @@ fn balance(x: f32) -> f64 {
     (b * 100.0).round() / 100.0
 }
 
-fn build_placements(game: &GameData, data: &SampleData, t0: f64, t_map_end: f64) -> Vec<Placement> {
+fn build_placements(game: &GameData, data: &SampleData, t0: f64, t_map_end: f64, resolver: &mut SampleResolver) -> Vec<Placement> {
     let mut out: Vec<Placement> = Vec::new();
     if game.objects.len() != data.objects.len() {
         return out; // parser mismatch; silence rather than desynced sounds
@@ -460,9 +469,9 @@ fn build_placements(game: &GameData, data: &SampleData, t0: f64, t_map_end: f64)
                         bank: obj_samples.iter().find(|s| s.name == "hitwhistle").map(|s| s.bank).unwrap_or(obj_normal.bank),
                         volume: obj_normal.volume,
                     });
-                let slide_len_ms = sample_clip(slide).map(|w| w.duration_ms()).unwrap_or(0.0);
+                let slide_len_ms = resolver.clip(slide).map(|w| w.duration_ms()).unwrap_or(0.0);
                 let whistle_len_ms = whistle
-                    .and_then(|w| sample_clip(w))
+                    .and_then(|w| resolver.clip(w))
                     .map(|w| w.duration_ms())
                     .unwrap_or(0.0);
                 if slide_len_ms > 0.0 || whistle_len_ms > 0.0 {
@@ -637,6 +646,149 @@ fn sample_clip(sample: HitSample) -> Option<Clip> {
 }
 
 // ---------------------------------------------------------------------------
+// Sample resolution: user skin first, embedded ArgonPro fills the gaps
+// ---------------------------------------------------------------------------
+
+/// Per-render hitsound resolver — lazer's gameplay sample chain with the
+/// beatmap-skin layer deliberately removed (this renderer never reads
+/// beatmap skins). The USER skin is asked first through lazer's
+/// `LegacySkin.GetSample` name chain (`getLegacyLookupNames`):
+/// `UseCustomSampleBanks` is only ever true for beatmap skins, so for a
+/// user skin the custom-sample-index suffix is always filtered out and
+/// the candidates collapse to the unsuffixed names
+/// `Gameplay/{bank}-{name}` and `Gameplay/{name}` (each expanding to its
+/// last path piece inside [`crate::skin::Skin::get_sample`]), plus the
+/// universal bank-less `{name}`. Every slot the skin leaves open is
+/// filled by the embedded ArgonPro set ([`sample_clip`]) — elements MIX
+/// between the two, exactly one provider per lookup. Both missing (or a
+/// skin file that fails to decode, which lazer treats as a null sample
+/// and walks past) → the slot is silent.
+pub struct SampleResolver<'a> {
+    skin: Option<&'a dyn crate::skin::Skin>,
+    cache: HashMap<(Bank, &'static str), Option<Arc<Clip>>>,
+}
+
+impl<'a> SampleResolver<'a> {
+    pub fn new(skin: &'a dyn crate::skin::Skin) -> Self {
+        SampleResolver {
+            skin: skin.is_legacy().then_some(skin),
+            cache: HashMap::new(),
+        }
+    }
+
+    /// The embedded ArgonPro set alone (no user skin in scope).
+    fn builtin() -> SampleResolver<'static> {
+        SampleResolver { skin: None, cache: HashMap::new() }
+    }
+
+    /// Resolve one sample: user skin file → embedded ArgonPro entry →
+    /// silent. Results (including negatives) are cached per (bank, name).
+    pub fn clip(&mut self, sample: HitSample) -> Option<Arc<Clip>> {
+        if let Some(hit) = self.cache.get(&(sample.bank, sample.name)) {
+            return hit.clone();
+        }
+        let resolved = self
+            .skin
+            .and_then(|skin| lookup_candidates(sample.bank.as_str(), sample.name).iter().find_map(|n| skin.get_sample(n)));
+        let clip = match resolved {
+            Some(path) => match decode_sample_file(&path) {
+                Ok(clip) => Some(Arc::new(clip)),
+                Err(e) => {
+                    eprintln!("hitsound warning: skin sample {} failed to decode ({}), falling back", path.display(), e);
+                    None
+                }
+            },
+            None => None,
+        }
+        .or_else(|| sample_clip(sample).map(Arc::new));
+        if clip.is_none() {
+            eprintln!(
+                "hitsound warning: no sample for {}-{} in the skin or the default set, its hitsounds are silent",
+                sample.bank.as_str(),
+                sample.name
+            );
+        }
+        self.cache.insert((sample.bank, sample.name), clip.clone());
+        clip
+    }
+
+    /// Distinct (bank, name) slots resolved so far (debug output).
+    fn distinct(&self) -> usize {
+        self.cache.len()
+    }
+}
+
+/// `HitSampleInfo.LookupNames` order for a user legacy skin (suffix
+/// always filtered: `UseCustomSampleBanks` is beatmap-skin-only).
+/// `Gameplay/combobreak` is a plain `SampleInfo` with no bank.
+fn lookup_candidates(bank: &str, name: &str) -> Vec<String> {
+    if name == "combobreak" {
+        vec!["Gameplay/combobreak".to_string()]
+    } else {
+        vec![format!("Gameplay/{bank}-{name}"), format!("Gameplay/{name}")]
+    }
+}
+
+/// Bytes-level resolution for live-playback hosts that own their audio
+/// engine (decode the returned WAV themselves): the user skin's file
+/// first under the same mix policy (skin WAVs pass through untouched,
+/// mp3/ogg re-encode through ffmpeg), else the embedded ArgonPro entry.
+pub fn resolve_sample_wav(bank: &str, name: &str, skin: &dyn crate::skin::Skin) -> Option<Vec<u8>> {
+    if skin.is_legacy() {
+        let path = lookup_candidates(bank, name).iter().find_map(|n| skin.get_sample(n));
+        if let Some(path) = path {
+            let is_wav = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("wav"));
+            if is_wav {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    return Some(bytes);
+                }
+            } else if let Some(clip) = ffmpeg_pcm(&path) {
+                return Some(encode_wav(&clip.data, false));
+            }
+        }
+    }
+    sample_bytes(bank, name).map(|b| b.to_vec())
+}
+
+/// Decode a skin sample file: WAV in-process ([`decode_wav`]); anything
+/// else (mp3/ogg/...) through the local ffmpeg binary the export path
+/// already encodes with.
+fn decode_sample_file(path: &Path) -> Result<Clip, String> {
+    let is_wav = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("wav"));
+    if is_wav {
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        return decode_wav(&bytes).ok_or_else(|| "not a decodable RIFF/PCM wav".to_string());
+    }
+    ffmpeg_pcm(path).ok_or_else(|| "ffmpeg decode failed".to_string())
+}
+
+/// `ffmpeg -i <file> -map a:0 -f s16le -ar 44100 -ac 2 pipe:1` — PCM16
+/// on stdout, converted to the interleaved f32 clip format.
+fn ffmpeg_pcm(path: &Path) -> Option<Clip> {
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-map", "a:0", "-f", "s16le", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", "pipe:1"])
+        .output()
+        .ok()?;
+    if !out.status.success() || out.stdout.is_empty() {
+        return None;
+    }
+    let data = out
+        .stdout
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+        .collect();
+    Some(Clip { data })
+}
+
+// ---------------------------------------------------------------------------
 // WAV decode / mix / encode
 // ---------------------------------------------------------------------------
 
@@ -803,7 +955,7 @@ pub struct HitsoundEvent {
 /// offline track.
 pub fn collect_events(game: &GameData, map_content: &str) -> Vec<HitsoundEvent> {
     let data = parse_sample_data(map_content);
-    let mut events: Vec<HitsoundEvent> = build_placements(game, &data, f64::NEG_INFINITY, f64::INFINITY)
+    let mut events: Vec<HitsoundEvent> = build_placements(game, &data, f64::NEG_INFINITY, f64::INFINITY, &mut SampleResolver::builtin())
         .into_iter()
         .filter(|p| p.until.is_none())
         .map(|p| HitsoundEvent {
@@ -850,8 +1002,8 @@ pub fn sample_bytes(bank: &str, name: &str) -> Option<&'static [u8]> {
     Some(bytes)
 }
 
-pub fn render_track_wav(game: &GameData, map_content: &str, t0: f64, wall_secs: f64, rate: f64, master_gain: f32) -> Vec<u8> {
-    render_track(game, map_content, t0, wall_secs, rate, master_gain, true)
+pub fn render_track_wav(game: &GameData, map_content: &str, t0: f64, wall_secs: f64, rate: f64, master_gain: f32, skin: &dyn crate::skin::Skin) -> Vec<u8> {
+    render_track(game, map_content, t0, wall_secs, rate, master_gain, true, skin)
 }
 
 /// `render_track_wav` without the bus soft limiter: the sum stays
@@ -862,14 +1014,15 @@ pub fn render_track_wav(game: &GameData, map_content: &str, t0: f64, wall_secs: 
 /// bus ducked dense stacks 2-4 dB and bent every stack peak; the
 /// float-sum mix only needs the headroom so PCM16 can carry stacks
 /// above unity.
-pub fn render_track_wav_linear(game: &GameData, map_content: &str, t0: f64, wall_secs: f64, rate: f64, scale: f32) -> Vec<u8> {
-    render_track(game, map_content, t0, wall_secs, rate, scale, false)
+pub fn render_track_wav_linear(game: &GameData, map_content: &str, t0: f64, wall_secs: f64, rate: f64, scale: f32, skin: &dyn crate::skin::Skin) -> Vec<u8> {
+    render_track(game, map_content, t0, wall_secs, rate, scale, false, skin)
 }
 
-fn render_track(game: &GameData, map_content: &str, t0: f64, wall_secs: f64, rate: f64, gain: f32, limit: bool) -> Vec<u8> {
+fn render_track(game: &GameData, map_content: &str, t0: f64, wall_secs: f64, rate: f64, gain: f32, limit: bool, skin: &dyn crate::skin::Skin) -> Vec<u8> {
     let data = parse_sample_data(map_content);
     let t_map_end = t0 + wall_secs * rate * 1000.0;
-    let placements = build_placements(game, &data, t0, t_map_end);
+    let mut resolver = SampleResolver::new(skin);
+    let placements = build_placements(game, &data, t0, t_map_end, &mut resolver);
     if std::env::var("HITSOUND_DEBUG").is_ok() {
         eprintln!("hitsound debug: parsed {} objects (game {}), {} points, {} placements in [{},{}]",
             data.objects.len(), game.objects.len(), data.points.len(), placements.len(), t0, t_map_end);
@@ -881,29 +1034,8 @@ fn render_track(game: &GameData, map_content: &str, t0: f64, wall_secs: f64, rat
     // Decode each distinct (bank, name) once; a sample that fails to
     // decode warns once and drops only its own placements (a silent
     // `continue` here hid a 24-bit asset mismatch before).
-    let mut cache: Vec<(HitSample, Clip)> = Vec::new();
-    let mut missing: Vec<HitSample> = Vec::new();
     for p in &placements {
-        if cache.iter().any(|(s, _)| s.name == p.sample.name && s.bank == p.sample.bank)
-            || missing.iter().any(|s| s.name == p.sample.name && s.bank == p.sample.bank)
-        {
-            continue;
-        }
-        match sample_clip(p.sample) {
-            Some(clip) => cache.push((p.sample, clip)),
-            None => {
-                eprintln!(
-                    "hitsound warning: no decodable sample for {}-{}, its hitsounds are silent",
-                    p.sample.bank.as_str(),
-                    p.sample.name
-                );
-                missing.push(p.sample);
-            }
-        }
-    }
-
-    for p in &placements {
-        let Some((_, clip)) = cache.iter().find(|(s, _)| s.name == p.sample.name && s.bank == p.sample.bank) else {
+        let Some(clip) = resolver.clip(p.sample) else {
             continue;
         };
         let volume = p.sample.volume.max(MINIMUM_SAMPLE_VOLUME) as f32 / 100.0;
@@ -912,7 +1044,7 @@ fn render_track(game: &GameData, map_content: &str, t0: f64, wall_secs: f64, rat
         let gr = volume * (1.0 - (-bal).max(0.0));
         let wall = (p.time - t0) / rate / 1000.0;
         let until = p.until.map(|u| (u - t0) / rate / 1000.0);
-        place(&mut buf, clip, wall, gl, gr, until);
+        place(&mut buf, &clip, wall, gl, gr, until);
     }
 
     // Master gain / headroom scale (`--hitsounds-volume`, or the linear
@@ -925,7 +1057,7 @@ fn render_track(game: &GameData, map_content: &str, t0: f64, wall_secs: f64, rat
 
     if std::env::var("HITSOUND_DEBUG").is_ok() {
         let peak = buf.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        eprintln!("hitsound debug: {} clips decoded, buffer peak {:.4}", cache.len(), peak);
+        eprintln!("hitsound debug: {} clips decoded, buffer peak {:.4}", resolver.distinct(), peak);
         let mut names: Vec<(usize, &str)> = Vec::new();
         for p in &placements {
             match names.iter_mut().find(|(_, n)| *n == p.sample.name) {
@@ -1031,5 +1163,54 @@ mod tests {
         place(&mut cut, &clip, 0.5, 1.0, 1.0, Some(0.5 + 50.0 / SAMPLE_RATE as f64));
         assert_eq!(cut[(22050 + 49) * 2], clip.data[49 * 2]);
         assert_eq!(cut[(22050 + 50) * 2], 0.0, "cut at until");
+    }
+
+    /// A user skin sample takes priority over the embedded set, missing
+    /// slots mix with it, and lookups nothing provides are silent.
+    #[test]
+    fn resolver_mixes_skin_with_builtin() {
+        let dir = std::env::temp_dir().join(format!("osr_hitsound_skin_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 50ms of near-silence - the builtin hitwhistle is much longer,
+        // so which provider answered is observable via the duration.
+        let short = encode_wav(&vec![0.01f32; 4410], false);
+        std::fs::write(dir.join("normal-hitwhistle.wav"), &short).unwrap();
+        // Bank-less universal name: "hitclap" with no bank prefix.
+        std::fs::write(dir.join("hitclap.wav"), &short).unwrap();
+        std::fs::write(dir.join("skin.ini"), "[General]\nVersion: 2.5\n").unwrap();
+
+        let skin = crate::skin::load_skin(Some(&dir)).unwrap();
+        assert!(skin.is_legacy());
+        let mut resolver = SampleResolver::new(&skin);
+
+        let whistled = resolver.clip(HitSample { name: "hitwhistle", bank: Bank::Normal, volume: 100 }).unwrap();
+        assert!((45.0..55.0).contains(&whistled.duration_ms()), "skin file wins, got {}ms", whistled.duration_ms());
+        let builtin_whistle = sample_clip(HitSample { name: "hitwhistle", bank: Bank::Normal, volume: 100 }).unwrap();
+        assert!(builtin_whistle.duration_ms() > 100.0);
+
+        // The skin has no drum-hitfinish: the embedded ArgonPro copy fills it.
+        let finish = resolver.clip(HitSample { name: "hitfinish", bank: Bank::Drum, volume: 100 }).unwrap();
+        assert_eq!(finish.duration_ms(), sample_clip(HitSample { name: "hitfinish", bank: Bank::Drum, volume: 100 }).unwrap().duration_ms());
+
+        // Universal bank-less file serves every bank's hitclap (lazer's
+        // `Gameplay/{Name}` + raw-name tail of `getLegacyLookupNames`).
+        let clap = resolver.clip(HitSample { name: "hitclap", bank: Bank::Soft, volume: 100 }).unwrap();
+        assert!((45.0..55.0).contains(&clap.duration_ms()));
+
+        // Nothing provides this: silent, and cached as such.
+        assert!(resolver.clip(HitSample { name: "nosuchsound", bank: Bank::Soft, volume: 100 }).is_none());
+        assert!(resolver.clip(HitSample { name: "nosuchsound", bank: Bank::Soft, volume: 100 }).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `SampleResolver::new` on the builtin skin (no `--skin`) keeps the
+    /// embedded set as the only provider.
+    #[test]
+    fn resolver_builtin_skin_uses_embedded_set() {
+        let skin = crate::skin::load_skin(None).unwrap();
+        let mut resolver = SampleResolver::new(&skin);
+        let clip = resolver.clip(HitSample { name: "hitnormal", bank: Bank::Normal, volume: 100 }).unwrap();
+        let builtin = sample_clip(HitSample { name: "hitnormal", bank: Bank::Normal, volume: 100 }).unwrap();
+        assert_eq!(clip.duration_ms(), builtin.duration_ms());
     }
 }
