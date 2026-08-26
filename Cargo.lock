@@ -649,15 +649,15 @@ dependencies = [
 
 [[package]]
 name = "osu_replay_judge"
-version = "0.1.1"
-source = "git+https://github.com/Ohdmire/osu-replay-judge.git?branch=master#43956b16431653614cbecf1e59ad15244787a9d2"
+version = "0.1.2"
+source = "git+https://github.com/Ohdmire/osu-replay-judge.git?branch=master#208f5ba040a52a961de727fb4f904e09d277d2f1"
 dependencies = [
  "lzma-rs",
 ]
 
 [[package]]
 name = "osu_replay_render"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "ab_glyph",
  "jpeg-decoder",
