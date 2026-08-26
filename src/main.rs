@@ -543,7 +543,10 @@ fn main() {
     };
     game::apply_skin_combo_colours(&mut game, &resolved_skin);
 
-    let (atlas, bold, semibold) = build_atlas(bg_image, &mut resolved_skin);
+    // 8192 is the GLES/GL-compat floor for max_texture_dimension2d:
+    // capping here keeps the atlas creatable on every backend (desktop
+    // Vulkan/dGPU simply packs wider instead of taller).
+    let (atlas, bold, semibold) = build_atlas(bg_image, &mut resolved_skin, 8192);
     eprintln!("atlas: {}x{}", atlas.width, atlas.height);
 
     let mut renderer = Renderer::new(opts.width, opts.height, &atlas);
