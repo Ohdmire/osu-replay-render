@@ -278,6 +278,9 @@ pub struct GameData {
     pub health_increases: Vec<(f64, f64)>,
     /// Spinner bonus ticks: (object index, time, large_bonus).
     pub spinner_ticks: Vec<(usize, f64, bool)>,
+    /// Spins past the tick limit (lazer `maxBonusSample`: sound, no
+    /// score): (object index, time).
+    pub spinner_max_ticks: Vec<(usize, f64)>,
     /// Key-tap count timeline for the key overlay (rising edges only).
     pub key_events: Vec<KeyCountEvent>,
     pub player: String,
@@ -517,6 +520,7 @@ fn build(
     // Timeline -> per-object judgement states + display events.
     let mut events: Vec<EventView> = Vec::new();
     let mut spinner_ticks: Vec<(usize, f64, bool)> = Vec::new();
+    let mut spinner_max_ticks: Vec<(usize, f64)> = Vec::new();
     for entry in &engine.timeline {
         let obj = &mut objects[entry.object_index];
         let label = entry.label.as_str();
@@ -535,6 +539,9 @@ fn build(
             "slider" | "spinner" => obj.body_judged = Some((entry.time, entry.result)),
             "stick" => {
                 spinner_ticks.push((entry.object_index, entry.time, entry.result == HitResult::LargeBonus));
+            }
+            "smax" => {
+                spinner_max_ticks.push((entry.object_index, entry.time));
             }
             _ => {}
         }
@@ -666,6 +673,7 @@ fn build(
         drain_end,
         health_increases,
         spinner_ticks,
+        spinner_max_ticks,
         key_events,
         player: String::new(),
         final_score: engine.score.total_score(),
