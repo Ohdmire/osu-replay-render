@@ -265,7 +265,14 @@ pub struct GameData {
     pub objects: Vec<ObjView>,
     pub events: Vec<EventView>,
     pub snapshots: Vec<FrameSnap>,
+    /// Base combo palette from `build()`: the beatmap's `[Colours]` when
+    /// present, else the argon fallback. `apply_skin_combo_colours`
+    /// re-maps object colours from this, so it must stay pristine.
     pub combo_colours: Vec<Colour>,
+    /// Whether the beatmap shipped its own `[Colours]` (lazer: the
+    /// `LegacyBeatmapSkin` lookup hits, so the user skin's combo colours
+    /// are never reached).
+    pub has_beatmap_colours: bool,
     pub rate: f64,
     /// Nightcore mod (rate 1.5 like DT, but the export keeps the game's
     /// pitch-up on the BGM — nightcore without the pitch isn't nightcore).
@@ -665,6 +672,7 @@ fn build(
         events,
         snapshots: with_lead_in(engine.snapshots.clone()),
         combo_colours,
+        has_beatmap_colours: !map_colours.is_empty(),
         rate: mods.rate,
         nightcore: mods.nightcore,
         classic,
@@ -815,13 +823,23 @@ pub fn health_at(game: &GameData, t: f64) -> f64 {
 }
 
 /// Re-map object colours through a loaded skin's combo colours
-/// (`SkinComboColourLookup`). A legacy user skin always overrides the
-/// beatmap's `[Colours]` (stable behaviour: any installed skin replaces
-/// them, falling back to the default stable colours when the skin ships
-/// none); without a user skin the beatmap/argon colours stay.
-pub fn apply_skin_combo_colours(game: &mut GameData, skin: &crate::skin::ResolvedSkin) {
+/// (`SkinComboColourLookup`). Default (`force == false`, lazer's
+/// "Beatmap skins" player setting on): the beatmap's `[Colours]` win —
+/// `LegacyBeatmapSkin` answers the lookup first — and the skin's
+/// colours only apply when the beatmap ships none (its
+/// `AllowDefaultComboColoursFallback` is false, so the lookup falls
+/// through to the user skin). `force == true` is the stable behaviour:
+/// an installed legacy skin's colours (custom, or the default stable
+/// fallback) always override the beatmap's, like lazer with
+/// "Beatmap skins" off.
+///
+/// Re-entrant: every call re-maps the whole palette from the base one
+/// `build()` stored (`combo_colours`: beatmap `[Colours]` or the argon
+/// fallback), so hosts can call it again after a skin swap or a flag
+/// toggle without the previous mapping sticking.
+pub fn apply_skin_combo_colours(game: &mut GameData, skin: &crate::skin::ResolvedSkin, force: bool) {
     use crate::skin::Skin as _;
-    let Some(colours) = skin
+    let skin_colours = skin
         .get_config(crate::skin::SkinLookup::GlobalColour(
             crate::skin::GlobalSkinColours::ComboColours,
         ))
@@ -829,13 +847,15 @@ pub fn apply_skin_combo_colours(game: &mut GameData, skin: &crate::skin::Resolve
             crate::skin::SkinValue::ComboColours(c) => Some(c),
             _ => None,
         })
-    else {
-        return;
+        .filter(|c| !c.is_empty() && skin.is_legacy());
+    let palette = match skin_colours {
+        Some(c) if force || !game.has_beatmap_colours => c,
+        _ => game.combo_colours.clone(),
     };
-    if colours.is_empty() || !skin.is_legacy() {
+    if palette.is_empty() {
         return;
     }
     for obj in &mut game.objects {
-        obj.colour = colours[(obj.combo_colour_index as usize) % colours.len()];
+        obj.colour = palette[(obj.combo_colour_index as usize) % palette.len()];
     }
 }

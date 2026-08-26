@@ -27,6 +27,11 @@
 //!                          lazer gameplay-audio parity) and mix it into
 //!                          the export, amix-summed with --audio when
 //!                          present
+//!   --skin-colours         Force the user skin's combo colours over the
+//!                          beatmap's [Colours] (stable behaviour, lazer
+//!                          "Beatmap skins" off). Default: the beatmap's
+//!                          colours win; the skin's only apply when the
+//!                          beatmap ships none
 //!   --limit <n>            Render at most n frames (testing)
 
 use osu_replay_render::{build_atlas, decode_image_file, draw, draw::Image, game, hitsound, osu_background_file, osu_general_value, render::Renderer, scene, skin};
@@ -105,6 +110,11 @@ struct Options {
     /// effective bus gain is channel x master (0.6 x 0.6), so at defaults
     /// music + hitsounds peak at ~0.72 and essentially never clip.
     master_volume: f32,
+    /// Force the user skin's combo colours over the beatmap's `[Colours]`
+    /// (`--skin-colours`; stable behaviour, = lazer's "Beatmap skins"
+    /// setting off). Default: the beatmap's colours win and the skin's
+    /// only apply when the beatmap ships none.
+    skin_colours: bool,
 }
 
 fn parse_args() -> Result<(Options, String, Option<String>), String> {
@@ -114,7 +124,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
     let autoplay = args.iter().any(|a| a == "--autoplay");
     let min_args = if autoplay { 2 } else { 3 };
     if args.len() < min_args {
-        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--hd] [--no-hd] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro] [--no-guides] [--audio [file.mp3]] [--audio-offset ms] [--bg] [--bg-opacity 0..1] [--cursor-size 0.1..=2] [--hitsounds] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
+        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--hd] [--no-hd] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro] [--no-guides] [--audio [file.mp3]] [--audio-offset ms] [--bg] [--bg-opacity 0..1] [--cursor-size 0.1..=2] [--hitsounds] [--skin-colours] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
     }
     let map_path = args[1].clone();
     let replay_path = if autoplay { None } else { Some(args[2].clone()) };
@@ -146,6 +156,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
         hitsounds_volume: 0.6,
         bgm_volume: 0.6,
         master_volume: 0.6,
+        skin_colours: false,
     };
     let mut i = min_args;
     while i < args.len() {
@@ -279,6 +290,9 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
             }
             "--hitsounds" => {
                 opts.hitsounds = true;
+            }
+            "--skin-colours" => {
+                opts.skin_colours = true;
             }
             "--master-volume" => {
                 i += 1;
@@ -533,7 +547,8 @@ fn main() {
     let has_bg = bg_image.is_some();
 
     // Skin resolution (`--skin <dir>`: user legacy skin with argon
-    // fallbacks; the combo colours override the beatmap's like stable).
+    // fallbacks). Default combo colours: the beatmap's `[Colours]` win
+    // (lazer "Beatmap skins" on); `--skin-colours` forces the skin's.
     let mut resolved_skin = match skin::load_skin(opts.skin_dir.as_deref()) {
         Ok(s) => s,
         Err(e) => {
@@ -541,7 +556,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    game::apply_skin_combo_colours(&mut game, &resolved_skin);
+    game::apply_skin_combo_colours(&mut game, &resolved_skin, opts.skin_colours);
 
     // 8192 is the GLES/GL-compat floor for max_texture_dimension2d:
     // capping here keeps the atlas creatable on every backend (desktop
