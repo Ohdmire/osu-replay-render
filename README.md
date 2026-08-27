@@ -166,7 +166,16 @@ if renderer.pending_len() > 0 {
   可关闭，默认渲染）、Great 色中心圆标记、**EMA 均值小箭头**（指数
   移动平均 0.9/0.1，800ms OutQuint 滑动指向）、条上方实时 UR 数值；
   UR 事件集与 `ScoreProcessor.unstable_rate` 完全一致（`has_windows &&
-  is_hit`，offset/rate），Welford 增量累计）。
+  is_hit`，offset/rate），Welford 增量累计）、**PP 计数器**
+  （`ArgonPerformancePointsCounter`：ACC 正下方、整数 + 蓝色 "PP" 标签
+  （Torus Bold 12, Blue0）+ 线框背景，250ms 滚动；数据来自
+  `rosu-pp` 的 `OsuGradualPerformance` 逐物件推进——judge 判定时间轴
+  逐事件折入累计 `OsuScoreState`，每个顶层物件判完推进一次，即
+  「每次判定后的实时 PP」，与 lazer 游戏内计数器每 `NewJudgement`
+  重算的语义一致；legacy 皮肤的 MainHUD 容器不含 PP 计数器，遵循
+  lazer 不显示；stable 回放走 `lazer(false)` 稳定语义（tick 不计
+  acc），lazer 回放计入 slider tick/repeat/tail 命中——rosu-pp 为
+  lazer 计算器的移植，数值与原版"大致相同"而非逐位一致）。
 
 ## 已实现（自定义皮肤 HUD，`--skin <dir>`）
 
@@ -299,8 +308,11 @@ UR、光标轨迹、按键显示全部走既有回放路径,无需 .osr 文件�
 - Rust (`cargo build --release`)
 - ffmpeg 在 PATH（`--out` 模式需要;库/surface 路径不需要）
 - 判定引擎：`osu-replay-judge`（git dependency，master 分支）。本地
-  checkout（`../osu-replay-judge`，v0.2.0：HP 处理器 + break 解析）经
-  Cargo.toml 的 `[patch]` 段优先生效——judge 推送后可移除该段
+  checkout（`../osu-replay-judge`，v0.3.0：HP 处理器双路径 + break 解析）
+  经 Cargo.toml 的 `[patch]` 段优先生效——judge 推送后可移除该段
+- PP 计算：`rosu-pp`（[Apeuriox fork](https://github.com/Apeuriox/rosu-pp)
+  的 `pp-rework-202607` 分支，lazer 难度/表现计算器的 Rust 移植），同样
+  经 `[patch]` 指向本地 `../rosu-pp` checkout
 - 作为库嵌入时:宿主窗口需提供原生窗口句柄(当前为 Win32 HWND;
   `raw-window-handle` 0.6)
 

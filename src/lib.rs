@@ -7,6 +7,7 @@ pub mod draw;
 pub mod game;
 pub mod hitsound;
 pub mod hud;
+pub mod pp;
 pub mod render;
 pub mod scene;
 /// osu!(lazer) skinning abstraction port: user skin directories

@@ -184,6 +184,8 @@ impl KeyAnim {
 pub struct HudState {
     score: Rolling,
     acc: Rolling,
+    /// Live PP counter (`ArgonPerformancePointsCounter`: int, 250ms roll).
+    pp: Rolling,
     combo_display: f64,
     combo_scale_anim: Option<(f64, f64, f64, f64, Easing)>,
     /// Live combo scale, advanced every frame.
@@ -236,6 +238,7 @@ impl HudState {
         HudState {
             score: Rolling::new(),
             acc: Rolling::new(),
+            pp: Rolling::new(),
             combo_display: 0.0,
             combo_scale_anim: None,
             combo_scale_now: 1.0,
@@ -376,6 +379,46 @@ impl HudState {
             acc_cd.draw_top(list, "%", pct_right, acc_top, 1.0, Colour::WHITE, Blend::Alpha);
             acc_cd.draw_top(list, &frac_s, frac_right, acc_top + 4.0 * unit, 0.5, Colour::WHITE, Blend::Alpha);
             acc_cd.draw_top(list, &whole_s, whole_right, acc_top, 1.0, Colour::WHITE, Blend::Alpha);
+        }
+
+        // --- PP counter (`ArgonPerformancePointsCounter`) ------------------------
+        // Live PP off the gradual timeline, rounded to int (`Math.Round`
+        // AwayFromZero) with the same 250ms roll as the other counters.
+        // Argon-only: lazer's legacy-skin MainHUD container ships no PP
+        // counter.
+        if !use_legacy && !game.pp_events.is_empty() {
+            let pp = crate::pp::pp_at(&game.pp_events, t);
+            self.pp.set(pp.round(), t);
+            self.pp.update(t);
+
+            let cd = CounterDraw { atlas: assets.atlas, digit_h: 22.0 * m.virt };
+            // Below the accuracy counter: (accuracy.X, accuracy.Y +
+            // accuracy.DrawHeight + 10) with TopRight anchors.
+            let right = m.virt([1024.0 - 20.0, 0.0])[0];
+            let top = m.virt([0.0, 20.0 + 36.0 + 10.0])[1];
+            let text = format!("{}", self.pp.display.round() as i64);
+            let wire = text.len().max(3); // `Math.Max(3, digits)`
+            draw_wireframe_run(list, assets.atlas, right, top + cd.k() * TEX_BOX * 0.5, wire, m.virt);
+            cd.draw_right(list, &text, right, top + cd.k() * TEX_BOX * 0.5, 1.0, Colour::WHITE, Blend::Alpha);
+
+            // "PP" label (Torus Bold 12, Blue0), 2.5 left of the digits,
+            // top-aligned with the digit boxes.
+            let label_size = 12.0 * m.virt;
+            let (lw, ltop, lbottom) = ttf_measure(assets.bold, "PP", label_size, 0.0);
+            let _ = (ltop, lbottom);
+            let label_right = right - cd.run_width(&text, 1.0) - 2.5 * m.virt;
+            draw_ttf_text(
+                list,
+                assets.atlas,
+                assets.bold,
+                true,
+                "PP",
+                [label_right - lw * 0.5, top + 4.0 * m.virt],
+                label_size,
+                Colour::from_hex(0x99DDFF),
+                0.0,
+                Blend::Alpha,
+            );
         }
 
         // --- Combo counter (bottom-left, scale 1.3) --------------------------------
