@@ -296,6 +296,15 @@ pub struct GameData {
     pub final_classic_score: i64,
     pub final_max_combo: i32,
     pub final_accuracy: f64,
+    /// Performance points of the judged replay (`rosu-pp`,
+    /// pp-rework-202607 port of lazer's calculator) and the FC max PP of
+    /// the map+mods. `NaN` when rosu-pp could not parse the map.
+    pub pp: f64,
+    pub pp_max: f64,
+    /// Live PP timeline (`OsuGradualPerformance`, advanced once per fully
+    /// judged object): `(time, pp)` pairs - the in-game PP counter feed
+    /// (`pp::pp_at` queries it). Empty when PP is unavailable.
+    pub pp_events: Vec<(f64, f64)>,
     /// Autoplay mod (beatmap preview): hide the score/accuracy/combo
     /// counters and the UR bar — the numbers are all perfect and carry no
     /// information about the beatmap.
@@ -353,6 +362,11 @@ pub fn load(map_path: &str, replay_path: &str) -> Result<GameData, String> {
 
     let mut data = build(mods, classic, map.combo_colours, &engine)?;
     data.player = rep.header.player_name.clone();
+    if let Some(pp) = crate::pp::calculate(map_path, rep.header.mods, classic, &engine) {
+        data.pp = pp.pp;
+        data.pp_max = pp.pp_max;
+        data.pp_events = pp.events;
+    }
     Ok(data)
 }
 
@@ -380,6 +394,11 @@ pub fn load_autoplay(map_path: &str) -> Result<GameData, String> {
     // GameData::autoplay).
     data.player = "osu!".to_string();
     data.autoplay = true;
+    if let Some(pp) = crate::pp::calculate(map_path, 0, classic, &engine) {
+        data.pp = pp.pp;
+        data.pp_max = pp.pp_max;
+        data.pp_events = pp.events;
+    }
     Ok(data)
 }
 
@@ -671,6 +690,9 @@ fn build(
         final_classic_score: engine.score.classic_display_score(),
         final_max_combo: engine.score.highest_combo,
         final_accuracy: engine.score.accuracy(),
+        pp: f64::NAN,
+        pp_max: f64::NAN,
+        pp_events: Vec::new(),
         autoplay: false,
         hidden: mods.hidden,
         hd_first_object,

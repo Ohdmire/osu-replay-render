@@ -488,12 +488,14 @@ fn main() {
         HdMode::Off => game.hidden = false,
     }
     eprintln!(
-        "player: {} | objects: {} | snapshots: {} | final score: {} (max combo {})",
+        "player: {} | objects: {} | snapshots: {} | final score: {} (max combo {}) | pp: {} / {} max",
         game.player,
         game.objects.len(),
         game.snapshots.len(),
         game.final_score,
-        game.final_max_combo
+        game.final_max_combo,
+        if game.pp.is_nan() { "-".to_string() } else { format!("{:.2}", game.pp) },
+        if game.pp_max.is_nan() { "-".to_string() } else { format!("{:.2}", game.pp_max) },
     );
 
     // Resolve optional BGM: explicit file, or the beatmap's own audio

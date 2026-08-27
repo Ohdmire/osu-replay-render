@@ -6,6 +6,7 @@ license = "MIT"
 
 [dependencies]
 osu_replay_judge = { git = "https://github.com/Ohdmire/osu-replay-judge.git", branch = "master" }
+rosu-pp = { git = "https://github.com/Apeuriox/rosu-pp.git", branch = "pp-rework-202607" }
 wgpu = "24"
 raw-window-handle = "0.6"
 pollster = "0.4"
@@ -17,6 +18,11 @@ ab_glyph = "0.2"
 # break periods); drop this once osu-replay-judge is pushed.
 [patch."https://github.com/Ohdmire/osu-replay-judge.git"]
 osu_replay_judge = { path = "../osu-replay-judge" }
+
+# Local rosu-pp checkout of the pp-rework-202607 branch (spares network
+# fetches; the git dependency above is what embedders resolve).
+[patch."https://github.com/Apeuriox/rosu-pp.git"]
+rosu-pp = { path = "../rosu-pp" }
 
 [profile.release]
 lto = "thin"
