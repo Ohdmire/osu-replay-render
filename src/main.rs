@@ -115,6 +115,10 @@ struct Options {
     /// setting off). Default: the beatmap's colours win and the skin's
     /// only apply when the beatmap ships none.
     skin_colours: bool,
+    /// Keep the Argon HUD even with a user skin (`--argon-hud`); by
+    /// default the skin's own score/accuracy/combo/health/key pieces are
+    /// used when it provides them.
+    argon_hud: bool,
 }
 
 fn parse_args() -> Result<(Options, String, Option<String>), String> {
@@ -124,7 +128,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
     let autoplay = args.iter().any(|a| a == "--autoplay");
     let min_args = if autoplay { 2 } else { 3 };
     if args.len() < min_args {
-        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--hd] [--no-hd] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro] [--no-guides] [--audio [file.mp3]] [--audio-offset ms] [--bg] [--bg-opacity 0..1] [--cursor-size 0.1..=2] [--hitsounds] [--skin-colours] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
+        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--hd] [--no-hd] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro|dir] [--argon-hud] [--no-guides] [--audio [file.mp3]] [--audio-offset ms] [--bg] [--bg-opacity 0..1] [--cursor-size 0.1..=2] [--hitsounds] [--skin-colours] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
     }
     let map_path = args[1].clone();
     let replay_path = if autoplay { None } else { Some(args[2].clone()) };
@@ -157,6 +161,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
         bgm_volume: 0.6,
         master_volume: 0.6,
         skin_colours: false,
+        argon_hud: false,
     };
     let mut i = min_args;
     while i < args.len() {
@@ -293,6 +298,9 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
             }
             "--skin-colours" => {
                 opts.skin_colours = true;
+            }
+            "--argon-hud" => {
+                opts.argon_hud = true;
             }
             "--master-volume" => {
                 i += 1;
@@ -568,6 +576,7 @@ fn main() {
     let mut state = SceneState::new(&game, opts.width, opts.height);
     state.pro_skin = opts.skin == "argon-pro";
     state.hud.ur_guides = opts.guides;
+    state.hud.argon_hud = opts.argon_hud;
     state.bg_opacity = if has_bg { Some(opts.bg_opacity) } else { None };
     state.cursor_size = opts.cursor_size;
     if opts.classic_score {

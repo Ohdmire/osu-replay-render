@@ -571,6 +571,15 @@ const CONSUMED_TEXTURE_NAMES: &[&str] = &[
     "spinner-rpm",
     "spinner-spin",
     "spinner-clear",
+    // Legacy HUD pieces (LegacyHealthDisplay / LegacyKeyCounterDisplay).
+    "scorebar-bg",
+    "scorebar-colour",
+    "scorebar-marker",
+    "scorebar-ki",
+    "scorebar-kidanger",
+    "scorebar-kidanger2",
+    "inputoverlay-background",
+    "inputoverlay-key",
 ];
 
 /// Names whose `{name}{sep}{i}` frame sequences are probed (the
@@ -590,6 +599,9 @@ const ANIMATABLE_TEXTURE_NAMES: &[(&str, &str)] = &[
     ("spinner-circle", "-"),
     ("spinner-metre", "-"),
     ("sliderb", ""),
+    // LegacyHealthDisplay's fill is a frame sequence when the skin ships
+    // `scorebar-colour-0..` (`LegacyFill`'s GetAnimation probe).
+    ("scorebar-colour", "-"),
 ];
 
 impl LegacySkin {
@@ -638,9 +650,17 @@ impl LegacySkin {
             for d in 0..10 {
                 push(format!("{}-{}", font_prefix, d), &mut names);
             }
-            for extra in ["comma", "dot", "percent"] {
+            // `LegacySpriteText`'s punctuation glyphs: comma / dot / percent
+            // via `getLookupName`, plus the plain `x` the combo counter
+            // formats onto every value (`{count}x`).
+            for extra in ["comma", "dot", "percent", "x"] {
                 push(format!("{}-{}", font_prefix, extra), &mut names);
             }
+        }
+
+        // The key-counter entry font is a fixed prefix (no skin.ini key).
+        for d in 0..10 {
+            push(format!("scoreentry-{}", d), &mut names);
         }
 
         names.sort();
