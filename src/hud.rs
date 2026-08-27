@@ -411,7 +411,7 @@ impl HudState {
 
             let v = m.virt;
             let cy = m.virt([0.0, self.l_score_h + 9.0 + self.l_acc_h * 0.5])[1];
-            let cx_right = m.virt([1024.0 - 17.0, 0.0])[0] - self.l_acc_w * v - 18.0 * v;
+            let cx_right = m.virt([1024.0 - 17.0 - self.l_acc_w - 18.0, 0.0])[0];
             let r_ring = 16.5 * v;  // 33x33 container, border 2 inward
             let r_dot = 2.0 * v;    // 4-unit centre dot
             let r_arc = 13.0 * v;   // CircularProgress inside the 0.92 child
@@ -1391,7 +1391,10 @@ impl HudState {
         self.l_acc_h = font.max_digit_h() * 0.6 * 0.96;
         let right = m.virt([1024.0 - 17.0, 0.0])[0];
         let baseline = m.virt([0.0, top_units])[1] + font.max_digit_h() * k;
-        self.l_acc_w = font.run_width(&text, true);
+        // `accuracy.ScreenSpaceDeltaToParentSpace(accuracy.Size).X`: the
+        // SCALED size (component Scale 0.6*0.96) - the song-progress
+        // circle's X offset uses this, not the raw text width.
+        self.l_acc_w = font.run_width(&text, true) * 0.6 * 0.96;
         font.draw_right(list, assets.atlas, &text, right, baseline, k, Colour::WHITE, Blend::Alpha);
     }
 
