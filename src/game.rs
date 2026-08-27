@@ -279,10 +279,11 @@ pub struct GameData {
     /// Hitsounds stay at their natural rate regardless.
     pub nightcore: bool,
     pub classic: bool,
-    pub drain_rate: f64,
-    pub drain_start: f64,
-    pub drain_end: f64,
-    pub health_increases: Vec<(f64, f64)>,
+    /// Health processor output from the judge crate
+    /// (`HealthProcessor` + `DrainingHealthProcessor` +
+    /// `OsuHealthProcessor`): drain rate/window, no-drain break periods
+    /// and the per-judgement HP curve. Query via [`health_at`].
+    pub health: osu_replay_judge::health::HealthInfo,
     /// Spinner bonus ticks: (object index, time, large_bonus).
     pub spinner_ticks: Vec<(usize, f64, bool)>,
     /// Spins past the tick limit (lazer `maxBonusSample`: sound, no
@@ -345,13 +346,12 @@ pub fn load(map_path: &str, replay_path: &str) -> Result<GameData, String> {
     let classic = is_legacy_score;
     let mods = Mods::from_legacy(rep.header.mods, classic)?;
     let difficulty = process::apply_difficulty_mods(map.difficulty, mods.hard_rock, mods.easy);
-    let hp = difficulty.hp;
     let processed = process::process(&map, difficulty, classic, mods.hard_rock);
 
     let mut engine = Engine::new(processed, &mods);
     engine.run(&rep.frames);
 
-    let mut data = build(mods, classic, map.combo_colours, &engine, hp)?;
+    let mut data = build(mods, classic, map.combo_colours, &engine)?;
     data.player = rep.header.player_name.clone();
     Ok(data)
 }
@@ -368,7 +368,6 @@ pub fn load_autoplay(map_path: &str) -> Result<GameData, String> {
     let mods = Mods::from_legacy(0, false)?;
     let classic = false;
     let difficulty = process::apply_difficulty_mods(map.difficulty, false, false);
-    let hp = difficulty.hp;
     let processed = process::process(&map, difficulty, classic, false);
 
     let frames = crate::autoplay::AutoGenerator::new(&processed.objects, difficulty.ar as f64).generate();
@@ -376,7 +375,7 @@ pub fn load_autoplay(map_path: &str) -> Result<GameData, String> {
     let mut engine = Engine::new(processed, &mods);
     engine.run(&frames);
 
-    let mut data = build(mods, classic, map.combo_colours, &engine, hp)?;
+    let mut data = build(mods, classic, map.combo_colours, &engine)?;
     // lazer's autoplay attribution; HUD counters stay hidden (see
     // GameData::autoplay).
     data.player = "osu!".to_string();
@@ -389,7 +388,6 @@ fn build(
     classic: bool,
     map_colours: Vec<[u8; 3]>,
     engine: &Engine,
-    hp: f32,
 ) -> Result<GameData, String> {
     let engine_objects: &[ProcObject] = engine.objects();
 
@@ -621,22 +619,10 @@ fn build(
         }
     }
 
-    // Health (DrainingHealthProcessor port).
-    let mut health_increases: Vec<(f64, f64)> = Vec::new();
-    for entry in &engine.timeline {
-        let amount = match entry.result {
-            HitResult::Miss | HitResult::LargeTickMiss | HitResult::IgnoreMiss => -0.02,
-            HitResult::SmallBonus | HitResult::LargeBonus => 0.0,
-            _ => 0.01,
-        };
-        if amount != 0.0 {
-            health_increases.push((entry.time, amount));
-        }
-    }
-
-    let drain_start = objects.first().map(|o| o.start_time).unwrap_or(0.0);
-    let drain_end = objects.last().map(|o| o.end_time).unwrap_or(0.0);
-    let drain_rate = compute_drain_rate(&health_increases, drain_start, hp);
+    // Health: the judge engine's `HealthProcessor` pass (drain rate solved
+    // off the perfect-play simulation, per-judgement HP curve with the
+    // combo-end bonus and break no-drain periods).
+    let health = engine.health.clone();
 
     // Key overlay counts: rising edges of [left, right, smoke] across the
     // visual snapshots (the stream the overlay itself displays).
@@ -676,10 +662,7 @@ fn build(
         rate: mods.rate,
         nightcore: mods.nightcore,
         classic,
-        drain_rate,
-        drain_start,
-        drain_end,
-        health_increases,
+        health,
         spinner_ticks,
         spinner_max_ticks,
         key_events,
@@ -692,59 +675,6 @@ fn build(
         hidden: mods.hidden,
         hd_first_object,
     })
-}
-
-/// Port of `DrainingHealthProcessor.ComputeDrainRate`.
-fn compute_drain_rate(increases: &[(f64, f64)], drain_start: f64, hp: f32) -> f64 {
-    if increases.len() <= 1 {
-        return 0.0;
-    }
-
-    let min_health_target = 0.99f64;
-    let mid_health_target = 0.9f64;
-    let max_health_target = 0.4f64;
-    let h = hp as f64;
-    let target = if h > 5.0 {
-        mid_health_target + (max_health_target - mid_health_target) * (h - 5.0) / 5.0
-    } else if h < 5.0 {
-        mid_health_target + (mid_health_target - min_health_target) * (h - 5.0) / 5.0
-    } else {
-        mid_health_target
-    };
-
-    let minimum_health_error = 0.01;
-    let mut adjustment = 1i64;
-    let mut result = 1.0f64;
-
-    while adjustment > 0 {
-        let mut current_health = 1.0f64;
-        let mut lowest_health = 1.0f64;
-
-        for (i, inc) in increases.iter().enumerate() {
-            let current_time = inc.0;
-            let last_time = if i > 0 { increases[i - 1].0 } else { drain_start };
-
-            current_health -= (current_time - last_time) * result;
-            lowest_health = lowest_health.min(current_health);
-            current_health = (current_health + inc.1).min(1.0);
-
-            if lowest_health < 0.0 {
-                break;
-            }
-        }
-
-        if (lowest_health - target).abs() <= minimum_health_error {
-            break;
-        }
-
-        adjustment = adjustment.saturating_mul(2);
-        if adjustment <= 0 || adjustment > 1 << 40 {
-            break;
-        }
-        result += 1.0 / adjustment as f64 * (lowest_health - target).signum();
-    }
-
-    result.max(0.0)
 }
 
 /// Synthesizes a snapshot at an arbitrary time: cursor linearly interpolated
@@ -797,29 +727,10 @@ pub fn key_counts_at(game: &GameData, t: f64) -> [u32; 3] {
     if n == 0 { [0, 0, 0] } else { game.key_events[n - 1].counts }
 }
 
-/// Health at time `t` (no fail).
+/// Health at time `t` (judge `HealthProcessor` reconstruction: latest
+/// judgement's clamped HP minus the linear drain, skipping break periods).
 pub fn health_at(game: &GameData, t: f64) -> f64 {
-    let mut health = 1.0f64;
-    let mut last = game.drain_start;
-    for (time, amount) in &game.health_increases {
-        if *time > t {
-            break;
-        }
-        let ct = time.max(game.drain_start).min(game.drain_end);
-        let lt = last.max(game.drain_start).min(game.drain_end);
-        if game.drain_rate > 0.0 && ct > lt {
-            health -= game.drain_rate * (ct - lt);
-        }
-        health = (health + amount).clamp(0.0, 1.0);
-        last = *time;
-    }
-    // Drain from the last increase to `t`.
-    let ct = t.clamp(game.drain_start, game.drain_end);
-    let lt = last.clamp(game.drain_start, game.drain_end);
-    if ct > lt {
-        health -= game.drain_rate * (ct - lt);
-    }
-    health.clamp(0.0, 1.0)
+    osu_replay_judge::health::health_at(&game.health, t)
 }
 
 /// Re-map object colours through a loaded skin's combo colours

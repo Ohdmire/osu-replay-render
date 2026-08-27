@@ -1,6 +1,6 @@
 [package]
 name = "osu_replay_render"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 license = "MIT"
 
@@ -12,6 +12,11 @@ pollster = "0.4"
 png = "0.17"
 jpeg-decoder = "0.3"
 ab_glyph = "0.2"
+
+# Local judge checkout ahead of the published git rev (health processor +
+# break periods); drop this once osu-replay-judge is pushed.
+[patch."https://github.com/Ohdmire/osu-replay-judge.git"]
+osu_replay_judge = { path = "../osu-replay-judge" }
 
 [profile.release]
 lto = "thin"
