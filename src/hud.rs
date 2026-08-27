@@ -1,9 +1,17 @@
 //! Argon HUD: wedge pieces, score/accuracy/combo counters (argon-counter
 //! texture digits with wireframes), health bar, and rolling counter logic.
+//!
+//! When a user legacy skin is active (`--skin <dir>`), the four main HUD
+//! pieces switch to the skin's own textures, ported from lazer's
+//! `LegacyScoreCounter` / `LegacyAccuracyCounter` /
+//! `LegacyDefaultComboCounter` / `LegacyHealthDisplay` /
+//! `LegacyKeyCounterDisplay` (see `LegacyHud` below). The UR bar has no
+//! legacy equivalent and always uses the argon implementation.
 
-use crate::draw::{draw_ttf_text, ttf_measure, value_at, Blend, Colour, DrawList, Easing, Region};
+use crate::draw::{draw_ttf_text, ttf_measure, value_at, Atlas, Blend, Colour, DrawList, Easing, Region};
 use crate::game::{health_at, key_counts_at, key_state_at, GameData, KEY_ACTIONS};
 use crate::scene::{colour_for_result, draw_chevron, Assets, Mapper};
+use crate::skin::{texture::LegacyFont, Skin, SkinTexture};
 
 const WEDGE_COLOUR: u32 = 0x66CCFF;
 const HEALTH_GLOW: [u8; 4] = [126, 215, 253, 128];
@@ -204,6 +212,23 @@ pub struct HudState {
     pub key_overlay: bool,
     /// Press/release animation state per key (order matches KEY_ACTIONS).
     keys: [KeyAnim; 3],
+    /// Force the Argon HUD even with a user legacy skin
+    /// (`--argon-hud`; the legacy HUD is the default when a skin
+    /// provides its pieces).
+    pub argon_hud: bool,
+    /// Resolved legacy-skin HUD pieces (built on first use while a
+    /// legacy skin is active).
+    legacy: Option<LegacyHud>,
+    /// Legacy counters (proportional rolls) + combo/health/key anim state.
+    l_score: PropRoll,
+    l_acc: PropRoll,
+    l_combo: LegacyCombo,
+    l_health: LegacyHealth,
+    l_keys: [LegacyKeyAnim; 3],
+    /// Digit run height (HUD units) of the last legacy score draw - the
+    /// accuracy counter sits below it (`LegacySkin`'s MainHUD container
+    /// aligns the two).
+    l_score_h: f32,
 }
 
 impl HudState {
@@ -228,6 +253,14 @@ impl HudState {
             ur_guides: true,
             key_overlay: true,
             keys: [KeyAnim::new(), KeyAnim::new(), KeyAnim::new()],
+            argon_hud: false,
+            legacy: None,
+            l_score: PropRoll::new(0.0),
+            l_acc: PropRoll::new(1.0),
+            l_combo: LegacyCombo::new(),
+            l_health: LegacyHealth::new(),
+            l_keys: [LegacyKeyAnim::new(), LegacyKeyAnim::new(), LegacyKeyAnim::new()],
+            l_score_h: 0.0,
         }
     }
 
@@ -268,30 +301,46 @@ impl HudState {
             accuracy = ev.accuracy;
         }
 
+        // Legacy-skin HUD pieces, built once per render (missing pieces
+        // keep their argon fallbacks per element).
+        let use_legacy = !self.argon_hud && assets.skin.is_legacy();
+        if use_legacy && self.legacy.is_none() {
+            self.legacy = Some(LegacyHud::resolve(assets.skin));
+        }
+        let legacy_score = use_legacy && self.legacy.as_ref().is_some_and(|l| l.score.is_some());
+        let legacy_acc = use_legacy && self.legacy.as_ref().is_some_and(|l| l.score.is_some());
+        let legacy_combo = use_legacy && self.legacy.as_ref().is_some_and(|l| l.combo.is_some());
+        let legacy_health = use_legacy && self.legacy.as_ref().is_some_and(|l| l.health_bg.is_some() && l.health_fill.is_some());
+        let legacy_keys = use_legacy && self.legacy.as_ref().is_some_and(|l| l.input_bg.is_some() || l.input_key.is_some());
+
         // --- Score counter --------------------------------------------------
         self.score.set(score as f64, t);
         self.score.update(t);
 
-        // Wedge pieces (380x72, shear 0.8, #66CCFF 0->0.25 gradient, two
-        // pieces offset by (4,5), positioned at (-50,15) virtual).
-        draw_wedge(list, m, [-50.0, 15.0]);
-        draw_wedge(list, m, [-50.0 + 4.0, 15.0 + 5.0]);
+        if legacy_score {
+            self.draw_legacy_score(assets, list, m, score, t);
+        } else {
+            // Wedge pieces (380x72, shear 0.8, #66CCFF 0->0.25 gradient, two
+            // pieces offset by (4,5), positioned at (-50,15) virtual).
+            draw_wedge(list, m, [-50.0, 15.0]);
+            draw_wedge(list, m, [-50.0 + 4.0, 15.0 + 5.0]);
 
-        // Score digits right edge at virtual (250, 55): centre y = 55 + h/2.
-        let cd = CounterDraw { atlas: assets.atlas, digit_h: 36.0 * m.virt };
-        // Lazer aligns the glyph BOX right edge at virtual x=250
-        // (`score.Position = (components_x_offset + 200, ...)` with Origin
-        // TopRight); the digit textures carry a ~32/240 right margin, so
-        // the visible ink edge reads ~6 units left of it. Nudge the whole
-        // assembly (wireframes included) right by that margin so the ink
-        // right edge lands on 250.
-        let right = m.virt([250.0, 0.0])[0] + 32.0 * cd.k();
-        let cy = m.virt([0.0, 55.0 + 20.0])[1];
-        let score_text = format!("{}", self.score.display.round() as i64);
-        // Wireframe background: fixed digit count.
-        let wire_digits = (game.final_score.max(game.final_classic_score)).to_string().len().max(8);
-        draw_wireframe_run(list, assets.atlas, right, cy, wire_digits, m.virt);
-        cd.draw_right(list, &score_text, right, cy, 1.0, Colour::WHITE, Blend::Alpha);
+            // Score digits right edge at virtual (250, 55): centre y = 55 + h/2.
+            let cd = CounterDraw { atlas: assets.atlas, digit_h: 36.0 * m.virt };
+            // Lazer aligns the glyph BOX right edge at virtual x=250
+            // (`score.Position = (components_x_offset + 200, ...)` with Origin
+            // TopRight); the digit textures carry a ~32/240 right margin, so
+            // the visible ink edge reads ~6 units left of it. Nudge the whole
+            // assembly (wireframes included) right by that margin so the ink
+            // right edge lands on 250.
+            let right = m.virt([250.0, 0.0])[0] + 32.0 * cd.k();
+            let cy = m.virt([0.0, 55.0 + 20.0])[1];
+            let score_text = format!("{}", self.score.display.round() as i64);
+            // Wireframe background: fixed digit count.
+            let wire_digits = (game.final_score.max(game.final_classic_score)).to_string().len().max(8);
+            draw_wireframe_run(list, assets.atlas, right, cy, wire_digits, m.virt);
+            cd.draw_right(list, &score_text, right, cy, 1.0, Colour::WHITE, Blend::Alpha);
+        }
 
         // --- Accuracy counter --------------------------------------------------
         // Exact ArgonAccuracyCounter layout: a horizontal FillFlow of
@@ -299,37 +348,44 @@ impl HudState {
         // all TOP-aligned; anchored TopRight at virtual (1024-20, 20).
         self.acc.set(accuracy * 100.0, t);
         self.acc.update(t);
-        let acc_cd = CounterDraw { atlas: assets.atlas, digit_h: 36.0 * m.virt };
-        let acc_right = m.virt([1024.0 - 20.0, 0.0])[0];
-        let acc_top = m.virt([0.0, 20.0])[1];
-        // Component-local margins (fraction margin-top 4) scale with the
-        // digit calibration (36 local units = digit_h).
-        let unit = acc_cd.digit_h / 36.0;
+        if legacy_acc {
+            self.draw_legacy_accuracy(assets, list, m, accuracy, t);
+        } else {
+            let acc_cd = CounterDraw { atlas: assets.atlas, digit_h: 36.0 * m.virt };
+            let acc_right = m.virt([1024.0 - 20.0, 0.0])[0];
+            let acc_top = m.virt([0.0, 20.0])[1];
+            // Component-local margins (fraction margin-top 4) scale with the
+            // digit calibration (36 local units = digit_h).
+            let unit = acc_cd.digit_h / 36.0;
 
-        let acc_val = self.acc.display;
-        let whole = acc_val.trunc();
-        let frac = ((acc_val - whole) * 100.0).round();
-        let whole_s = format!("{}", whole as i64);
-        let frac_s = format!(".{:02}", frac as i64);
+            let acc_val = self.acc.display;
+            let whole = acc_val.trunc();
+            let frac = ((acc_val - whole) * 100.0).round();
+            let whole_s = format!("{}", whole as i64);
+            let frac_s = format!(".{:02}", frac as i64);
 
-        // Widths (texture-slot based), then place left-to-right ending at
-        // acc_right.
-        let w_pct = acc_cd.run_width("%", 1.0);
-        let w_frac = acc_cd.run_width(&frac_s, 0.5);
+            // Widths (texture-slot based), then place left-to-right ending at
+            // acc_right.
+            let w_pct = acc_cd.run_width("%", 1.0);
+            let w_frac = acc_cd.run_width(&frac_s, 0.5);
 
-        let pct_right = acc_right;
-        let frac_right = pct_right - w_pct;
-        let whole_right = frac_right - w_frac;
+            let pct_right = acc_right;
+            let frac_right = pct_right - w_pct;
+            let whole_right = frac_right - w_frac;
 
-        acc_cd.draw_top(list, "%", pct_right, acc_top, 1.0, Colour::WHITE, Blend::Alpha);
-        acc_cd.draw_top(list, &frac_s, frac_right, acc_top + 4.0 * unit, 0.5, Colour::WHITE, Blend::Alpha);
-        acc_cd.draw_top(list, &whole_s, whole_right, acc_top, 1.0, Colour::WHITE, Blend::Alpha);
+            acc_cd.draw_top(list, "%", pct_right, acc_top, 1.0, Colour::WHITE, Blend::Alpha);
+            acc_cd.draw_top(list, &frac_s, frac_right, acc_top + 4.0 * unit, 0.5, Colour::WHITE, Blend::Alpha);
+            acc_cd.draw_top(list, &whole_s, whole_right, acc_top, 1.0, Colour::WHITE, Blend::Alpha);
+        }
 
         // --- Combo counter (bottom-left, scale 1.3) --------------------------------
         // ArgonComboCounter: newScale = clamp(current * (increase ? 1.1 :
         // 0.8), 0.6, 1.4), then ScaleTo(1, 500/2000, OutQuint). `current` is
         // the LIVE scale at the moment of the change.
-        if combo != self.last_combo {
+        if legacy_combo {
+            self.l_combo.update(combo, t);
+            self.draw_legacy_combo(assets, list, m, t);
+        } else if combo != self.last_combo {
             let increase = combo > self.last_combo;
             let was_miss = self.last_combo > 1 && combo == 0;
             let new_scale = (self.combo_scale_now * if increase { 1.1 } else { 0.8 }).clamp(0.6, 1.4);
@@ -339,42 +395,48 @@ impl HudState {
             self.last_combo = combo;
             self.last_combo_time = t;
         }
-        let combo_scale = match self.combo_scale_anim {
-            Some((a, b, from, to, e)) => value_at(t, a, b, from, to, e),
-            None => 1.0,
-        };
-        self.combo_scale_now = combo_scale;
-        // Combo number roll: instant is fine (lazer rolls 250ms too).
-        self.combo_display = lerp_to(self.combo_display, combo as f64, 0.3);
-
-        if combo > 0 {
-            let combo_cd = CounterDraw { atlas: assets.atlas, digit_h: 25.0 * 1.3 * m.virt };
-            let base = m.virt([36.0, 768.0 - 66.0]);
-            // ArgonSkin.cs: combo 组件 BottomLeft + Position(36, -66),数字贴
-            // 组件盒底(240 贴图盒的 ink 底边距 ~31/240,scale 1.3 后数字 ink
-            // 底 ≈ -66 线上方 ~7 单位) —— 即与 key overlay 数字同一水平线。
-            let cy = base[1] - 18.0 * 1.3 * m.virt;
-            let text = format!("{}x", self.combo_display.round() as i64);
-            let flash = self.was_miss && t < self.last_combo_time + 800.0;
-            let col = if flash {
-                let f = value_at(t, self.last_combo_time, self.last_combo_time + 800.0, 1.0, 0.0, Easing::OutQuint) as f32;
-                Colour::lerp(Colour::WHITE, Colour::from_hex(0xFF0000), f)
-            } else {
-                Colour::WHITE
+        if !legacy_combo {
+            let combo_scale = match self.combo_scale_anim {
+                Some((a, b, from, to, e)) => value_at(t, a, b, from, to, e),
+                None => 1.0,
             };
-            // Left-anchored: measure with the same slot widths draw_right
-            // places glyphs with.
-            let width = combo_cd.run_width(&text, combo_scale as f32);
-            combo_cd.draw_right(list, &text, base[0] + width, cy, combo_scale as f32, col, Blend::Alpha);
+            self.combo_scale_now = combo_scale;
+            // Combo number roll: instant is fine (lazer rolls 250ms too).
+            self.combo_display = lerp_to(self.combo_display, combo as f64, 0.3);
+
+            if combo > 0 {
+                let combo_cd = CounterDraw { atlas: assets.atlas, digit_h: 25.0 * 1.3 * m.virt };
+                let base = m.virt([36.0, 768.0 - 66.0]);
+                // ArgonSkin.cs: combo 组件 BottomLeft + Position(36, -66),数字贴
+                // 组件盒底(240 贴图盒的 ink 底边距 ~31/240,scale 1.3 后数字 ink
+                // 底 ≈ -66 线上方 ~7 单位) —— 即与 key overlay 数字同一水平线。
+                let cy = base[1] - 18.0 * 1.3 * m.virt;
+                let text = format!("{}x", self.combo_display.round() as i64);
+                let flash = self.was_miss && t < self.last_combo_time + 800.0;
+                let col = if flash {
+                    let f = value_at(t, self.last_combo_time, self.last_combo_time + 800.0, 1.0, 0.0, Easing::OutQuint) as f32;
+                    Colour::lerp(Colour::WHITE, Colour::from_hex(0xFF0000), f)
+                } else {
+                    Colour::WHITE
+                };
+                // Left-anchored: measure with the same slot widths draw_right
+                // places glyphs with.
+                let width = combo_cd.run_width(&text, combo_scale as f32);
+                combo_cd.draw_right(list, &text, base[0] + width, cy, combo_scale as f32, col, Blend::Alpha);
+            }
         }
 
         // --- Health bar ------------------------------------------------------------
         let health = health_at(game, t);
-        if health < self.last_health - 1e-6 {
-            self.health_flash = Some(t);
+        if legacy_health {
+            self.draw_legacy_health(assets, list, m, health, t);
+        } else {
+            if health < self.last_health - 1e-6 {
+                self.health_flash = Some(t);
+            }
+            self.last_health = health;
+            draw_health(list, m, health, t, self.health_flash);
         }
-        self.last_health = health;
-        draw_health(list, m, health, t, self.health_flash);
 
         // --- Unstable rate bar (skin style, bottom centre) ------------------------
         if self.ur_bar {
@@ -383,7 +445,11 @@ impl HudState {
 
         // --- Key overlay (Z/X/C tap display) ---------------------------------------
         if self.key_overlay && std::env::var("NO_KEYS").is_err() {
-            self.draw_key_overlay(game, assets, list, m, t);
+            if legacy_keys {
+                self.draw_legacy_keys(game, assets, list, m, t);
+            } else {
+                self.draw_key_overlay(game, assets, list, m, t);
+            }
         }
     }
 
@@ -757,6 +823,754 @@ fn draw_health(list: &mut DrawList, m: &Mapper, health: f64, t: f64, flash: Opti
             let a = value_at(x, 0.0, 1100.0, 1.0, 0.0, Easing::OutQuint) as f32;
             let red = Colour::from_hex(0xFF6060).opacity(a * 0.6);
             list.capsule(left, right, radius, red, Blend::Additive);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy-skin HUD (`--skin <dir>`): ports of the lazer components the
+// gameplay HUD is made of when a user skin provides them.
+//
+// | lazer source | port |
+// |---|---|
+// | `Skinning/LegacyScoreCounter.cs` (TopRight, 0.96, margin 10, Score font, FixedWidth, "000000"/"00000000") | [`LegacyHud::score`] + [`HudState::draw_legacy_score`] |
+// | `Skinning/LegacyAccuracyCounter.cs` (TopRight, 0.576, margins 9/17, below the score, FormatAccuracy) | [`HudState::draw_legacy_accuracy`] |
+// | `Skinning/LegacyDefaultComboCounter.cs` (BottomLeft, 1.28, margin 10, "{n}x", pop-out bursts + proportional break roll) | [`LegacyCombo`] + [`HudState::draw_legacy_combo`] |
+// | `Skinning/LegacyHealthDisplay.cs` (scorebar-bg/colour/marker/ki*, old vs new style) | [`LegacyHealth`] + [`HudState::draw_legacy_health`] |
+// | `Skinning/LegacyKeyCounter(Display).cs` (`inputoverlay-*`, right-centre column) | [`HudState::draw_legacy_keys`] |
+// | `Skinning/LegacySpriteText.cs` (`{prefix}-{glyph}` textures, -overlap spacing, FixedWidth '5') | [`DigitFont`] |
+//
+// All coordinates are lazer's 1024x768 HUD units (the same stretched
+// virtual space `Mapper::virt` maps); `LegacySkin.STABLE_MAGIC_SCALE_FACTOR`
+// (1.6) constants from the source are pre-multiplied into the literals.
+// ---------------------------------------------------------------------------
+
+/// Proportional rolling counter (`RollingCounter.IsRollingProportional`):
+/// the roll duration is the size of the change, with the counter's own
+/// easing (`LegacyScoreCounter` 1000·|Δscore| ms Out;
+/// `PercentageCounter` 375·|Δacc|·100 ms Out). The FIRST value seen is
+/// snapped in without a roll - lazer's `RollingCounter` sets
+/// `DisplayedCount` directly on the initial bind, and a cold seek into a
+/// finished score must not spend a minute rolling up from zero.
+struct PropRoll {
+    display: f64,
+    from: f64,
+    to: f64,
+    start: f64,
+    dur: f64,
+    init: bool,
+}
+
+impl PropRoll {
+    fn new(initial: f64) -> PropRoll {
+        PropRoll { display: initial, from: initial, to: initial, start: f64::NEG_INFINITY, dur: 0.0, init: false }
+    }
+
+    fn set(&mut self, value: f64, t: f64, per_unit: f64) {
+        if value != self.to {
+            if !self.init {
+                // Initial bind: snap without a roll (from == to ⇒ dur 0).
+                self.from = value;
+                self.display = value;
+                self.init = true;
+            } else {
+                self.from = self.display;
+            }
+            self.to = value;
+            self.start = t;
+            self.dur = (value - self.from).abs() * per_unit;
+        }
+    }
+
+    fn update(&mut self, t: f64) {
+        self.display = value_at(t, self.start, self.start + self.dur, self.from, self.to, Easing::Out);
+    }
+}
+
+/// A legacy sprite font (`LegacySpriteText` + `LegacyGlyphStore`):
+/// `{prefix}-0..9` digits plus the punctuation lookups (`comma`, `dot`,
+/// `percent`, plain `x`). `FixedWidth` digits all advance by the '5'
+/// texture's width (`FixedWidthReferenceCharacter`), everything else by
+/// its own width; every advance loses `overlap` (`Spacing = -overlap`).
+struct DigitFont {
+    digits: [Option<SkinTexture>; 10],
+    overlap: f32,
+    dot: Option<SkinTexture>,
+    percent: Option<SkinTexture>,
+    comma: Option<SkinTexture>,
+    x: Option<SkinTexture>,
+}
+
+impl DigitFont {
+    /// Full font or nothing (`LegacySkinExtensions.HasFont` requires at
+    /// least `{prefix}-0`): the score/accuracy/combo counters demand all
+    /// ten digits so big numbers never grow gaps. `partial` fonts (the
+    /// key-overlay `scoreentry` counts) skip missing glyphs instead -
+    /// plenty of skins ship only a handful of entry digits.
+    fn resolve(skin: &crate::skin::ResolvedSkin, font: LegacyFont) -> Option<DigitFont> {
+        Self::resolve_inner(skin, font, true)
+    }
+
+    fn resolve_partial(skin: &crate::skin::ResolvedSkin, font: LegacyFont) -> Option<DigitFont> {
+        Self::resolve_inner(skin, font, false)
+    }
+
+    fn resolve_inner(skin: &crate::skin::ResolvedSkin, font: LegacyFont, require_full: bool) -> Option<DigitFont> {
+        let prefix = crate::skin::get_font_prefix(skin, font);
+        let mut digits: [Option<SkinTexture>; 10] = Default::default();
+        let mut any = false;
+        for (i, slot) in digits.iter_mut().enumerate() {
+            *slot = skin.legacy_texture(&format!("{}-{}", prefix, i));
+            any |= slot.is_some();
+        }
+        if !any || (require_full && digits.iter().any(|d| d.is_none())) {
+            return None;
+        }
+        let punct = |name: &str| skin.legacy_texture(&format!("{}-{}", prefix, name));
+        Some(DigitFont {
+            digits,
+            overlap: crate::skin::get_font_overlap(skin, font),
+            dot: punct("dot"),
+            percent: punct("percent"),
+            comma: punct("comma"),
+            x: punct("x"),
+        })
+    }
+
+    fn glyph(&self, c: char) -> Option<&SkinTexture> {
+        match c {
+            '0'..='9' => self.digits[c as usize - '0' as usize].as_ref(),
+            '.' => self.dot.as_ref(),
+            '%' => self.percent.as_ref(),
+            ',' => self.comma.as_ref(),
+            'x' | 'X' => self.x.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn tex_w(&self, c: char) -> f32 {
+        self.glyph(c).map(|t| t.display_width()).unwrap_or(0.0)
+    }
+
+    /// Glyph advance in font units (texture px ÷ @2x).
+    fn advance(&self, c: char, fixed_width: bool) -> f32 {
+        let w = if fixed_width && c.is_ascii_digit() { self.tex_w('5') } else { self.tex_w(c) };
+        (w - self.overlap).max(0.0)
+    }
+
+    fn run_width(&self, text: &str, fixed_width: bool) -> f32 {
+        text.chars().map(|c| self.advance(c, fixed_width)).sum()
+    }
+
+    /// Draws the run with its LAST glyph's advance slot ending at
+    /// `right_x` (Origin TopRight), glyph boxes bottom-aligned on
+    /// `baseline_y` (`UseFullGlyphHeight = false` bottom-baseline layout).
+    /// `k` converts font units to screen px (component scale included).
+    /// Returns the run's total advance in font units.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_right(
+        &self,
+        list: &mut DrawList,
+        atlas: &Atlas,
+        text: &str,
+        right_x: f32,
+        baseline_y: f32,
+        k: f32,
+        colour: Colour,
+        blend: Blend,
+    ) -> f32 {
+        let total = self.run_width(text, true);
+        let mut pen = right_x - total * k;
+        for c in text.chars() {
+            if let Some(tex) = self.glyph(c) {
+                let w = tex.display_width() * k;
+                let h = tex.display_height() * k;
+                list.image(atlas, tex.region, [pen + w * 0.5, baseline_y - h * 0.5], [w, h], 0.0, colour, blend);
+            }
+            pen += self.advance(c, true) * k;
+        }
+        total
+    }
+
+    /// Same run left-aligned at `left_x`.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_left(
+        &self,
+        list: &mut DrawList,
+        atlas: &Atlas,
+        text: &str,
+        left_x: f32,
+        baseline_y: f32,
+        k: f32,
+        colour: Colour,
+        blend: Blend,
+        fixed_width: bool,
+    ) -> f32 {
+        let mut pen = left_x;
+        for c in text.chars() {
+            if let Some(tex) = self.glyph(c) {
+                let w = tex.display_width() * k;
+                let h = tex.display_height() * k;
+                list.image(atlas, tex.region, [pen + w * 0.5, baseline_y - h * 0.5], [w, h], 0.0, colour, blend);
+            }
+            pen += self.advance(c, fixed_width) * k;
+        }
+        self.run_width(text, fixed_width)
+    }
+
+    fn max_digit_h(&self) -> f32 {
+        self.digits.iter().filter_map(|d| d.as_ref()).map(|d| d.display_height()).fold(0.0, f32::max)
+    }
+}
+
+/// All resolved legacy HUD pieces; element slots stay `None` when the
+/// skin doesn't provide them (the argon fallback takes over that piece).
+struct LegacyHud {
+    score: Option<DigitFont>,
+    combo: Option<DigitFont>,
+    entry: Option<DigitFont>,
+    health_bg: Option<SkinTexture>,
+    health_fill: Option<crate::skin::SkinAnimation>,
+    health_marker: Option<SkinTexture>,
+    health_ki: Option<SkinTexture>,
+    health_kidanger: Option<SkinTexture>,
+    health_kidanger2: Option<SkinTexture>,
+    input_bg: Option<SkinTexture>,
+    input_key: Option<SkinTexture>,
+    /// `[Colours] InputOverlayText` (?? black, `LegacyKeyCounterDisplay`).
+    input_text_colour: Colour,
+    /// `LegacyHealthDisplay.isNewStyle`: a `scorebar-marker` provider
+    /// switches the bar to the new-style fill position + HP tint.
+    health_new_style: bool,
+}
+
+impl LegacyHud {
+    fn resolve(skin: &crate::skin::ResolvedSkin) -> LegacyHud {
+        let tex = |name: &str| skin.legacy_texture(name);
+        let anim = |name: &str| {
+            skin.legacy_skin()
+                .and_then(|l| crate::skin::get_animation(l, name, true, true, true, "-"))
+        };
+        let input_text_colour = skin
+            .get_config(crate::skin::SkinLookup::CustomColour(crate::skin::SkinCustomColourLookup(
+                "InputOverlayText".to_string(),
+            )))
+            .and_then(|v| v.as_colour())
+            .unwrap_or_else(|| Colour::from_hex(0x000000));
+        let health_bg = tex("scorebar-bg");
+        LegacyHud {
+            score: DigitFont::resolve(skin, LegacyFont::Score),
+            combo: DigitFont::resolve(skin, LegacyFont::Combo),
+            entry: DigitFont::resolve_partial(skin, LegacyFont::ScoreEntry),
+            health_bg,
+            health_fill: if health_bg.is_some() { anim("scorebar-colour") } else { None },
+            health_marker: tex("scorebar-marker"),
+            health_ki: tex("scorebar-ki"),
+            health_kidanger: tex("scorebar-kidanger"),
+            health_kidanger2: tex("scorebar-kidanger2"),
+            input_bg: tex("inputoverlay-background"),
+            input_key: tex("inputoverlay-key"),
+            input_text_colour,
+            health_new_style: health_bg.is_some() && tex("scorebar-marker").is_some(),
+        }
+    }
+}
+
+/// `LegacyDefaultComboCounter` state: the stepped `DisplayedCount` with
+/// its delayed +1 queue, the additive pop-out burst, the small pulse on
+/// the displayed text, and the break roll + fade.
+struct LegacyCombo {
+    prev: i32,
+    displayed: f64,
+    /// Scheduled `scheduledPopOutSmall` fire times (each steps the
+    /// displayed count +1 toward `target`).
+    steps: Vec<f64>,
+    target: i32,
+    visible: bool,
+    alpha: f64,
+    alpha_anim: Option<(f64, f64, f64)>, // (start, from, to) 100ms linear
+    roll: Option<(f64, f64, f64, f64)>,  // (start, from, to, dur) linear
+    big_pop: Option<(f64, i32)>,         // (burst time, burst text value)
+    small_pop: Option<f64>,
+}
+
+impl LegacyCombo {
+    fn new() -> LegacyCombo {
+        LegacyCombo {
+            prev: 0,
+            displayed: 0.0,
+            steps: Vec::new(),
+            target: 0,
+            visible: false,
+            alpha: 0.0,
+            alpha_anim: None,
+            roll: None,
+            big_pop: None,
+            small_pop: None,
+        }
+    }
+
+    fn update(&mut self, current: i32, t: f64) {
+        if current != self.prev {
+            if current == 0 && self.prev > 0 {
+                // onCountRolling: fade out (100ms) + proportional roll to 0
+                // (`difference * 20ms`, linear `TransformTo`).
+                self.alpha_anim = Some((t, self.alpha, 0.0));
+                self.roll = Some((t, self.displayed, 0.0, self.displayed * 20.0));
+                self.steps.clear();
+                self.big_pop = None;
+                self.small_pop = None;
+            } else if current == self.prev + 1 {
+                // onCountIncrement: big additive pop-out now, the displayed
+                // value steps up 160ms later (big_pop_out_duration - 140).
+                self.big_pop = Some((t, current));
+                self.small_pop = Some(t);
+                self.steps.push(t + 160.0);
+                self.target = current;
+                self.visible = true;
+                self.alpha_anim = Some((t, self.alpha, 1.0));
+                self.roll = None;
+            } else {
+                // onCountChange: jump.
+                self.displayed = current as f64;
+                self.target = current;
+                self.steps.clear();
+                self.roll = None;
+                self.big_pop = None;
+                self.small_pop = None;
+                self.visible = current > 0;
+                self.alpha_anim = Some((t, self.alpha, if current > 0 { 1.0 } else { 0.0 }));
+            }
+            self.prev = current;
+        }
+
+        // Fire due steps (`scheduledPopOutSmall`, guarded by
+        // `DisplayedCount < currentValue`).
+        let mut fired = false;
+        while self.steps.first().is_some_and(|&s| s <= t) {
+            self.steps.remove(0);
+            if self.displayed < self.target as f64 {
+                self.displayed += 1.0;
+                fired = true;
+            }
+        }
+        let _ = fired;
+
+        if let Some((start, from, to, dur)) = self.roll {
+            self.displayed = value_at(t, start, start + dur, from, to, Easing::Linear);
+        }
+        if let Some((start, from, to)) = self.alpha_anim {
+            self.alpha = value_at(t, start, start + 100.0, from, to, Easing::Linear);
+        }
+    }
+
+    /// Displayed-text scale (`transformPopOutSmall`: 1 → 1.1 → 1 over
+    /// 50+50ms In/Out).
+    fn small_scale(&self, t: f64) -> f64 {
+        match self.small_pop {
+            Some(s) => {
+                let x = t - s;
+                if x < 0.0 || x > 100.0 {
+                    1.0
+                } else if x < 50.0 {
+                    value_at(x, 0.0, 50.0, 1.0, 1.1, Easing::In)
+                } else {
+                    value_at(x, 50.0, 100.0, 1.1, 1.0, Easing::Out)
+                }
+            }
+            None => 1.0,
+        }
+    }
+}
+
+/// `LegacyHealthDisplay` state: smoothed fill width + marker flash/bulge.
+struct LegacyHealth {
+    fill_w: f64,
+    prev_hp: f64,
+    bulge: Option<f64>,
+    flash: Option<(f64, bool)>,
+    last_t: f64,
+}
+
+impl LegacyHealth {
+    fn new() -> LegacyHealth {
+        LegacyHealth { fill_w: 0.0, prev_hp: 1.0, bulge: None, flash: None, last_t: f64::NEG_INFINITY }
+    }
+}
+
+struct LegacyKeyAnim {
+    pressed: bool,
+    press_t: f64,
+    release_t: f64,
+    /// `activatedOnce`: after the first press the key NAME is swapped for
+    /// the cumulative press count permanently.
+    activated: bool,
+}
+
+impl LegacyKeyAnim {
+    fn new() -> LegacyKeyAnim {
+        LegacyKeyAnim { pressed: false, press_t: -1e12, release_t: -1e12, activated: false }
+    }
+}
+
+/// `LegacyUtils.InterpolateNonLinear` / `LegacyHealthDisplay.getFillColour`:
+/// white above half, darkening toward black at low HP, then into red in
+/// the danger zone.
+fn legacy_fill_colour(hp: f64) -> Colour {
+    if hp < 0.2 {
+        let f = ((0.2 - hp) / 0.2) as f32;
+        Colour::lerp(Colour::from_hex(0x000000), Colour::from_hex(0xFF0000), f)
+    } else if hp < 0.5 {
+        let f = ((0.5 - hp) / 0.5) as f32;
+        Colour::lerp(Colour::WHITE, Colour::from_hex(0x000000), f)
+    } else {
+        Colour::WHITE
+    }
+}
+
+impl HudState {
+    /// `LegacyScoreCounter`: TopRight origin TopRight, Scale 0.96, margin
+    /// horizontal 10; score digits, FixedWidth, zero-padded to 6
+    /// (standardised) / 8 (classic) digits (`GameplayScoreCounter`).
+    fn draw_legacy_score(&mut self, assets: &Assets, list: &mut DrawList, m: &Mapper, score: i64, t: f64) {
+        self.l_score.set(score as f64, t, 1000.0);
+        self.l_score.update(t);
+        let value = self.l_score.display.round() as i64;
+        let classic = self.classic_score;
+
+        let Some(font) = self.legacy.as_ref().and_then(|l| l.score.as_ref()) else { return };
+
+        let k = 0.96 * m.virt;
+        let digits = if classic { 8 } else { 6 };
+        let text = format!("{:0width$}", value, width = digits);
+
+        let right = m.virt([1024.0 - 10.0, 0.0])[0];
+        // Glyph boxes bottom-aligned on the run's baseline; the run top is
+        // flush with the screen top edge (margin vertical 0).
+        let baseline = font.max_digit_h() * k;
+        font.draw_right(list, assets.atlas, &text, right, baseline, k, Colour::WHITE, Blend::Alpha);
+        self.l_score_h = font.max_digit_h() * 0.96;
+    }
+
+    /// `LegacyAccuracyCounter`: TopRight, Scale 0.6·0.96, margins
+    /// vertical 9 / horizontal 17; its Y is pinned below the score run by
+    /// the MainHUD container callback. Text = `FormatAccuracy` ("0.00%",
+    /// floored to 4 decimals so a 89.9999% never rounds up to 90%).
+    fn draw_legacy_accuracy(&mut self, assets: &Assets, list: &mut DrawList, m: &Mapper, accuracy: f64, t: f64) {
+        // PercentageCounter rolls the FRACTION with |Δ|·375ms·100 duration.
+        self.l_acc.set(accuracy, t, 37500.0);
+        self.l_acc.update(t);
+        let floored = (self.l_acc.display * 10_000.0).floor() / 10_000.0;
+        let text = format!("{:.2}%", floored * 100.0);
+        let top_units = self.l_score_h + 9.0;
+
+        let Some(font) = self.legacy.as_ref().and_then(|l| l.score.as_ref()) else { return };
+
+        let k = 0.6 * 0.96 * m.virt;
+        let right = m.virt([1024.0 - 17.0, 0.0])[0];
+        let baseline = m.virt([0.0, top_units])[1] + font.max_digit_h() * k;
+        font.draw_right(list, assets.atlas, &text, right, baseline, k, Colour::WHITE, Blend::Alpha);
+    }
+
+    /// `LegacyDefaultComboCounter`: BottomLeft + margin 10, Scale 1.28,
+    /// Combo font, "{n}x". The additive pop-out burst (`transformPopOut`)
+    /// fires behind every increment; the displayed value pulses
+    /// (`transformPopOutSmall`) and steps up 160ms later.
+    fn draw_legacy_combo(&mut self, assets: &Assets, list: &mut DrawList, m: &Mapper, t: f64) {
+        let combo = &self.l_combo;
+        let (big_pop, small_scale, visible, alpha, displayed, roll_active) =
+            (combo.big_pop, combo.small_scale(t) as f32, combo.visible, combo.alpha as f32, combo.displayed.round() as i64, combo.roll.is_some());
+
+        let Some(font) = self.legacy.as_ref().and_then(|l| l.combo.as_ref()) else { return };
+
+        let v = m.virt;
+        let k = 1.28 * v;
+        let left = 10.0 * v;
+        let baseline = m.virt([0.0, 768.0 - 10.0])[1];
+        let text = |value: i32| format!("{}x", value);
+
+        // Additive pop-out behind (`popOutCount`): text of the burst value,
+        // scale 1.56 → 1 and alpha .6 → 0 over 300ms, linear.
+        if let Some((start, value)) = big_pop {
+            let x = t - start;
+            if x < 300.0 {
+                let s = value_at(x, 0.0, 300.0, 1.56, 1.0, Easing::Linear) as f32;
+                let a = value_at(x, 0.0, 300.0, 0.6, 0.0, Easing::Linear) as f32;
+                if a > 0.004 {
+                    font.draw_left(
+                        list,
+                        assets.atlas,
+                        &text(value),
+                        left,
+                        baseline,
+                        k * s,
+                        Colour::WHITE.opacity(a),
+                        Blend::Additive,
+                        false,
+                    );
+                }
+            }
+        }
+
+        if visible && alpha > 0.004 {
+            if displayed > 0 || roll_active {
+                font.draw_left(
+                    list,
+                    assets.atlas,
+                    &text(displayed as i32),
+                    left,
+                    baseline,
+                    k * small_scale,
+                    Colour::WHITE.opacity(alpha),
+                    Blend::Alpha,
+                    false,
+                );
+            }
+        }
+    }
+
+    /// `LegacyHealthDisplay`: scorebar-bg at the screen top-left corner,
+    /// the fill (masked by HP, smoothed 200ms OutQuint) inset (3,10)·1.6
+    /// old-style / (7.5,7.8)·1.6 new-style, and the marker riding the
+    /// fill's leading edge. New style tints fill+marker by HP and blends
+    /// the marker additively above half; old style swaps
+    /// ki/kidanger/kidanger2 at 0.5/0.2. Damage flashes the marker
+    /// (additive burst, 120ms Out); gains bulge it (1.2 → 0.8, 150ms).
+    fn draw_legacy_health(&mut self, assets: &Assets, list: &mut DrawList, m: &Mapper, hp: f64, t: f64) {
+        // Snapshot the skin pieces (cheap: textures are Copy handles, the
+        // animation a small frame vec) so the health state can be mutated
+        // below without aliasing `self.legacy`.
+        let (bg, fill_anim, new_style, marker_new, ki, kidanger, kidanger2) = {
+            let Some(hud) = self.legacy.as_ref() else { return };
+            match (hud.health_bg, hud.health_fill.clone()) {
+                (Some(bg), Some(fill)) => (
+                    bg,
+                    fill,
+                    hud.health_new_style,
+                    hud.health_marker,
+                    hud.health_ki,
+                    hud.health_kidanger,
+                    hud.health_kidanger2,
+                ),
+                _ => return,
+            }
+        };
+
+        let v = m.virt;
+        let state = &mut self.l_health;
+
+        // Health-change edges (`HealthChanged(increase)` → Bulge / Flash).
+        if hp < state.prev_hp - 1e-9 {
+            state.flash = Some((t, hp >= 0.5));
+        } else if hp > state.prev_hp + 1e-9 {
+            state.bulge = Some(t);
+        }
+        state.prev_hp = hp;
+
+        // Background sprite, top-left of the screen.
+        let bg_w = bg.display_width() * v;
+        let bg_h = bg.display_height() * v;
+        list.image(assets.atlas, bg.region, [bg_w * 0.5, bg_h * 0.5], [bg_w, bg_h], 0.0, Colour::WHITE, Blend::Alpha);
+
+        // Fill: animated frame (`LegacyFill`'s scorebar-colour animation),
+        // masked to the smoothed HP width. The per-frame width tween is
+        // `Interpolation.ValueAt(ElapsedFrameTime clamped 200, width,
+        // hp·max, 0, 200, OutQuint)`.
+        let (off_x, off_y) = if new_style { (7.5 * 1.6, 7.8 * 1.6) } else { (3.0 * 1.6, 10.0 * 1.6) };
+        let frame = fill_anim.frame_at(t);
+        let max_w = frame.display_width() as f64;
+        let fill_h = frame.display_height() * v;
+        let dt = if state.last_t.is_finite() && t > state.last_t { (t - state.last_t).clamp(0.0, 200.0) } else { 200.0 };
+        state.fill_w = value_at(dt, 0.0, 200.0, state.fill_w, hp * max_w, Easing::OutQuint);
+        state.last_t = t;
+        let frac = if max_w > 0.0 { (state.fill_w / max_w).clamp(0.0, 1.0) } else { 0.0 };
+
+        let fill_x = off_x * v;
+        let fill_y = off_y * v;
+        let fill_w = max_w as f32 * v * frac as f32;
+        if fill_w > 0.5 {
+            let tint = if new_style { legacy_fill_colour(hp) } else { Colour::WHITE };
+            list.image_sub(
+                assets.atlas,
+                frame.region,
+                [fill_x + fill_w * 0.5, fill_y + fill_h * 0.5],
+                [fill_w, fill_h],
+                0.0,
+                tint,
+                Blend::Alpha,
+                0.0,
+                0.0,
+                frac as f32,
+                1.0,
+            );
+        }
+
+        // Marker: rides the fill's leading edge (right-middle for the new
+        // style, right-top line for the old one).
+        let marker_x = fill_x + fill_w;
+        let marker_y = if new_style { fill_y + fill_h * 0.5 } else { fill_y };
+
+        // Bulge animation factor (`Main.ScaleTo(1.2)` then → 0.8, 150ms).
+        let bulge_s = match state.bulge {
+            Some(b) => {
+                let x = t - b;
+                if x < 0.0 || x > 150.0 {
+                    1.0
+                } else {
+                    value_at(x, 0.0, 150.0, 1.2, 0.8, Easing::Linear) as f32
+                }
+            }
+            None => 1.0,
+        };
+
+        // Pick the marker texture + tint + blend mode for this style/HP.
+        let (marker, tint, blend) = if new_style {
+            let tint = legacy_fill_colour(hp);
+            let blend = if hp >= 0.5 { Blend::Additive } else { Blend::Alpha };
+            (marker_new, tint, blend)
+        } else {
+            let tex = if hp < 0.2 {
+                kidanger2.or(kidanger).or(ki)
+            } else if hp < 0.5 {
+                kidanger.or(ki)
+            } else {
+                ki.or(kidanger)
+            };
+            (tex, Colour::WHITE, Blend::Alpha)
+        };
+
+        if let Some(marker) = marker {
+            let mw = marker.display_width() * v * bulge_s;
+            let mh = marker.display_height() * v * bulge_s;
+            list.image(assets.atlas, marker.region, [marker_x, marker_y], [mw, mh], 0.0, tint, blend);
+
+            // Flash: additive copy of the current marker texture bursting
+            // out (scale → 2 epic / 1.6, FadeOutFromOne, 120ms Out).
+            if let Some((start, epic)) = state.flash {
+                let x = t - start;
+                if x < 120.0 {
+                    let a = value_at(x, 0.0, 120.0, 1.0, 0.0, Easing::Out) as f32;
+                    let s = value_at(x, 0.0, 120.0, 1.0, if epic { 2.0 } else { 1.6 }, Easing::Out) as f32;
+                    let ew = marker.display_width() * v * s;
+                    let eh = marker.display_height() * v * s;
+                    list.image(
+                        assets.atlas,
+                        marker.region,
+                        [marker_x, marker_y],
+                        [ew, eh],
+                        0.0,
+                        tint.opacity(a),
+                        Blend::Additive,
+                    );
+                }
+            }
+        }
+    }
+
+    /// `LegacyKeyCounterDisplay`: a vertical column of `inputoverlay-key`
+    /// boxes hanging off the right edge, centred vertically
+    /// (`CentreRight` anchor, origin TopRight, Position (0, -40)·1.6),
+    /// with the `inputoverlay-background` strip rotated 90° behind them.
+    /// Each 46-unit box shows the key NAME until its first press, then
+    /// the cumulative press count (`ScoreEntry` font), tinted
+    /// `InputOverlayText`; the box squashes to 0.75 while pressed and the
+    /// first two keys light up #ffde00, the third #f8009e.
+    fn draw_legacy_keys(&mut self, game: &GameData, assets: &Assets, list: &mut DrawList, m: &Mapper, t: f64) {
+        let v = m.virt;
+
+        const BOX: f32 = 46.0;
+        const SPACING: f32 = 1.8;
+
+        let state = key_state_at(game, t);
+        let counts = key_counts_at(game, t);
+
+        // Phase 1: advance the press animations / activation flags.
+        let mut rows: [(bool, f32, bool, u32); 3] = [(false, 1.0, false, 0); 3];
+        for k in 0..3 {
+            let anim = &mut self.l_keys[k];
+            if state[k] != anim.pressed {
+                if state[k] {
+                    anim.press_t = t;
+                    anim.activated = true;
+                } else {
+                    anim.release_t = t;
+                }
+                anim.pressed = state[k];
+            }
+            // Container squash while pressed (160ms Out both ways).
+            let press_s = if anim.pressed {
+                value_at(t, anim.press_t, anim.press_t + 160.0, 1.0, 0.75, Easing::Out)
+            } else {
+                value_at(t, anim.release_t, anim.release_t + 160.0, 0.75, 1.0, Easing::Out)
+            } as f32;
+            rows[k] = (anim.pressed, press_s, anim.activated, counts[k]);
+        }
+
+        // Phase 2: draw with the skin borrow.
+        let Some(hud) = self.legacy.as_ref() else { return };
+        let text_colour = hud.input_text_colour;
+
+        // Display container: CentreRight anchor, TopRight origin, (0, -64).
+        let tr = [m.virt([1024.0, 0.0])[0], m.screen_h * 0.5 - 64.0 * v];
+
+        // Background strip: Sprite anchored TopRight/origin TopLeft,
+        // Scale (1.05, 1), Rotation 90 - scale applies first, then the
+        // rotation about the (unrotated) top-left corner, so the quad
+        // hangs DOWN from the container's top-right edge.
+        if let Some(bg) = hud.input_bg.as_ref() {
+            let w = bg.display_width() * 1.05 * v;
+            let h = bg.display_height() * v;
+            // Unrotated half-extents about the pivot corner; +90° maps
+            // (x, y) → (-y, x), placing the quad left-below the pivot.
+            let centre = [tr[0] - h * 0.5, tr[1] + w * 0.5];
+            list.image(assets.atlas, bg.region, centre, [h, w], 90.0, Colour::WHITE, Blend::Alpha);
+        }
+
+        // Key flow: TopRight anchor, X -1.5, Y +7, vertical, spacing 1.8.
+        let flow_tr = [tr[0] - 1.5 * v, tr[1] + 7.0 * v];
+
+        for k in 0..3 {
+            let (pressed, press_s, activated, count) = rows[k];
+            let row_top = flow_tr[1] + (k as f32) * (BOX + SPACING) * v;
+            let centre = [flow_tr[0] - BOX * 0.5 * v, row_top + BOX * 0.5 * v];
+
+            // Key sprite (native display size, centred in the 46-box),
+            // tinted with the active colour while pressed.
+            if let Some(key) = hud.input_key.as_ref() {
+                let kw = key.display_width() * v * press_s;
+                let kh = key.display_height() * v * press_s;
+                let active = if k < 2 { Colour::from_hex(0xFFDE00) } else { Colour::from_hex(0xF8009E) };
+                let tint = if pressed { active } else { Colour::WHITE };
+                list.image(assets.atlas, key.region, centre, [kw, kh], 0.0, tint, Blend::Alpha);
+            }
+
+            // Overlay text: key name until the first press, then the
+            // cumulative count (`ScoreEntry` digits), centred in the box.
+            // Deviation: lazer blanks the box when the skin ships no
+            // entry digits (`LegacyGlyphStore` finds nothing); we keep the
+            // key NAME instead of losing the count display entirely.
+            let show_name = !activated || hud.entry.is_none();
+            if !show_name {
+                let font = hud.entry.as_ref().unwrap();
+                let text = format!("{}", count);
+                let run_w = font.run_width(&text, false) * v;
+                let baseline = centre[1] + font.max_digit_h() * 0.5 * v;
+                font.draw_left(list, assets.atlas, &text, centre[0] - run_w * 0.5, baseline, v, text_colour, Blend::Alpha, false);
+            } else {
+                let size = 20.0 * v;
+                draw_ttf_text(
+                    list,
+                    assets.atlas,
+                    assets.semibold,
+                    false,
+                    KEY_ACTIONS[k],
+                    [centre[0], centre[1]],
+                    size,
+                    text_colour,
+                    0.0,
+                    Blend::Alpha,
+                );
+            }
         }
     }
 }

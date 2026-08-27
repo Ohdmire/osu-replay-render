@@ -27,7 +27,8 @@ osu_replay_render <beatmap.osu> [replay.osr] [options]
 | `--fps <n>` | 输出帧率 1..480，默认 60（与游戏帧一一对应；其他帧率对光标做插值采样） |
 | `--start <ms>` / `--end <ms>` | 渲染回放时间区间（毫秒） |
 | `--score classic` | HUD 显示经典分（默认 standardised） |
-| `--skin <argon\|argon-pro>` | 皮肤变体，默认 `argon-pro`（无 GREAT/PERFECT 判定文字、滑条身体透明度 0.92） |
+| `--skin <argon\|argon-pro\|dir>` | 皮肤变体,默认 `argon-pro`(无 GREAT/PERFECT 判定文字、滑条身体透明度 0.92);传**皮肤目录**(解包的 .osk / 游戏 `Skins/<name>`)即启用该皮肤:玩法元素之外,**HUD 的分数/准确率/连击计数器、HP 血条(scorebar-\*,新旧两种样式)与按键计数(inputoverlay-\*)**也换用皮肤自己的贴图(lazer `LegacyScoreCounter`/`LegacyAccuracyCounter`/`LegacyDefaultComboCounter`/`LegacyHealthDisplay`/`LegacyKeyCounterDisplay` 的移植;皮肤缺哪块就回退哪块的 argon 实现,UR 条始终用本渲染器的实现) |
+| `--argon-hud` | 有皮肤目录时仍强制 Argon HUD(默认皮肤提供哪块 HUD 元素就用哪块) |
 | `--skin-colours` | **强制用皮肤 combo 色**覆盖谱面 `[Colours]`（stable 行为，= lazer 关闭「Beatmap skins」设定）。默认相反：谱面自带 `[Colours]` 时优先谱面色（lazer 默认行为，`LegacyBeatmapSkin` 先应答查找），皮肤 combo 色仅在谱面未配色时生效 |
 | `--encoder <auto\|x264\|x265\|nvenc>` | 视频编码器：默认 `auto`（探测 NVENC 可用则用之，否则回退 x264）；NVENC 硬件编码（bgr0 直喂 + p5/hq/vbr/cq，**端到端约比 x264 快 1.7×、比 x265 快 3.2×**）；libx264 / libx265（preset medium + crf） |
 | `--quality <n>` | crf（软件）/ cq（nvenc），默认 18 |
@@ -164,6 +165,44 @@ if renderer.pending_len() > 0 {
   移动平均 0.9/0.1，800ms OutQuint 滑动指向）、条上方实时 UR 数值；
   UR 事件集与 `ScoreProcessor.unstable_rate` 完全一致（`has_windows &&
   is_hit`，offset/rate），Welford 增量累计）。
+
+## 已实现（自定义皮肤 HUD，`--skin <dir>`）
+
+皮肤目录下,HUD 五件套按 lazer 对应组件逐行移植（坐标为 lazer
+1024x768 HUD 空间,`STABLE_MAGIC_SCALE_FACTOR` 1.6 已折入常量;
+皮肤缺某块元素时该块回退 argon,`--argon-hud` 可整体强制 Argon）：
+
+- **分数计数器**（`LegacyScoreCounter`）：右上 Anchor TopRight、Scale
+  0.96、边距 10,score 字体数字 FixedWidth（'5' 定宽 − ScoreOverlap）,
+  按 standardised/classic 补零到 6/8 位;比例滚动（1000·|Δ| ms Out,
+  首值瞬时显示不播滚动）。
+- **准确率计数器**（`LegacyAccuracyCounter`）：TopRight、Scale
+  0.6×0.96、边距 9/17,固定钉在分数行下方（`MainHUD` 容器回调语义）;
+  `FormatAccuracy` 文本（向下取整 4 位小数防 89.9999% 显示成 90%）,
+  `.`/`%`/`,`/`x` 走 `{prefix}-dot/-percent/-comma/-x` 字形,缺字形跳过
+  且不推进 pen（framework `TextBuilder` 语义）。
+- **连击计数器**（`LegacyDefaultComboCounter`）：左下 BottomLeft、
+  Scale 1.28、边距 10,Combo 字体 `{n}x`；每次 +1 触发**加色大弹出**
+  （新值文本 1.56→1 缩放、0.6→0 淡出,300ms 线性）与显示值小脉冲
+  （1→1.1→1,50+50ms In/Out）,显示值在 160ms 后步进（
+  `big_pop_out_duration − 140` 的调度步进）;断连按比例时长滚动归零
+  （差值 ×20ms,线性）并 100ms 淡出。
+- **HP 血条**（`LegacyHealthDisplay`）：`scorebar-bg` 贴屏幕左上角,
+  `scorebar-colour`（可帧行）按 HP 水平裁切、200ms OutQuint 平滑追宽;
+  **新样式**（皮肤提供 `scorebar-marker`）填充/圆盘 marker 按血量着色
+  （>0.5 白→0.5 黑→0.2 红的插值曲线,marker ≥0.5 加色混合）,偏移
+  (7.5,7.8)×1.6;**旧样式**用 `scorebar-ki/kidanger/kidanger2` 三态
+  切换（0.5/0.2 阈值）,偏移 (3,10)×1.6,marker 骑在填充上沿;掉血时
+  marker 加色爆闪（120ms Out,血量 ≥0.5 时爆到 2 倍）,回血时 bulge
+  （1.2→0.8,150ms）。
+- **按键计数**（`LegacyKeyCounterDisplay`）：右缘垂直一列 46x46 盒
+  （CentreRight 锚、TopRight 原点、(0,−40)×1.6,间距 1.8）,
+  `inputoverlay-background` 横条贴图旋转 90° 缩放 (1.05,1) 挂在列后;
+  `inputoverlay-key` 盒子按下压扁到 0.75（160ms Out）,前两键点亮
+  #ffde00、第三键 #f8009e;盒内先显示键名,首次按下后永久切换为累计
+  按压次数（`scoreentry` 字体,染色 `[Colours] InputOverlayText`
+  ?? 黑）;皮肤不带 entry 数字时保留键名（对 lazer 空白行为的小偏离,
+  注释已标注）。
 
 ## 资产
 
