@@ -411,7 +411,7 @@ impl HudState {
 
             let v = m.virt;
             let cy = m.virt([0.0, self.l_score_h + 9.0 + self.l_acc_h * 0.5])[1];
-            let cx_right = m.virt([1024.0 - 17.0 - self.l_acc_w - 18.0, 0.0])[0];
+            let cx_right = m.screen_w - (17.0 + self.l_acc_w + 18.0) * v;
             let r_ring = 16.5 * v;  // 33x33 container, border 2 inward
             let r_dot = 2.0 * v;    // 4-unit centre dot
             let r_arc = 13.0 * v;   // CircularProgress inside the 0.92 child
@@ -458,6 +458,7 @@ impl HudState {
         // MainHUD container ships no PP counter) - under legacy skins it
         // hangs below the legacy accuracy run instead of the argon one.
         if !game.pp_events.is_empty() {
+            let v = m.virt;
             let pp = crate::pp::pp_at(&game.pp_events, t);
             self.pp.set(pp.round(), t);
             self.pp.update(t);
@@ -470,7 +471,7 @@ impl HudState {
             // score digits falls back to the argon accuracy, and the
             // legacy run heights would still be 0.
             let (right, top) = if legacy_acc {
-                (m.virt([1024.0 - 17.0, 0.0])[0], m.virt([0.0, self.l_score_h + 9.0 + self.l_acc_h + 10.0])[1])
+                (m.screen_w - 17.0 * v, m.virt([0.0, self.l_score_h + 9.0 + self.l_acc_h + 10.0])[1])
             } else {
                 (m.virt([1024.0 - 20.0, 0.0])[0], m.virt([0.0, 20.0 + 36.0 + 10.0])[1])
             };
@@ -1359,12 +1360,18 @@ impl HudState {
         let classic = self.classic_score;
 
         let Some(font) = self.legacy.as_ref().and_then(|l| l.score.as_ref()) else { return };
+        let v = m.virt;
 
         let k = 0.96 * m.virt;
         let digits = if classic { 8 } else { 6 };
         let text = format!("{:0width$}", value, width = digits);
 
-        let right = m.virt([1024.0 - 10.0, 0.0])[0];
+        // Legacy HUD counters anchor to the REAL screen edge with margins
+        // in lazer's window units (scale H/768 = v), NOT the 1024 space -
+        // skin frame art (scorebar-bg) is authored on the same 1366x768
+        // canvas, so both must share the unit scale for text to land in
+        // the art's frames.
+        let right = m.screen_w - 10.0 * v;
         // Glyph boxes bottom-aligned on the run's baseline; the run top is
         // flush with the screen top edge (margin vertical 0).
         let baseline = font.max_digit_h() * k;
@@ -1385,11 +1392,12 @@ impl HudState {
         let top_units = self.l_score_h + 9.0;
 
         let Some(font) = self.legacy.as_ref().and_then(|l| l.score.as_ref()) else { return };
+        let v = m.virt;
 
         let k = 0.6 * 0.96 * m.virt;
         // Remember the run height so the PP counter can hang below it.
         self.l_acc_h = font.max_digit_h() * 0.6 * 0.96;
-        let right = m.virt([1024.0 - 17.0, 0.0])[0];
+        let right = m.screen_w - 17.0 * v;
         let baseline = m.virt([0.0, top_units])[1] + font.max_digit_h() * k;
         // `accuracy.ScreenSpaceDeltaToParentSpace(accuracy.Size).X`: the
         // SCALED size (component Scale 0.6*0.96) - the song-progress
