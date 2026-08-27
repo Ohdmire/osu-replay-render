@@ -231,6 +231,9 @@ pub struct HudState {
     /// accuracy counter sits below it (`LegacySkin`'s MainHUD container
     /// aligns the two).
     l_score_h: f32,
+    /// Digit run height of the last legacy accuracy draw - the PP counter
+    /// hangs below it.
+    l_acc_h: f32,
 }
 
 impl HudState {
@@ -264,6 +267,7 @@ impl HudState {
             l_health: LegacyHealth::new(),
             l_keys: [LegacyKeyAnim::new(), LegacyKeyAnim::new(), LegacyKeyAnim::new()],
             l_score_h: 0.0,
+            l_acc_h: 0.0,
         }
     }
 
@@ -381,21 +385,26 @@ impl HudState {
             acc_cd.draw_top(list, &whole_s, whole_right, acc_top, 1.0, Colour::WHITE, Blend::Alpha);
         }
 
-        // --- PP counter (`ArgonPerformancePointsCounter`) ------------------------
+        // --- PP counter (`ArgonPerformancePointsCounter` style) -----------------
         // Live PP off the gradual timeline, rounded to int (`Math.Round`
         // AwayFromZero) with the same 250ms roll as the other counters.
-        // Argon-only: lazer's legacy-skin MainHUD container ships no PP
-        // counter.
-        if !use_legacy && !game.pp_events.is_empty() {
+        // Shown for EVERY skin (deliberate deviation: lazer's legacy-skin
+        // MainHUD container ships no PP counter) - under legacy skins it
+        // hangs below the legacy accuracy run instead of the argon one.
+        if !game.pp_events.is_empty() {
             let pp = crate::pp::pp_at(&game.pp_events, t);
             self.pp.set(pp.round(), t);
             self.pp.update(t);
 
             let cd = CounterDraw { atlas: assets.atlas, digit_h: 22.0 * m.virt };
             // Below the accuracy counter: (accuracy.X, accuracy.Y +
-            // accuracy.DrawHeight + 10) with TopRight anchors.
-            let right = m.virt([1024.0 - 20.0, 0.0])[0];
-            let top = m.virt([0.0, 20.0 + 36.0 + 10.0])[1];
+            // accuracy.DrawHeight + 10) with TopRight anchors; the legacy
+            // run sits under its own score+accuracy stack.
+            let (right, top) = if use_legacy {
+                (m.virt([1024.0 - 17.0, 0.0])[0], m.virt([0.0, self.l_score_h + 9.0 + self.l_acc_h + 10.0])[1])
+            } else {
+                (m.virt([1024.0 - 20.0, 0.0])[0], m.virt([0.0, 20.0 + 36.0 + 10.0])[1])
+            };
             let text = format!("{}", self.pp.display.round() as i64);
             let wire = text.len().max(3); // `Math.Max(3, digits)`
             draw_wireframe_run(list, assets.atlas, right, top + cd.k() * TEX_BOX * 0.5, wire, m.virt);
@@ -404,8 +413,7 @@ impl HudState {
             // "PP" label (Torus Bold 12, Blue0), 2.5 left of the digits,
             // top-aligned with the digit boxes.
             let label_size = 12.0 * m.virt;
-            let (lw, ltop, lbottom) = ttf_measure(assets.bold, "PP", label_size, 0.0);
-            let _ = (ltop, lbottom);
+            let (lw, _ltop, _lbottom) = ttf_measure(assets.bold, "PP", label_size, 0.0);
             let label_right = right - cd.run_width(&text, 1.0) - 2.5 * m.virt;
             draw_ttf_text(
                 list,
@@ -1310,6 +1318,8 @@ impl HudState {
         let Some(font) = self.legacy.as_ref().and_then(|l| l.score.as_ref()) else { return };
 
         let k = 0.6 * 0.96 * m.virt;
+        // Remember the run height so the PP counter can hang below it.
+        self.l_acc_h = font.max_digit_h() * 0.6 * 0.96;
         let right = m.virt([1024.0 - 17.0, 0.0])[0];
         let baseline = m.virt([0.0, top_units])[1] + font.max_digit_h() * k;
         font.draw_right(list, assets.atlas, &text, right, baseline, k, Colour::WHITE, Blend::Alpha);
