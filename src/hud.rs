@@ -899,13 +899,13 @@ fn draw_health(list: &mut DrawList, m: &Mapper, health: f64, t: f64, flash: Opti
 // (1.6) constants from the source are pre-multiplied into the literals.
 // ---------------------------------------------------------------------------
 
-/// Proportional rolling counter (`RollingCounter.IsRollingProportional`):
-/// the roll duration is the size of the change, with the counter's own
-/// easing (`LegacyScoreCounter` 1000·|Δscore| ms Out;
-/// `PercentageCounter` 375·|Δacc|·100 ms Out). The FIRST value seen is
-/// snapped in without a roll - lazer's `RollingCounter` sets
-/// `DisplayedCount` directly on the initial bind, and a cold seek into a
-/// finished score must not spend a minute rolling up from zero.
+/// Fixed-duration rolling counter (`RollingCounter` with the default
+/// `IsRollingProportional = false`: `LegacyScoreCounter` rolls 1000 ms
+/// Out, `PercentageCounter` 375 ms Out — `GetProportionalDuration` is
+/// dead code for both). The FIRST value seen is snapped in without a
+/// roll - lazer's `RollingCounter` sets `DisplayedCount` directly on the
+/// initial bind, and a cold seek into a finished score must not spend
+/// time rolling up from zero.
 struct PropRoll {
     display: f64,
     from: f64,
@@ -920,7 +920,7 @@ impl PropRoll {
         PropRoll { display: initial, from: initial, to: initial, start: f64::NEG_INFINITY, dur: 0.0, init: false }
     }
 
-    fn set(&mut self, value: f64, t: f64, per_unit: f64) {
+    fn set(&mut self, value: f64, t: f64, dur: f64) {
         if value != self.to {
             if !self.init {
                 // Initial bind: snap without a roll (from == to ⇒ dur 0).
@@ -932,7 +932,7 @@ impl PropRoll {
             }
             self.to = value;
             self.start = t;
-            self.dur = (value - self.from).abs() * per_unit;
+            self.dur = dur;
         }
     }
 
@@ -1287,7 +1287,7 @@ impl HudState {
     /// horizontal 10; score digits, FixedWidth, zero-padded to 6
     /// (standardised) / 8 (classic) digits (`GameplayScoreCounter`).
     fn draw_legacy_score(&mut self, assets: &Assets, list: &mut DrawList, m: &Mapper, score: i64, t: f64) {
-        self.l_score.set(score as f64, t, 1.0);
+        self.l_score.set(score as f64, t, 1000.0);
         self.l_score.update(t);
         let value = self.l_score.display.round() as i64;
         let classic = self.classic_score;
@@ -1312,7 +1312,7 @@ impl HudState {
     /// floored to 4 decimals so a 89.9999% never rounds up to 90%).
     fn draw_legacy_accuracy(&mut self, assets: &Assets, list: &mut DrawList, m: &Mapper, accuracy: f64, t: f64) {
         // PercentageCounter rolls the FRACTION with |Δ|·375ms·100 duration.
-        self.l_acc.set(accuracy, t, 37500.0);
+        self.l_acc.set(accuracy, t, 375.0);
         self.l_acc.update(t);
         let floored = (self.l_acc.display * 10_000.0).floor() / 10_000.0;
         let text = format!("{:.2}%", floored * 100.0);
@@ -1571,15 +1571,21 @@ impl HudState {
 
         // Background strip: Sprite anchored TopRight/origin TopLeft,
         // Scale (1.05, 1), Rotation 90 - scale applies first, then the
-        // rotation about the (unrotated) top-left corner, so the quad
-        // hangs DOWN from the container's top-right edge.
+        // Background strip: `Sprite { Anchor TopRight, Origin TopLeft,
+        // Scale (1.05, 1), Rotation 90 }`. Verified against framework
+        // source (`DrawInfo.ApplyTransform` + `MatrixExtensions.RotateFromLeft`,
+        // row-vector: point -> scale -> rotate -> translate; +90° maps
+        // (x, y) -> (-y, x), clockwise on the y-down screen):
+        // local [0..sx]x[0..sy] (Origin TopLeft) lands on bbox
+        // x[pivot.x - sy, pivot.x], y[pivot.y, pivot.y + sx] - i.e. the
+        // texture WIDTH runs DOWN (u axis -> (0,1)) and the HEIGHT runs
+        // LEFT (v axis -> (-1, 0)); the texture's top edge hugs the
+        // container's right edge.
         if let Some(bg) = hud.input_bg.as_ref() {
-            let w = bg.display_width() * 1.05 * v;
-            let h = bg.display_height() * v;
-            // Unrotated half-extents about the pivot corner; +90° maps
-            // (x, y) → (-y, x), placing the quad left-below the pivot.
+            let w = bg.display_width() * 1.05 * v; // u: vertical length
+            let h = bg.display_height() * v;       // v: horizontal thickness
             let centre = [tr[0] - h * 0.5, tr[1] + w * 0.5];
-            list.image(assets.atlas, bg.region, centre, [h, w], 90.0, Colour::WHITE, Blend::Alpha);
+            list.image(assets.atlas, bg.region, centre, [w, h], 90.0, Colour::WHITE, Blend::Alpha);
         }
 
         // Key flow: TopRight anchor, X -1.5, Y +7, vertical, spacing 1.8.
