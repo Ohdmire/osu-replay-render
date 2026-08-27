@@ -398,9 +398,12 @@ impl HudState {
 
             let cd = CounterDraw { atlas: assets.atlas, digit_h: 22.0 * m.virt };
             // Below the accuracy counter: (accuracy.X, accuracy.Y +
-            // accuracy.DrawHeight + 10) with TopRight anchors; the legacy
-            // run sits under its own score+accuracy stack.
-            let (right, top) = if use_legacy {
+            // accuracy.DrawHeight + 10) with TopRight anchors. Placement
+            // follows whichever accuracy counter was actually DRAWN
+            // (`legacy_acc`), not the skin type - a legacy skin without
+            // score digits falls back to the argon accuracy, and the
+            // legacy run heights would still be 0.
+            let (right, top) = if legacy_acc {
                 (m.virt([1024.0 - 17.0, 0.0])[0], m.virt([0.0, self.l_score_h + 9.0 + self.l_acc_h + 10.0])[1])
             } else {
                 (m.virt([1024.0 - 20.0, 0.0])[0], m.virt([0.0, 20.0 + 36.0 + 10.0])[1])
