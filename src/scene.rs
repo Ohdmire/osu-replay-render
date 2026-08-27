@@ -1913,11 +1913,6 @@ fn draw_spinner_legacy(
             draw_sprite(list, background, centre, 1.0, 0.0, lg.spinner_background_colour.opacity(alpha), Blend::Alpha);
         }
 
-        // The ONLY rotating element: `disc.Rotation = RotationTracker.Rotation`.
-        if let Some(disc) = lg.spinner_circle {
-            draw_sprite(list, disc, centre, 1.0, display_rotation as f32, Colour::WHITE.opacity(alpha), Blend::Alpha);
-        }
-
         // Metre (`getMetreHeight` + the masking hack): 10 bars; the partial
         // bar blinks (progress capped at 99 so it keeps blinking at full).
         // The mask reveals texture rows [692 - h .. tex_h] — the metre
@@ -1964,6 +1959,15 @@ fn draw_spinner_legacy(
                     1.0,
                 );
             }
+        }
+
+        // The ONLY rotating element: `disc.Rotation = RotationTracker.Rotation`.
+        // Drawn AFTER the metre (deviation from lazer's AddRangeInternal
+        // order, which puts the disc under the metre): full-artwork metres
+        // (BTMC & friends) would otherwise bury the spinning ring, which
+        // stable always shows on top.
+        if let Some(disc) = lg.spinner_circle {
+            draw_sprite(list, disc, centre, 1.0, display_rotation as f32, Colour::WHITE.opacity(alpha), Blend::Alpha);
         }
     }
 
