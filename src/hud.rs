@@ -1287,7 +1287,7 @@ impl HudState {
     /// horizontal 10; score digits, FixedWidth, zero-padded to 6
     /// (standardised) / 8 (classic) digits (`GameplayScoreCounter`).
     fn draw_legacy_score(&mut self, assets: &Assets, list: &mut DrawList, m: &Mapper, score: i64, t: f64) {
-        self.l_score.set(score as f64, t, 1000.0);
+        self.l_score.set(score as f64, t, 1.0);
         self.l_score.update(t);
         let value = self.l_score.display.round() as i64;
         let classic = self.classic_score;
