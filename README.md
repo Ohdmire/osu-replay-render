@@ -157,7 +157,9 @@ if renderer.pending_len() > 0 {
   回放文件自动启用。
 - **HUD**：楔形块、分数/准确率/连击计数器（argon-counter 官方纹理
   数字 + 线框背景 + ink 对齐度量）、数字滚动（250ms）、连击弹出/miss
-  变红、血条（简化 HP 模拟 + 受伤闪红）、**UR 条**（水平置于屏幕底部
+  变红、血条（judge 判定引擎的 lazer `HealthProcessor` 移植：DR 相关扣
+  血表、combo 尾加成、break 段无 drain、满血模拟解 drain rate —— 见
+  osu-replay-judge v0.2.0；渲染端 200ms OutQuint 平滑追宽 + 受伤闪红）、**UR 条**（水平置于屏幕底部
   居中，按 lazer `BarHitErrorMeter` 源码移植：刻度为**加色混合**判定
   色竖线（100ms 弹入至 0.6 后 5s 淡出收缩，最多 50 个）、判定色窗口
   引导线色轴（中心 Great 蓝向外 Ok 绿、Meh 黄，最外端渐隐；`--no-guides`
@@ -296,8 +298,9 @@ UR、光标轨迹、按键显示全部走既有回放路径,无需 .osr 文件�
 
 - Rust (`cargo build --release`)
 - ffmpeg 在 PATH（`--out` 模式需要;库/surface 路径不需要）
-- 判定引擎：`../osu-replay-judge`（path dependency，已加入逐帧快照、
-  combo 信息输出与 `Engine::windows()` OD 窗口 getter 的修改）
+- 判定引擎：`osu-replay-judge`（git dependency，master 分支）。本地
+  checkout（`../osu-replay-judge`，v0.2.0：HP 处理器 + break 解析）经
+  Cargo.toml 的 `[patch]` 段优先生效——judge 推送后可移除该段
 - 作为库嵌入时:宿主窗口需提供原生窗口句柄(当前为 Win32 HWND;
   `raw-window-handle` 0.6)
 
