@@ -172,8 +172,9 @@ if renderer.pending_len() > 0 {
   `rosu-pp` 的 `OsuGradualPerformance` 逐物件推进——judge 判定时间轴
   逐事件折入累计 `OsuScoreState`，每个顶层物件判完推进一次，即
   「每次判定后的实时 PP」，与 lazer 游戏内计数器每 `NewJudgement`
-  重算的语义一致；legacy 皮肤的 MainHUD 容器不含 PP 计数器，遵循
-  lazer 不显示；stable 回放走 `lazer(false)` 稳定语义（tick 不计
+  重算的语义一致；**所有皮肤都显示**（对 lazer 的偏离：legacy 皮肤的
+  MainHUD 容器本无 PP 计数器——legacy 布局下它挂在 legacy ACC 行下方）；
+  stable 回放走 `lazer(false)` 稳定语义（tick 不计
   acc），lazer 回放计入 slider tick/repeat/tail 命中——rosu-pp 为
   lazer 计算器的移植，数值与原版"大致相同"而非逐位一致）。
 
