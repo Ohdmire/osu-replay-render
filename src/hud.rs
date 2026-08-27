@@ -409,8 +409,8 @@ impl HudState {
                 (m.virt([1024.0 - 20.0, 0.0])[0], m.virt([0.0, 20.0 + 36.0 + 10.0])[1])
             };
             let text = format!("{}", self.pp.display.round() as i64);
-            let wire = text.len().max(3); // `Math.Max(3, digits)`
-            draw_wireframe_run(list, assets.atlas, right, top + cd.k() * TEX_BOX * 0.5, wire, m.virt);
+            // No wireframe background behind the PP digits (user
+            // preference - unlike the score counter).
             cd.draw_right(list, &text, right, top + cd.k() * TEX_BOX * 0.5, 1.0, Colour::WHITE, Blend::Alpha);
 
             // "PP" label (Torus Bold 12, Blue0), 2.5 left of the digits,
