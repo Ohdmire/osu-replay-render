@@ -234,6 +234,9 @@ pub struct HudState {
     /// Digit run height of the last legacy accuracy draw - the PP counter
     /// hangs below it.
     l_acc_h: f32,
+    /// Digit run width of the last legacy accuracy draw - the legacy song
+    /// progress circle sits left of it (`LegacySkin`'s MainHUD callback).
+    l_acc_w: f32,
 }
 
 impl HudState {
@@ -268,6 +271,7 @@ impl HudState {
             l_keys: [LegacyKeyAnim::new(), LegacyKeyAnim::new(), LegacyKeyAnim::new()],
             l_score_h: 0.0,
             l_acc_h: 0.0,
+            l_acc_w: 0.0,
         }
     }
 
@@ -383,6 +387,68 @@ impl HudState {
             acc_cd.draw_top(list, "%", pct_right, acc_top, 1.0, Colour::WHITE, Blend::Alpha);
             acc_cd.draw_top(list, &frac_s, frac_right, acc_top + 4.0 * unit, 0.5, Colour::WHITE, Blend::Alpha);
             acc_cd.draw_top(list, &whole_s, whole_right, acc_top, 1.0, Colour::WHITE, Blend::Alpha);
+        }
+
+        // --- Song progress circle (`LegacySongProgress`) ------------------------
+        // A 33-unit circle left of the accuracy counter (right edge 18 units
+        // left of the accuracy run, vertically centred on it): a white ring
+        // (2-unit border), a white 60%-alpha progress arc sweeping clockwise
+        // from the top, and a 4-unit centre dot. Intro (before the first
+        // object): green (199,255,47), mirrored, counting DOWN from clock
+        // start; gameplay: progress through [first object start, last object
+        // end], time clamped to the last hit (`SongProgress.Update`).
+        if legacy_acc && !game.autoplay {
+            let first = game.objects.first().map(|o| o.start_time).unwrap_or(0.0);
+            let last = game.objects.last().map(|o| o.end_time).unwrap_or(0.0);
+            let (progress, is_intro) = if t < first {
+                let intro_start = 0.0f64.max(first - 2000.0);
+                (((t - intro_start) / (first - intro_start)).clamp(0.0, 1.0), true)
+            } else if last > first {
+                (((t.min(last) - first) / (last - first)).clamp(0.0, 1.0), false)
+            } else {
+                (0.0, false)
+            };
+
+            let v = m.virt;
+            let cy = m.virt([0.0, self.l_score_h + 9.0 + self.l_acc_h * 0.5])[1];
+            let cx_right = m.virt([1024.0 - 17.0, 0.0])[0] - self.l_acc_w * v - 18.0 * v;
+            let r_ring = 16.5 * v;  // 33x33 container, border 2 inward
+            let r_dot = 2.0 * v;    // 4-unit centre dot
+            let r_arc = 13.0 * v;   // CircularProgress inside the 0.92 child
+            let stroke_arc = 4.5 * v;
+
+            // Static white ring (border), centre dot.
+            let steps = 48;
+            for i in 0..steps {
+                let a0 = (i as f32 / steps as f32) * std::f32::consts::TAU;
+                let a1 = ((i + 1) as f32 / steps as f32) * std::f32::consts::TAU;
+                let (p0, p1) = (
+                    [cx_right - r_ring + r_ring * a0.cos(), cy + r_ring * a0.sin()],
+                    [cx_right - r_ring + r_ring * a1.cos(), cy + r_ring * a1.sin()],
+                );
+                list.capsule(p0, p1, 1.0 * v, Colour::WHITE, Blend::Alpha);
+            }
+            list.disc([cx_right - r_ring, cy], r_dot, Colour::WHITE, Colour::WHITE, Blend::Alpha);
+
+            // Progress arc: gameplay white 60% sweeping clockwise from the
+            // top; intro green 60% mirrored, showing the countdown (1 - p).
+            let (arc_frac, colour, dir) = if is_intro {
+                (1.0 - progress, Colour::from_hex(0xC7FF2F).opacity(0.6), -1.0f32)
+            } else {
+                (progress, Colour::WHITE.opacity(0.6), 1.0f32)
+            };
+            if arc_frac > 0.003 {
+                let arc_steps = ((arc_frac * 72.0).ceil() as usize).max(2);
+                let cx = cx_right - r_ring;
+                let mut prev = [cx, cy - r_arc * dir];
+                for i in 1..=arc_steps {
+                    let f = i as f32 / arc_steps as f32;
+                    let a = (-std::f32::consts::FRAC_PI_2) + dir * f * std::f32::consts::TAU * arc_frac as f32;
+                    let pt = [cx + r_arc * a.cos(), cy + r_arc * a.sin()];
+                    list.capsule(prev, pt, stroke_arc * 0.5, colour, Blend::Alpha);
+                    prev = pt;
+                }
+            }
         }
 
         // --- PP counter (`ArgonPerformancePointsCounter` style) -----------------
@@ -1325,6 +1391,7 @@ impl HudState {
         self.l_acc_h = font.max_digit_h() * 0.6 * 0.96;
         let right = m.virt([1024.0 - 17.0, 0.0])[0];
         let baseline = m.virt([0.0, top_units])[1] + font.max_digit_h() * k;
+        self.l_acc_w = font.run_width(&text, true);
         font.draw_right(list, assets.atlas, &text, right, baseline, k, Colour::WHITE, Blend::Alpha);
     }
 
