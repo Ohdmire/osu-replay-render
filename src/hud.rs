@@ -415,7 +415,6 @@ impl HudState {
             let r_ring = 16.5 * v;  // 33x33 container, border 2 inward
             let r_dot = 2.0 * v;    // 4-unit centre dot
             let r_arc = 13.0 * v;   // CircularProgress inside the 0.92 child
-            let stroke_arc = 4.5 * v;
 
             // Static white ring (border), centre dot.
             let steps = 48;
@@ -438,15 +437,25 @@ impl HudState {
                 (progress, Colour::WHITE.opacity(0.6), 1.0f32)
             };
             if arc_frac > 0.003 {
-                let arc_steps = ((arc_frac * 72.0).ceil() as usize).max(2);
+                // `CircularProgress` (sh_CircularProgressUtils.h): the arc is
+                // a FILLED PIE (innerRadius defaults to 1) sweeping from the
+                // top COUNTER-CLOCKWISE (`pixelAngle = atan(0.5 - y, 0.5 - x) - HALF_PI`,
+                // sector = pixelAngle < 2*pi*progress). dir=-1 mirrors it for
+                // the intro countdown.
                 let cx = cx_right - r_ring;
-                let mut prev = [cx, cy - r_arc * dir];
-                for i in 1..=arc_steps {
-                    let f = i as f32 / arc_steps as f32;
-                    let a = (-std::f32::consts::FRAC_PI_2) + dir * f * std::f32::consts::TAU * arc_frac as f32;
-                    let pt = [cx + r_arc * a.cos(), cy + r_arc * a.sin()];
-                    list.capsule(prev, pt, stroke_arc * 0.5, colour, Blend::Alpha);
-                    prev = pt;
+                let steps = ((arc_frac * 72.0).ceil() as usize).max(2);
+                for i in 0..steps {
+                    let f0 = i as f32 / steps as f32;
+                    let f1 = (i + 1) as f32 / steps as f32;
+                    let a0 = (-std::f32::consts::FRAC_PI_2) + dir * f0 * std::f32::consts::TAU * arc_frac as f32;
+                    let a1 = (-std::f32::consts::FRAC_PI_2) + dir * f1 * std::f32::consts::TAU * arc_frac as f32;
+                    let pts = [
+                        [cx, cy],
+                        [cx + r_arc * a0.cos(), cy + r_arc * a0.sin()],
+                        [cx + r_arc * a1.cos(), cy + r_arc * a1.sin()],
+                        [cx, cy],
+                    ];
+                    list.quad_gradient(&pts, [colour; 4], Blend::Alpha);
                 }
             }
         }
