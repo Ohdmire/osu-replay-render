@@ -240,6 +240,12 @@ pub struct HudState {
     hp_events_done: usize,
     /// Previous frame time (dt for the damps, backwards-seek detection).
     hp_last_t: f64,
+    /// Whether the opening fill was active on the previous frame (its
+    /// cancel edge triggers the 500ms release tween).
+    hp_init_active: bool,
+    /// Post-fill release (`FinishInitialAnimation`): start time + bar
+    /// value at cancel, easing to the real health over 500ms OutQuint.
+    hp_release: Option<(f64, f64)>,
     classic_score: bool,
     /// UR bar (`BarHitErrorMeter` port): time of the first timed hit (starts
     /// the axis growth / marker / arrow appear animations).
@@ -306,6 +312,8 @@ impl HudState {
             hp_flash: None,
             hp_events_done: 0,
             hp_last_t: f64::NEG_INFINITY,
+            hp_init_active: false,
+            hp_release: None,
             classic_score: false,
             ur_first_t: None,
             ur_ema: 0.0,
@@ -1046,7 +1054,8 @@ impl HudState {
         let dt = if t > self.hp_last_t { (t - self.hp_last_t).min(100.0) } else { 0.0 };
         if t < self.hp_last_t {
             self.hp_miss = None;
-            self.hp_events_done = game.events.partition_point(|e| e.time <= t);
+            self.hp_release = None;
+            self.hp_events_done = game.miss_times.partition_point(|&mt| mt <= t);
         }
         self.hp_last_t = t;
 
@@ -1084,6 +1093,17 @@ impl HudState {
         let init_active = health >= 1.0 - 1e-9 && init_value < 1.0;
         let current = if init_active { init_value } else { health };
 
+        // Cancel edge of the fill animation: `FinishInitialAnimation` snaps
+        // `Current` to the real health, then eases the DISPLAYED bar value
+        // over with `TransformTo(healthBarValue, value, 500, OutQuint)` (the
+        // glow variant runs 250ms). During that release the per-frame damp
+        // for the bar value is suspended, like lazer's transform winning
+        // over the Update-time damp.
+        if self.hp_init_active && !init_active && self.hp_last_t.is_finite() {
+            self.hp_release = Some((t, self.hp_bar_value));
+        }
+        self.hp_init_active = init_active;
+
         // `Interpolation.DampContinuously(value, Current, 50, Elapsed)`.
         let damp = |prev: f64, target: f64, half_time: f64| -> f64 {
             if dt <= 0.0 {
@@ -1091,7 +1111,16 @@ impl HudState {
             }
             prev + (target - prev) * (1.0 - 0.5f64.powf(dt / half_time))
         };
-        self.hp_bar_value = damp(self.hp_bar_value, current, 50.0);
+        match self.hp_release {
+            Some((rt, from)) if t < rt + 500.0 => {
+                self.hp_bar_value = value_at(t, rt, rt + 500.0, from, health, Easing::OutQuint);
+            }
+            Some((rt, _)) => {
+                self.hp_release = None;
+                self.hp_bar_value = damp(self.hp_bar_value, current, 50.0);
+            }
+            None => self.hp_bar_value = damp(self.hp_bar_value, current, 50.0),
+        }
         if self.hp_miss.is_none() {
             self.hp_glow_value = damp(self.hp_glow_value, current, 50.0);
         }
