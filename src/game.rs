@@ -309,6 +309,11 @@ pub struct GameData {
     /// counters and the UR bar — the numbers are all perfect and carry no
     /// information about the beatmap.
     pub autoplay: bool,
+    /// Judgement times of every negative-increase miss (`Miss`,
+    /// `LargeTickMiss`, `SmallTickMiss` - `ArgonHealthDisplay`'s
+    /// `onNewJudgement` miss condition; `IgnoreMiss` carries no health
+    /// delta and is excluded). Feeds the health bar's red miss display.
+    pub miss_times: Vec<f64>,
     /// Hidden mod (`OsuModHidden`, visual only — HD changes no judgement).
     /// Objects fade out before their hit time; approach circles are hidden
     /// except on the first object.
@@ -563,9 +568,13 @@ fn build(
 
     // Timeline -> per-object judgement states + display events.
     let mut events: Vec<EventView> = Vec::new();
+    let mut miss_times: Vec<f64> = Vec::new();
     let mut spinner_ticks: Vec<(usize, f64, bool)> = Vec::new();
     let mut spinner_max_ticks: Vec<(usize, f64)> = Vec::new();
     for entry in &engine.timeline {
+        if matches!(entry.result, HitResult::Miss | HitResult::LargeTickMiss | HitResult::SmallTickMiss) {
+            miss_times.push(entry.time);
+        }
         let obj = &mut objects[entry.object_index];
         let label = entry.label.as_str();
 
@@ -714,6 +723,7 @@ fn build(
         pp_max: f64::NAN,
         pp_events: Vec::new(),
         autoplay: false,
+        miss_times,
         hidden: mods.hidden,
         hd_first_object,
     })

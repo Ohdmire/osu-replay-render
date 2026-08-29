@@ -29,6 +29,13 @@ impl Rolling {
         Rolling { display: 0.0, from: 0.0, to: 0.0, start: f64::NEG_INFINITY }
     }
 
+    /// Pre-seeded counter (`PercentageCounter`'s constructor sets
+    /// `Current.Value = DisplayedCount = 1.0`, so the accuracy counter
+    /// starts AT 100% instead of rolling 0→100 on the first frames).
+    pub fn with_initial(initial: f64) -> Rolling {
+        Rolling { display: initial, from: initial, to: initial, start: f64::NEG_INFINITY }
+    }
+
     pub fn set(&mut self, value: f64, t: f64) {
         if value != self.to {
             self.from = self.display;
@@ -64,6 +71,15 @@ const TEX_BOX: f32 = 240.0;
 const DIGIT_INK: f32 = 178.0;
 /// `ArgonCounterSpriteText.Spacing = (-2, 0)`.
 const COUNTER_SPACING: f32 = -2.0;
+///
+/// Display size chain (lazer): `FontUsage(font, 1)` (size 1) x
+/// `TexturedCharacterGlyph` scale 0.125 (`ArgonCounterTextComponent.GlyphStore`)
+/// against the raw 240px texture (`TextureStore.ScaleAdjust` does not divide
+/// `texture.Width`) -> each digit renders as a 240*0.125 = 30-unit BOX with a
+/// 178/240 share of it as INK, advancing 30-2 = 28 units. Every argon counter
+/// size below derives from that one number.
+const COUNTER_BOX: f32 = 30.0;
+const COUNTER_INK: f32 = COUNTER_BOX * (DIGIT_INK / TEX_BOX);
 
 impl<'a> CounterDraw<'a> {
     fn region_for(c: char) -> Region {
@@ -189,15 +205,41 @@ pub struct HudState {
     /// Whether the live PP counter renders (lazer's legacy-skin HUD ships
     /// no PP counter; the renderer shows it for every skin by default).
     pub pp_display: bool,
-    combo_display: f64,
+    /// Displayed combo digits (`RollingCounter<int>`: 250ms OutQuad roll).
+    combo_roll: Rolling,
     combo_scale_anim: Option<(f64, f64, f64, f64, Easing)>,
     /// Live combo scale, advanced every frame.
     combo_scale_now: f64,
     last_combo: i32,
     last_combo_time: f64,
-    was_miss: bool,
-    health_flash: Option<f64>,
-    last_health: f64,
+    /// Miss colour flash (`FlashColour(Color4.Red, 2000, OutQuint)`): a
+    /// one-shot transform that runs its full 2000ms even as the combo
+    /// climbs again, so it is tracked independently of the live combo.
+    combo_flash: Option<f64>,
+    /// `game.score_events` consumed so far by the combo state machines
+    /// (`l_combo` / argon scale + flash): lazer's `BindValueChanged`
+    /// callbacks fire for EVERY intermediate value, and a miss's
+    /// `combo == 0` tick shares its timestamp with the following +1, so
+    /// consuming only the per-frame final value would skip it entirely.
+    combo_events_done: usize,
+    /// Argon health bar (`HealthDisplay` initial fill + the per-frame
+    /// damps of `ArgonHealthDisplay.Update`).
+    /// Damped displayed bar value (`healthBarValue`, half-life 50ms).
+    hp_bar_value: f64,
+    /// Lagging glow value (`glowBarValue`); frozen while the miss display
+    /// holds, released to the current health over 300ms afterwards.
+    hp_glow_value: f64,
+    /// Bar alpha (`mainBar.Alpha`, half-life 40ms toward value > 0).
+    hp_alpha: f64,
+    /// Active miss display (`triggerMissDisplay`): trigger time + the
+    /// frozen glow value at that moment.
+    hp_miss: Option<(f64, f64)>,
+    /// Latest successful hit (`AddOnce(Flash)` glow pulse).
+    hp_flash: Option<f64>,
+    /// `game.events` consumed so far (miss / hit detection).
+    hp_events_done: usize,
+    /// Previous frame time (dt for the damps, backwards-seek detection).
+    hp_last_t: f64,
     classic_score: bool,
     /// UR bar (`BarHitErrorMeter` port): time of the first timed hit (starts
     /// the axis growth / marker / arrow appear animations).
@@ -247,17 +289,23 @@ impl HudState {
     pub fn new() -> HudState {
         HudState {
             score: Rolling::new(),
-            acc: Rolling::new(),
+            acc: Rolling::with_initial(100.0),
             pp: Rolling::new(),
             pp_display: true,
-            combo_display: 0.0,
+            combo_roll: Rolling::new(),
             combo_scale_anim: None,
             combo_scale_now: 1.0,
             last_combo: 0,
             last_combo_time: f64::NEG_INFINITY,
-            was_miss: false,
-            health_flash: None,
-            last_health: 1.0,
+            combo_flash: None,
+            combo_events_done: 0,
+            hp_bar_value: 0.0,
+            hp_glow_value: 0.0,
+            hp_alpha: 0.0,
+            hp_miss: None,
+            hp_flash: None,
+            hp_events_done: 0,
+            hp_last_t: f64::NEG_INFINITY,
             classic_score: false,
             ur_first_t: None,
             ur_ema: 0.0,
@@ -341,20 +389,23 @@ impl HudState {
             draw_wedge(list, m, [-50.0, 15.0]);
             draw_wedge(list, m, [-50.0 + 4.0, 15.0 + 5.0]);
 
-            // Score digits right edge at virtual (250, 55): centre y = 55 + h/2.
-            let cd = CounterDraw { atlas: assets.atlas, digit_h: 36.0 * m.virt };
-            // Lazer aligns the glyph BOX right edge at virtual x=250
-            // (`score.Position = (components_x_offset + 200, ...)` with Origin
-            // TopRight); the digit textures carry a ~32/240 right margin, so
-            // the visible ink edge reads ~6 units left of it. Nudge the whole
-            // assembly (wireframes included) right by that margin so the ink
-            // right edge lands on 250.
+            let cd = CounterDraw { atlas: assets.atlas, digit_h: COUNTER_INK * m.virt };
+            // `score.Position = (components_x_offset + 200, wedge.Y + 30)` with
+            // Origin TopRight: the glyph BOX top-left sits at (250, 50), box
+            // 30 units tall -> centre 65. The digit ink carries a 31/240 side
+            // margin, so the assembly is nudged right by it to land the INK
+            // right edge on 250.
             let right = m.virt([250.0, 0.0])[0] + 32.0 * cd.k();
-            let cy = m.virt([0.0, 55.0 + 20.0])[1];
-            let score_text = format!("{}", self.score.display.round() as i64);
-            // Wireframe background: fixed digit count.
-            let wire_digits = (game.final_score.max(game.final_classic_score)).to_string().len().max(8);
-            draw_wireframe_run(list, assets.atlas, right, cy, wire_digits, m.virt);
+            let cy = m.virt([0.0, 50.0 + COUNTER_BOX * 0.5])[1];
+            // `FormatCount` renders through `formatString` ("000000"
+            // standardised / "00000000" classic): zero-padded to the digit
+            // count, which also feeds the wireframe template
+            // (`updateWireframe`: max of the required digits and the
+            // displayed value's own digit count).
+            let digits = if self.classic_score { 8 } else { 6 };
+            let score_text = format!("{:0width$}", self.score.display.round() as i64, width = digits);
+            let wire_digits = score_text.len();
+            draw_wireframe_run(list, assets.atlas, right, cy, wire_digits, cd.digit_h, m.virt);
             cd.draw_right(list, &score_text, right, cy, 1.0, Colour::WHITE, Blend::Alpha);
         }
 
@@ -367,15 +418,12 @@ impl HudState {
         if legacy_acc {
             self.draw_legacy_accuracy(assets, list, m, accuracy, t);
         } else {
-            let acc_cd = CounterDraw { atlas: assets.atlas, digit_h: 36.0 * m.virt };
+            let acc_cd = CounterDraw { atlas: assets.atlas, digit_h: COUNTER_INK * m.virt };
             // `accuracy.Position = (-20, 20)` with Anchor/Origin TopRight:
             // the run's right edge sits 20 local units left of the canvas's
             // right edge (`canvas_w = screen_w / virt` units).
             let acc_right = m.screen_w - 20.0 * m.virt;
             let acc_top = m.virt([0.0, 20.0])[1];
-            // Component-local margins (fraction margin-top 4) scale with the
-            // digit calibration (36 local units = digit_h).
-            let unit = acc_cd.digit_h / 36.0;
 
             let acc_val = self.acc.display;
             let whole = acc_val.trunc();
@@ -384,7 +432,9 @@ impl HudState {
             let frac_s = format!(".{:02}", frac as i64);
 
             // Widths (texture-slot based), then place left-to-right ending at
-            // acc_right.
+            // acc_right. The fraction part keeps its component margin
+            // (fraction margin-top 4, "+4 to account for the extra spaces
+            // above the digits").
             let w_pct = acc_cd.run_width("%", 1.0);
             let w_frac = acc_cd.run_width(&frac_s, 0.5);
 
@@ -393,7 +443,7 @@ impl HudState {
             let whole_right = frac_right - w_frac;
 
             acc_cd.draw_top(list, "%", pct_right, acc_top, 1.0, Colour::WHITE, Blend::Alpha);
-            acc_cd.draw_top(list, &frac_s, frac_right, acc_top + 4.0 * unit, 0.5, Colour::WHITE, Blend::Alpha);
+            acc_cd.draw_top(list, &frac_s, frac_right, acc_top + 4.0 * m.virt, 0.5, Colour::WHITE, Blend::Alpha);
             acc_cd.draw_top(list, &whole_s, whole_right, acc_top, 1.0, Colour::WHITE, Blend::Alpha);
         }
 
@@ -409,19 +459,18 @@ impl HudState {
             self.pp.set(pp.round(), t);
             self.pp.update(t);
 
-            let cd = CounterDraw { atlas: assets.atlas, digit_h: 22.0 * m.virt };
+            // `new ArgonPerformancePointsCounter { Scale = new Vector2(0.8f) }`:
+            // the whole counter renders at 0.8x the base counter size.
+            let cd = CounterDraw { atlas: assets.atlas, digit_h: COUNTER_INK * 0.8 * m.virt };
             // Below the accuracy counter: (accuracy.X, accuracy.Y +
-            // accuracy.DrawHeight + 10) with TopRight anchors. Placement
-            // follows whichever accuracy counter was actually DRAWN
-            // (`legacy_acc`), not the skin type - a legacy skin without
-            // score digits falls back to the argon accuracy, and the
-            // legacy run heights would still be 0.
+            // accuracy.DrawHeight + 10) with TopRight anchors. ...
             let (right, top) = if legacy_acc {
                 (m.screen_w - 17.0 * v, m.virt([0.0, self.l_score_h + 9.0 + self.l_acc_h + 10.0])[1])
             } else {
                 // `performancePoints.Position = accuracy.X` (TopRight): the
-                // same right edge as the accuracy counter.
-                (m.screen_w - 20.0 * m.virt, m.virt([0.0, 20.0 + 36.0 + 10.0])[1])
+                // same right edge as the accuracy counter. The accuracy's
+                // DrawHeight is its glyph box (30 units).
+                (m.screen_w - 20.0 * v, m.virt([0.0, 20.0 + COUNTER_BOX + 10.0])[1])
             };
             let text = format!("{}", self.pp.display.round() as i64);
             // No wireframe background behind the PP digits (user
@@ -450,49 +499,69 @@ impl HudState {
         // --- Combo counter (bottom-left, scale 1.3) --------------------------------
         // ArgonComboCounter: newScale = clamp(current * (increase ? 1.1 :
         // 0.8), 0.6, 1.4), then ScaleTo(1, 500/2000, OutQuint). `current` is
-        // the LIVE scale at the moment of the change.
-        if legacy_combo {
-            self.l_combo.update(combo, t);
-            self.draw_legacy_combo(assets, list, m, t);
-        } else if combo != self.last_combo {
-            let increase = combo > self.last_combo;
-            let was_miss = self.last_combo > 1 && combo == 0;
-            let new_scale = (self.combo_scale_now * if increase { 1.1 } else { 0.8 }).clamp(0.6, 1.4);
-            let dur = if was_miss { 2000.0 } else { 500.0 };
-            self.combo_scale_anim = Some((t, t + dur, new_scale, 1.0, Easing::OutQuint));
-            self.was_miss = was_miss;
-            self.last_combo = combo;
-            self.last_combo_time = t;
+        // the LIVE scale at the moment of the change. The state machine
+        // consumes the combo timeline EVENT BY EVENT (stamped at each
+        // judgement time) - per-frame final values would skip the
+        // `combo == 0` tick when the next +1 shares its timestamp.
+        let ev_n = game.score_events.partition_point(|ev| ev.time <= t);
+        if self.combo_events_done > ev_n {
+            self.combo_events_done = ev_n;
         }
-        if !legacy_combo {
+        for ev in &game.score_events[self.combo_events_done..ev_n] {
+            if legacy_combo {
+                self.l_combo.update(ev.combo, ev.time);
+            } else if ev.combo != self.last_combo {
+                let increase = ev.combo > self.last_combo;
+                let is_miss = self.last_combo > 1 && ev.combo == 0;
+                let new_scale = (self.combo_scale_now * if increase { 1.1 } else { 0.8 }).clamp(0.6, 1.4);
+                let dur = if is_miss { 2000.0 } else { 500.0 };
+                self.combo_scale_anim = Some((ev.time, ev.time + dur, new_scale, 1.0, Easing::OutQuint));
+                if is_miss {
+                    self.combo_flash = Some(ev.time);
+                }
+                self.combo_roll.set(ev.combo as f64, ev.time);
+                self.last_combo = ev.combo;
+                self.last_combo_time = ev.time;
+            }
+        }
+        self.combo_events_done = ev_n;
+        if legacy_combo {
+            self.draw_legacy_combo(assets, list, m, t);
+        } else {
             let combo_scale = match self.combo_scale_anim {
                 Some((a, b, from, to, e)) => value_at(t, a, b, from, to, e),
                 None => 1.0,
             };
             self.combo_scale_now = combo_scale;
-            // Combo number roll: instant is fine (lazer rolls 250ms too).
-            self.combo_display = lerp_to(self.combo_display, combo as f64, 0.3);
+            // Displayed-count roll (`RollingCounter<int>`:
+            // `TransformTo(DisplayedCount, value, 250, OutQuad)`).
+            self.combo_roll.set(combo as f64, t);
+            self.combo_roll.update(t);
 
-            if combo > 0 {
-                let combo_cd = CounterDraw { atlas: assets.atlas, digit_h: 25.0 * 1.3 * m.virt };
-                let base = m.virt([36.0, 768.0 - 66.0]);
-                // ArgonSkin.cs: combo 组件 BottomLeft + Position(36, -66),数字贴
-                // 组件盒底(240 贴图盒的 ink 底边距 ~31/240,scale 1.3 后数字 ink
-                // 底 ≈ -66 线上方 ~7 单位) —— 即与 key overlay 数字同一水平线。
-                let cy = base[1] - 18.0 * 1.3 * m.virt;
-                let text = format!("{}x", self.combo_display.round() as i64);
-                let flash = self.was_miss && t < self.last_combo_time + 800.0;
-                let col = if flash {
-                    let f = value_at(t, self.last_combo_time, self.last_combo_time + 800.0, 1.0, 0.0, Easing::OutQuint) as f32;
+            // Visible from the start (lazer draws "0x" before the first
+            // object; nothing hides the counter at 0). Component Scale 1.3
+            // (ArgonSkin), BottomLeft anchor + Position (36, -66): the text
+            // BOX bottom sits on the -66 line, so the box centre is half a
+            // 30-unit box (scaled) above it.
+            let combo_cd = CounterDraw { atlas: assets.atlas, digit_h: COUNTER_INK * 1.3 * m.virt };
+            let base = m.virt([36.0, 768.0 - 66.0]);
+            let cy = base[1] - COUNTER_BOX * 1.3 * 0.5 * m.virt;
+            let text = format!("{}x", self.combo_roll.display.round() as i64);
+            // `FlashColour(Color4.Red, duration, OutQuint)` on a miss:
+            // instant red, easing back to white over the SAME duration as
+            // the scale ease (2000ms). The transform survives later combo
+            // increases, hence the independent timestamp.
+            let col = match self.combo_flash {
+                Some(ft) if t < ft + 2000.0 => {
+                    let f = value_at(t, ft, ft + 2000.0, 1.0, 0.0, Easing::OutQuint) as f32;
                     Colour::lerp(Colour::WHITE, Colour::from_hex(0xFF0000), f)
-                } else {
-                    Colour::WHITE
-                };
-                // Left-anchored: measure with the same slot widths draw_right
-                // places glyphs with.
-                let width = combo_cd.run_width(&text, combo_scale as f32);
-                combo_cd.draw_right(list, &text, base[0] + width, cy, combo_scale as f32, col, Blend::Alpha);
-            }
+                }
+                _ => Colour::WHITE,
+            };
+            // Left-anchored: measure with the same slot widths draw_right
+            // places glyphs with.
+            let width = combo_cd.run_width(&text, combo_scale as f32);
+            combo_cd.draw_right(list, &text, base[0] + width, cy, combo_scale as f32, col, Blend::Alpha);
         }
 
         // --- Song progress circle (`LegacySongProgress`) ------------------------
@@ -584,11 +653,7 @@ impl HudState {
         if legacy_health {
             self.draw_legacy_health(assets, list, m, health, t);
         } else {
-            if health < self.last_health - 1e-6 {
-                self.health_flash = Some(t);
-            }
-            self.last_health = health;
-            draw_health(list, m, health, t, self.health_flash);
+            self.draw_argon_health(game, list, m, health, t);
         }
 
 
@@ -909,22 +974,20 @@ impl HudState {
     }
 }
 
-fn lerp_to(current: f64, target: f64, factor: f64) -> f64 {
-    current + (target - current) * factor
-}
-
 /// The wireframe segments behind the score digits, laid out with the same
 /// texture-slot widths as the digits themselves (the wireframe texture
-/// shares the digits' 240-unit box, so slots line up exactly).
+/// shares the digits' 240-unit box, so slots line up exactly). `digit_h`
+/// is the ink height in screen px of the counter being decorated.
 fn draw_wireframe_run(
     list: &mut DrawList,
     atlas: &crate::draw::Atlas,
     right: f32,
     cy: f32,
     digits: usize,
+    digit_h: f32,
     virt: f32,
 ) {
-    let cd = CounterDraw { atlas, digit_h: 36.0 * virt };
+    let cd = CounterDraw { atlas, digit_h };
     let top_y = cy - cd.k() * TEX_BOX * 0.5;
     let slot = cd.slot_w('5', 1.0);
     let mut pen = right - slot * digits as f32;
@@ -954,30 +1017,181 @@ fn draw_wedge(list: &mut DrawList, m: &Mapper, top_left_virtual: [f32; 2]) {
     list.quad_gradient(&pts, [top, top, bottom, bottom], Blend::Alpha);
 }
 
-fn draw_health(list: &mut DrawList, m: &Mapper, health: f64, t: f64, flash: Option<f64>) {
-    // Position: TopLeft (50, 20), width 300, bar height 30 (virtual).
-    let left = m.virt([50.0, 20.0 + 10.0]);
-    let right = m.virt([50.0 + 300.0, 20.0 + 10.0]);
-    let radius = 10.0 * m.virt;
+/// `ArgonHealthDisplay` port. Geometry per lazer's default layout: the
+/// container sits at (50, 20), 300 wide, `BarHeight` 30 + 2·MAIN_PATH_RADIUS
+/// padding → 50-tall content with the 20-unit path vertically centred
+/// (centre y = 45 local); a 45x3 `BoxElement` healthLine sits above-left of
+/// the bar start.
+///
+/// Behaviour ports:
+/// - `HealthDisplay.startInitialAnimation`: `Current` ramps 0→1 in twenty
+///   0.05 steps 150ms apart (linear, ~3000ms), Flashing each step; ANY real
+///   health loss cancels it (`FinishInitialAnimation`), letting the bar
+///   ease to the actual health.
+/// - `ArgonHealthDisplay.Update`: the displayed bar and glow values chase
+///   `Current` with `DampContinuously` (half-life 50ms); both bars' alpha
+///   (half-life 40ms) fades in from 0 as the value leaves 0.
+/// - `onNewJudgement` / `triggerMissDisplay`: a miss (negative increase)
+///   freezes the glow at its current value for 500ms — the lost-health
+///   segment [health, glow] turns red (255,147,147 over 100ms then
+///   (255,93,93) over the next 400ms) — then the glow releases to the
+///   current health over 300ms OutQuint while the colours restore (300ms
+///   In). Recovery past the glow value ends the display immediately.
+/// - `onNewJudgement` / `Flash` (successful hits): the glow colour pulses
+///   white for 30ms, easing back over 300ms.
+impl HudState {
+    fn draw_argon_health(&mut self, game: &GameData, list: &mut DrawList, m: &Mapper, health: f64, t: f64) {
+        // Frame time for the damps; a backwards seek (live preview) snaps
+        // the animated state instead of playing it out.
+        let dt = if t > self.hp_last_t { (t - self.hp_last_t).min(100.0) } else { 0.0 };
+        if t < self.hp_last_t {
+            self.hp_miss = None;
+            self.hp_events_done = game.events.partition_point(|e| e.time <= t);
+        }
+        self.hp_last_t = t;
 
-    // Glow bar (additive, slightly ahead of health).
-    let glow_col = Colour::rgba_bytes(HEALTH_GLOW[0], HEALTH_GLOW[1], HEALTH_GLOW[2], 110);
-    let glow_extent = (health + 0.02).clamp(0.0, 1.0) as f32;
-    let glow_right = [left[0] + (right[0] - left[0]) * glow_extent, left[1]];
-    list.capsule(left, glow_right, radius * 1.6, glow_col.opacity(0.35), Blend::Additive);
+        // Consume miss judgements (`HealthProcessor.NewJudgement` with a
+        // negative increase arms `pendingMissAnimation`).
+        let n = game.miss_times.partition_point(|&mt| mt <= t);
+        if self.hp_events_done > n {
+            self.hp_events_done = n;
+        }
+        for &mt in &game.miss_times[self.hp_events_done..n] {
+            // Re-triggering keeps the glow frozen where it is
+            // (`resetMissBarDelegate?.Cancel()` + re-schedule).
+            let frozen = self.hp_miss.map_or(self.hp_glow_value, |(_, g)| g);
+            self.hp_miss = Some((mt, frozen));
+        }
+        self.hp_events_done = n;
 
-    // Main bar (white, additive).
-    let main_right = [left[0] + (right[0] - left[0]) * health as f32, left[1]];
-    list.capsule(left, main_right, radius, Colour::WHITE.opacity(0.9), Blend::Additive);
-    list.capsule(left, main_right, radius * 0.5, Colour::WHITE, Blend::Additive);
+        // Successful hits pulse the glow (`Scheduler.AddOnce(Flash)`):
+        // the latest displayed hit at/before t, still inside its 330ms
+        // (30 + 300) pulse window.
+        let hit_n = game.events.partition_point(|e| e.time <= t);
+        for e in game.events[..hit_n].iter().rev() {
+            if osu_replay_judge::score::hit_result_ext::is_hit(e.result) {
+                if t - e.time < 330.0 {
+                    self.hp_flash = Some(e.time);
+                }
+                break;
+            }
+        }
 
-    // Damage flash: red tint fading out.
-    if let Some(ft) = flash {
-        let x = t - ft;
-        if x < 1100.0 {
-            let a = value_at(x, 0.0, 1100.0, 1.0, 0.0, Easing::OutQuint) as f32;
-            let red = Colour::from_hex(0xFF6060).opacity(a * 0.6);
-            list.capsule(left, right, radius, red, Blend::Additive);
+        // Opening fill (`startInitialAnimation`): linear 0→1 over 3000ms
+        // (twenty +0.05 tweens of 150ms each); cancelled the moment the
+        // real health leaves full (`health.Value != initialHealthValue`).
+        let init_value = (t / 3000.0).clamp(0.0, 1.0);
+        let init_active = health >= 1.0 - 1e-9 && init_value < 1.0;
+        let current = if init_active { init_value } else { health };
+
+        // `Interpolation.DampContinuously(value, Current, 50, Elapsed)`.
+        let damp = |prev: f64, target: f64, half_time: f64| -> f64 {
+            if dt <= 0.0 {
+                return prev;
+            }
+            prev + (target - prev) * (1.0 - 0.5f64.powf(dt / half_time))
+        };
+        self.hp_bar_value = damp(self.hp_bar_value, current, 50.0);
+        if self.hp_miss.is_none() {
+            self.hp_glow_value = damp(self.hp_glow_value, current, 50.0);
+        }
+        // Bar alphas damp toward (value > 0 ? 1 : 0), half-life 40.
+        self.hp_alpha = damp(self.hp_alpha, if current > 0.0 { 1.0 } else { 0.0 }, 40.0);
+
+        // Miss display lifecycle (`triggerMissDisplay`'s Delay(500)):
+        // recovery past the frozen glow ends it immediately
+        // (`finishMissDisplay` on HealthChanged); otherwise the glow
+        // releases to the current health over 300ms OutQuint.
+        let mut miss_age = f64::INFINITY;
+        if let Some((mt, frozen)) = self.hp_miss {
+            if health >= frozen - 1e-6 {
+                self.hp_miss = None;
+            } else {
+                miss_age = t - mt;
+                if miss_age >= 500.0 {
+                    self.hp_glow_value = value_at(t, mt + 500.0, mt + 800.0, frozen, health, Easing::OutQuint);
+                }
+                if miss_age >= 800.0 {
+                    self.hp_miss = None;
+                }
+            }
+        }
+
+        // Lost-segment colour (`glowBar.BarColour` transforms): white →
+        // (255,147,147) over 100ms → (255,93,93); the finish at +500ms
+        // restores it over 300ms Easing.In.
+        let seg_col = if miss_age.is_finite() {
+            let step1 = value_at(miss_age, 0.0, 100.0, 0.0, 1.0, Easing::OutQuint) as f32;
+            let step2 = value_at(miss_age, 100.0, 500.0, 0.0, 1.0, Easing::OutQuint) as f32;
+            let restore = value_at(miss_age, 500.0, 800.0, 0.0, 1.0, Easing::In) as f32;
+            let red = if miss_age < 100.0 {
+                Colour::lerp(Colour::WHITE, Colour::from_hex(0xFF9393), step1)
+            } else {
+                Colour::lerp(Colour::from_hex(0xFF9393), Colour::from_hex(0xFF5D5D), step2)
+            };
+            Colour::lerp(red, Colour::WHITE, restore)
+        } else {
+            Colour::WHITE
+        };
+
+        // Glow flash on hits (`Flash`: GlowColour → white 30ms, back over
+        // 300ms OutQuint) - a white brightening of the trailing segment.
+        let flash_f = match self.hp_flash {
+            Some(ft) if t >= ft => {
+                let x = t - ft;
+                if x < 30.0 {
+                    1.0
+                } else if x < 330.0 {
+                    1.0 - value_at(x, 30.0, 330.0, 0.0, 1.0, Easing::OutQuint) as f32
+                } else {
+                    0.0
+                }
+            }
+            _ => 0.0,
+        };
+
+        let v = m.virt;
+        let alpha = self.hp_alpha as f32;
+        if alpha <= 0.003 {
+            return;
+        }
+
+        // Path centre: `health.Y + MAIN_PATH_RADIUS` = 20 + 10. Both bars'
+        // paths share this centreline: the glowBar container pads outward by
+        // MAIN_PATH_RADIUS - glow_path_radius = -30, and its radius-40 path
+        // then centres at content top + (-30 + 40) = +10 as well, so the
+        // glow wraps the main bar exactly. The healthLine's Y formula
+        // (below) lands on this same line.
+        let left = m.virt([50.0, 20.0 + 10.0]);
+        let right_x = m.virt([350.0, 20.0 + 10.0])[0];
+        let radius = 10.0 * v;
+
+        // healthLine (`BoxElement` 45x3, Origin CentreLeft, Y =
+        // health.Y + MAIN_PATH_RADIUS): the small white dash up-left of
+        // the bar start.
+        let hl = m.virt([0.0, 30.0]);
+        list.capsule([hl[0] + 1.5 * v, hl[1]], [hl[0] + 45.0 * v - 1.5 * v, hl[1]], 1.5 * v, Colour::WHITE.opacity(alpha), Blend::Alpha);
+
+        let hx = left[0] + (right_x - left[0]) * self.hp_bar_value.clamp(0.0, 1.0) as f32;
+        let gx = left[0] + (right_x - left[0]) * self.hp_glow_value.clamp(0.0, 1.0) as f32;
+
+        // Glow bar (additive, behind the fill): spans [health, glow]. A
+        // thin white trail while draining, the red lost-health area while
+        // the miss display holds.
+        if gx > hx + 0.5 {
+            let base = if miss_age.is_finite() {
+                seg_col
+            } else {
+                Colour::rgba_bytes(HEALTH_GLOW[0], HEALTH_GLOW[1], HEALTH_GLOW[2], 110)
+            };
+            let col = Colour::lerp(base, Colour::WHITE, flash_f * 0.8);
+            list.capsule([hx, left[1]], [gx, left[1]], radius * 1.6, col.opacity(alpha * 0.5), Blend::Additive);
+        }
+
+        // Main bar (white, additive).
+        if hx > left[0] + 0.5 {
+            list.capsule(left, [hx, left[1]], radius, Colour::WHITE.opacity(0.9 * alpha), Blend::Additive);
+            list.capsule(left, [hx, left[1]], radius * 0.5, Colour::WHITE.opacity(alpha), Blend::Additive);
         }
     }
 }
