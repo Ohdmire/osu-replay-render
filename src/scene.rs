@@ -143,13 +143,17 @@ pub struct Mapper {
     /// Playfield unit -> screen px.
     pub pf: f32,
     pub centre: [f32; 2],
-    /// Virtual 1024x768 unit -> screen px.
+    /// Virtual 1024x768 unit -> screen px (`OsuGameBase`'s root
+    /// `DrawSizePreservingFillContainer`: TargetDrawSize 1024x768, strategy
+    /// Minimum -> uniform scale `min(W/1024, H/768)`; the whole UI - HUD
+    /// included - lives in a local canvas of (W/s, H/s) units, i.e.
+    /// 1365.33x768 at 16:9).
     pub virt: f32,
 }
 
 impl Mapper {
     pub fn new(width: u32, height: u32) -> Mapper {
-        let virt = height as f32 / 768.0;
+        let virt = (width as f32 / 1024.0).min(height as f32 / 768.0);
         let pf = virt * PLAYFIELD_SCALE;
         let cx = width as f32 / 2.0;
         let cy = height as f32 / 2.0 + PLAYFIELD_SHIFT * virt;
@@ -163,13 +167,14 @@ impl Mapper {
         ]
     }
 
-    /// HUD coordinates: lazer's 1024x768 virtual space is STRETCHED to the
-    /// full screen (only the playfield keeps 4:3, via its own container).
+    /// HUD coordinates: the uniform local units of the root
+    /// `DrawSizePreservingFillContainer` (1024x768 fitted by the Minimum
+    /// strategy - wider windows grow the canvas to the right, they do not
+    /// stretch it). Right-anchored positions must go through
+    /// `screen_w - offset * virt` instead: the canvas width in units is
+    /// `screen_w / virt` (1365.33 at 16:9), not 1024.
     pub fn virt(&self, v: [f32; 2]) -> [f32; 2] {
-        [
-            v[0] / 1024.0 * self.screen_w,
-            v[1] / 768.0 * self.screen_h,
-        ]
+        [v[0] * self.virt, v[1] * self.virt]
     }
 
     /// Legacy spinner coordinates: stable's 640x480 window space. Lazer
@@ -214,6 +219,8 @@ struct SliderAnim {
     fc_alpha: f64,
     fc_scale_anim: Option<(f64, f64, f64, f64, Easing)>,
     fc_alpha_anim: Option<(f64, f64, f64, f64, Easing)>,
+    /// The tail judgement has been consumed (the exit animation fired).
+    fc_tail_done: bool,
     /// Per-repeat arrow rotation, indexed by repeat index:
     /// (has rotation been set yet, smoothed Arrow.Rotation in degrees).
     /// `DrawableSliderRepeat.UpdateSnakingPosition` keeps a live rotation
@@ -234,6 +241,7 @@ impl SliderAnim {
             fc_alpha: 0.0,
             fc_scale_anim: None,
             fc_alpha_anim: None,
+            fc_tail_done: false,
             repeat_rots: Vec::new(),
         }
     }
@@ -1047,15 +1055,29 @@ impl SceneState {
                 // in oversized and shrinking to size).
                 anim.fc_scale = 1.0;
                 anim.fc_alpha = 0.0;
+                anim.fc_tail_done = false;
                 anim.fc_scale_anim = Some((t, t + remaining.min(180.0), 1.0, 2.0, Easing::Out));
                 anim.fc_alpha_anim = Some((t, t + remaining.min(60.0), 0.0, 1.0, Easing::Linear));
-            } else if !tracking && anim.was_tracking {
-                if slider_ended {
-                    anim.fc_scale_anim = Some((t, t + 200.0, anim.fc_scale, 1.6, Easing::Out));
-                    anim.fc_alpha_anim = Some((t, t + 200.0, anim.fc_alpha, 0.0, Easing::In));
-                } else {
+            }
+            // The exit fires at the slider end, and the slider's OWN result
+            // picks the animation (`FollowCircle.updateStateTransforms` in
+            // lazer uses the tail's ArmedState: Hit -> OnSliderEnd, Miss ->
+            // OnSliderBreak). The classic timeline has no separate tail
+            // judgement - the tail nested entry stays unjudged and the
+            // whole-slider result lands on the body as IgnoreHit/IgnoreMiss
+            // (completed/released-early) or Miss (dropped entirely) - so a
+            // real Miss picks OnSliderBreak and anything else
+            // OnSliderEnd (settle 1.6x Out / 200ms In vs flash 4x / 100ms).
+            if slider_ended && !anim.fc_tail_done {
+                anim.fc_tail_done = true;
+                let body_miss =
+                    matches!(obj.body_judged, Some((_, r)) if !hit_result_ext::is_hit(r));
+                if body_miss {
                     anim.fc_scale_anim = Some((t, t + 100.0, anim.fc_scale, 4.0, Easing::Linear));
                     anim.fc_alpha_anim = Some((t, t + 100.0, anim.fc_alpha, 0.0, Easing::Linear));
+                } else {
+                    anim.fc_scale_anim = Some((t, t + 200.0, anim.fc_scale, 1.6, Easing::Out));
+                    anim.fc_alpha_anim = Some((t, t + 200.0, anim.fc_alpha, 0.0, Easing::In));
                 }
             }
             if let Some((a, b, from, to, e)) = anim.fc_scale_anim {
@@ -1340,7 +1362,16 @@ impl SceneState {
             let mut ball_alpha =
                 value_at(t, obj.start_time, obj.start_time + 200.0, 0.0, 1.0, Easing::OutQuint) * alpha;
             if body_judged {
-                ball_alpha *= value_at(t, bt, bt + 50.0, 1.0, 0.0, Easing::OutQuint);
+                // The end fade: ArgonSliderBall/DefaultSliderBall pile an
+                // extra FadeOut(duration/4 = 50ms, OutQuint); the legacy
+                // ball has no such override - it just rides the slider's
+                // own fade, and `LegacySliderBall.updateStateTransforms`
+                // hides it INSTANTLY at the tail judgement.
+                if legacy.is_some() {
+                    ball_alpha = 0.0;
+                } else {
+                    ball_alpha *= value_at(t, bt, bt + 50.0, 1.0, 0.0, Easing::OutQuint);
+                }
             }
             let ball_pos_screen = m.pf(obj.slider_ball_at(completion));
             let ball_r = OUTER_GRADIENT_SIZE * 0.5 * obj.scale * m.pf;
