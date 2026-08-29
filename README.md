@@ -33,6 +33,7 @@ osu_replay_render <beatmap.osu> [replay.osr] [options]
 | `--encoder <auto\|x264\|x265\|nvenc>` | 视频编码器：默认 `auto`（探测 NVENC 可用则用之，否则回退 x264）；NVENC 硬件编码（bgr0 直喂 + p5/hq/vbr/cq，**端到端约比 x264 快 1.7×、比 x265 快 3.2×**）；libx264 / libx265（preset medium + crf） |
 | `--quality <n>` | crf（软件）/ cq（nvenc），默认 18 |
 | `--no-guides` | 关闭 UR 条的窗口引导线（判定色色轴），默认开启渲染 |
+| `--no-pp` | 关闭实时 PP 计数器（lazer 的 legacy HUD 本没有 PP，渲染器默认给所有皮肤额外显示）；库嵌入方用 `HudState.pp_display` |
 | `--audio [file]` | 输出混入 BGM（AAC 192k）：带路径用指定文件；不带值自动取谱面 `[General] AudioFilename`（相对谱面目录）。音频位置 = 回放时间 − 偏移；负的起始位置用前置静音（adelay）补齐（复刻 lazer 负时间不播歌的行为）。DT/HT 自动 `atempo` 变速**不变调**（时长随 rate 压缩、音调保持原曲,刻意偏离游戏内变调行为）;NC 保持游戏内 `asetrate` 变速**变调**（nightcore 的升调是其本体,音效仍原速） |
 | `--audio-offset <ms>` | BGM 对齐偏移，默认 **0**；需要时手动传入（内部按 lazer 语义 ×rate） |
 | `--bgm-volume <0..1>` | BGM 增益,默认 **0.6**(osu! 默认 `VolumeMusic`,`OsuGame.GetFrameworkConfigDefaults` 覆盖 framework 的 1.0) |

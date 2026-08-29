@@ -186,6 +186,9 @@ pub struct HudState {
     acc: Rolling,
     /// Live PP counter (`ArgonPerformancePointsCounter`: int, 250ms roll).
     pp: Rolling,
+    /// Whether the live PP counter renders (lazer's legacy-skin HUD ships
+    /// no PP counter; the renderer shows it for every skin by default).
+    pub pp_display: bool,
     combo_display: f64,
     combo_scale_anim: Option<(f64, f64, f64, f64, Easing)>,
     /// Live combo scale, advanced every frame.
@@ -234,8 +237,9 @@ pub struct HudState {
     /// Digit run height of the last legacy accuracy draw - the PP counter
     /// hangs below it.
     l_acc_h: f32,
-    /// Digit run width of the last legacy accuracy draw - the legacy song
-    /// progress circle sits left of it (`LegacySkin`'s MainHUD callback).
+    /// Scaled quad width of the last legacy accuracy draw (framework
+    /// `TextBuilder.Bounds` semantics) - the song-progress circle anchors
+    /// to it (`LegacySkin`'s MainHUD callback).
     l_acc_w: f32,
 }
 
@@ -245,6 +249,7 @@ impl HudState {
             score: Rolling::new(),
             acc: Rolling::new(),
             pp: Rolling::new(),
+            pp_display: true,
             combo_display: 0.0,
             combo_scale_anim: None,
             combo_scale_now: 1.0,
@@ -363,7 +368,10 @@ impl HudState {
             self.draw_legacy_accuracy(assets, list, m, accuracy, t);
         } else {
             let acc_cd = CounterDraw { atlas: assets.atlas, digit_h: 36.0 * m.virt };
-            let acc_right = m.virt([1024.0 - 20.0, 0.0])[0];
+            // `accuracy.Position = (-20, 20)` with Anchor/Origin TopRight:
+            // the run's right edge sits 20 local units left of the canvas's
+            // right edge (`canvas_w = screen_w / virt` units).
+            let acc_right = m.screen_w - 20.0 * m.virt;
             let acc_top = m.virt([0.0, 20.0])[1];
             // Component-local margins (fraction margin-top 4) scale with the
             // digit calibration (36 local units = digit_h).
@@ -389,84 +397,13 @@ impl HudState {
             acc_cd.draw_top(list, &whole_s, whole_right, acc_top, 1.0, Colour::WHITE, Blend::Alpha);
         }
 
-        // --- Song progress circle (`LegacySongProgress`) ------------------------
-        // A 33-unit circle left of the accuracy counter (right edge 18 units
-        // left of the accuracy run, vertically centred on it): a white ring
-        // (2-unit border), a white 60%-alpha progress arc sweeping clockwise
-        // from the top, and a 4-unit centre dot. Intro (before the first
-        // object): green (199,255,47), mirrored, counting DOWN from clock
-        // start; gameplay: progress through [first object start, last object
-        // end], time clamped to the last hit (`SongProgress.Update`).
-        if legacy_acc && !game.autoplay {
-            let first = game.objects.first().map(|o| o.start_time).unwrap_or(0.0);
-            let last = game.objects.last().map(|o| o.end_time).unwrap_or(0.0);
-            let (progress, is_intro) = if t < first {
-                let intro_start = 0.0f64.max(first - 2000.0);
-                (((t - intro_start) / (first - intro_start)).clamp(0.0, 1.0), true)
-            } else if last > first {
-                (((t.min(last) - first) / (last - first)).clamp(0.0, 1.0), false)
-            } else {
-                (0.0, false)
-            };
-
-            let v = m.virt;
-            let cy = m.virt([0.0, self.l_score_h + 9.0 + self.l_acc_h * 0.5])[1];
-            let cx_right = m.screen_w - (17.0 + self.l_acc_w + 18.0) * v;
-            let r_ring = 16.5 * v;  // 33x33 container, border 2 inward
-            let r_dot = 2.0 * v;    // 4-unit centre dot
-            let r_arc = 13.0 * v;   // CircularProgress inside the 0.92 child
-
-            // Static white ring (border), centre dot.
-            let steps = 48;
-            for i in 0..steps {
-                let a0 = (i as f32 / steps as f32) * std::f32::consts::TAU;
-                let a1 = ((i + 1) as f32 / steps as f32) * std::f32::consts::TAU;
-                let (p0, p1) = (
-                    [cx_right - r_ring + r_ring * a0.cos(), cy + r_ring * a0.sin()],
-                    [cx_right - r_ring + r_ring * a1.cos(), cy + r_ring * a1.sin()],
-                );
-                list.capsule(p0, p1, 1.0 * v, Colour::WHITE, Blend::Alpha);
-            }
-            list.disc([cx_right - r_ring, cy], r_dot, Colour::WHITE, Colour::WHITE, Blend::Alpha);
-
-            // Progress arc: gameplay white 60% sweeping clockwise from the
-            // top; intro green 60% mirrored, showing the countdown (1 - p).
-            let (arc_frac, colour, dir) = if is_intro {
-                (1.0 - progress, Colour::from_hex(0xC7FF2F).opacity(0.6), -1.0f32)
-            } else {
-                (progress, Colour::WHITE.opacity(0.6), 1.0f32)
-            };
-            if arc_frac > 0.003 {
-                // `CircularProgress` (sh_CircularProgressUtils.h): the arc is
-                // a FILLED PIE (innerRadius defaults to 1) sweeping from the
-                // top COUNTER-CLOCKWISE (`pixelAngle = atan(0.5 - y, 0.5 - x) - HALF_PI`,
-                // sector = pixelAngle < 2*pi*progress). dir=-1 mirrors it for
-                // the intro countdown.
-                let cx = cx_right - r_ring;
-                let steps = ((arc_frac * 72.0).ceil() as usize).max(2);
-                for i in 0..steps {
-                    let f0 = i as f32 / steps as f32;
-                    let f1 = (i + 1) as f32 / steps as f32;
-                    let a0 = (-std::f32::consts::FRAC_PI_2) + dir * f0 * std::f32::consts::TAU * arc_frac as f32;
-                    let a1 = (-std::f32::consts::FRAC_PI_2) + dir * f1 * std::f32::consts::TAU * arc_frac as f32;
-                    let pts = [
-                        [cx, cy],
-                        [cx + r_arc * a0.cos(), cy + r_arc * a0.sin()],
-                        [cx + r_arc * a1.cos(), cy + r_arc * a1.sin()],
-                        [cx, cy],
-                    ];
-                    list.quad_gradient(&pts, [colour; 4], Blend::Alpha);
-                }
-            }
-        }
-
         // --- PP counter (`ArgonPerformancePointsCounter` style) -----------------
         // Live PP off the gradual timeline, rounded to int (`Math.Round`
         // AwayFromZero) with the same 250ms roll as the other counters.
         // Shown for EVERY skin (deliberate deviation: lazer's legacy-skin
         // MainHUD container ships no PP counter) - under legacy skins it
         // hangs below the legacy accuracy run instead of the argon one.
-        if !game.pp_events.is_empty() {
+        if self.pp_display && !game.pp_events.is_empty() {
             let v = m.virt;
             let pp = crate::pp::pp_at(&game.pp_events, t);
             self.pp.set(pp.round(), t);
@@ -482,7 +419,9 @@ impl HudState {
             let (right, top) = if legacy_acc {
                 (m.screen_w - 17.0 * v, m.virt([0.0, self.l_score_h + 9.0 + self.l_acc_h + 10.0])[1])
             } else {
-                (m.virt([1024.0 - 20.0, 0.0])[0], m.virt([0.0, 20.0 + 36.0 + 10.0])[1])
+                // `performancePoints.Position = accuracy.X` (TopRight): the
+                // same right edge as the accuracy counter.
+                (m.screen_w - 20.0 * m.virt, m.virt([0.0, 20.0 + 36.0 + 10.0])[1])
             };
             let text = format!("{}", self.pp.display.round() as i64);
             // No wireframe background behind the PP digits (user
@@ -556,6 +495,90 @@ impl HudState {
             }
         }
 
+        // --- Song progress circle (`LegacySongProgress`) ------------------------
+        // Drawn BEFORE the health bar below: lazer's MainHUD container lists
+        // score/accuracy/songProgress first and LegacyHealthDisplay last "to
+        // match stable, health bars are in front of everything else for the
+        // sake of hacky full screen area health bars" - on fullscreen-art
+        // scorebars the opaque art consequently covers this circle.
+        //
+        // Position per lazer's `DefaultSkinComponentsContainer`:
+        // CentreRight-anchored TopRight at X = -(acc scaled quad width) -
+        // 18 (the acc's own 17 margin is NOT part of that chain), Y = acc
+        // quad top + acc scaled height/2. The acc width uses framework
+        // `TextBuilder.Bounds` semantics - the last glyph keeps its FULL
+        // advance (spacing only applies between glyphs). The anchor
+        // legitimately wanders as the accuracy text width changes; skins
+        // with an oversized blank glyph push it far off (FGSky's blank
+        // 1022-unit `score-percent` moves it towards mid-screen, matching
+        // lazer). A 33-unit circle: white 2-unit border INSIDE the box
+        // (framework masking border), a white 60%-alpha FILLED PIE
+        // (innerRadius 1) from a 0.92 container sweeping clockwise from
+        // the top, and a 4-unit centre dot. Intro (before the first
+        // object): green (199,255,47), mirrored, counting DOWN from clock
+        // start; gameplay: progress through [first object start, last
+        // object end], time clamped to the last hit (`SongProgress.Update`).
+        if legacy_acc && !game.autoplay {
+            let first = game.objects.first().map(|o| o.start_time).unwrap_or(0.0);
+            let last = game.objects.last().map(|o| o.end_time).unwrap_or(0.0);
+            let (progress, is_intro) = if t < first {
+                let intro_start = 0.0f64.max(first - 2000.0);
+                (((t - intro_start) / (first - intro_start)).clamp(0.0, 1.0), true)
+            } else if last > first {
+                (((t.min(last) - first) / (last - first)).clamp(0.0, 1.0), false)
+            } else {
+                (0.0, false)
+            };
+
+            let v = m.virt;
+            let cy = m.virt([0.0, self.l_score_h + 9.0 + self.l_acc_h * 0.5])[1];
+            let cx = m.screen_w - (self.l_acc_w + 18.0 + 16.5) * v;
+            let r_dot = 2.0 * v;    // 4-unit centre dot
+            let r_arc = 16.5 * 0.92 * v; // CircularProgress in the 0.92 child
+
+            // Static white ring (border): 2-unit band just inside the 33
+            // box edge (band centre radius 15.5).
+            let steps = 48;
+            for i in 0..steps {
+                let a0 = (i as f32 / steps as f32) * std::f32::consts::TAU;
+                let a1 = ((i + 1) as f32 / steps as f32) * std::f32::consts::TAU;
+                let (p0, p1) = (
+                    [cx + 15.5 * v * a0.cos(), cy + 15.5 * v * a0.sin()],
+                    [cx + 15.5 * v * a1.cos(), cy + 15.5 * v * a1.sin()],
+                );
+                list.capsule(p0, p1, 1.0 * v, Colour::WHITE, Blend::Alpha);
+            }
+            list.disc([cx, cy], r_dot, Colour::WHITE, Colour::WHITE, Blend::Alpha);
+
+            // Progress arc: gameplay white 60% sweeping clockwise from the
+            // top; intro green 60% mirrored, showing the countdown (1 - p).
+            let (arc_frac, colour, dir) = if is_intro {
+                (1.0 - progress, Colour::from_hex(0xC7FF2F).opacity(0.6), -1.0f32)
+            } else {
+                (progress, Colour::WHITE.opacity(0.6), 1.0f32)
+            };
+            if arc_frac > 0.003 {
+                // `CircularProgress` (sh_CircularProgressUtils.h): the arc is
+                // a FILLED PIE (innerRadius defaults to 1) sweeping from the
+                // top COUNTER-CLOCKWISE (`pixelAngle = atan(0.5 - y, 0.5 - x) - HALF_PI`,
+                // sector = pixelAngle < 2*pi*progress). dir=-1 mirrors it for
+                // the intro countdown.
+                let steps = ((arc_frac * 72.0).ceil() as usize).max(2);
+                for i in 0..steps {
+                    let f0 = i as f32 / steps as f32;
+                    let f1 = (i + 1) as f32 / steps as f32;
+                    let a0 = (-std::f32::consts::FRAC_PI_2) + dir * f0 * std::f32::consts::TAU * arc_frac as f32;
+                    let a1 = (-std::f32::consts::FRAC_PI_2) + dir * f1 * std::f32::consts::TAU * arc_frac as f32;
+                    let pts = [
+                        [cx, cy],
+                        [cx + r_arc * a0.cos(), cy + r_arc * a0.sin()],
+                        [cx + r_arc * a1.cos(), cy + r_arc * a1.sin()],
+                        [cx, cy],
+                    ];
+                    list.quad_gradient(&pts, [colour; 4], Blend::Alpha);
+                }
+            }
+        }
         // --- Health bar ------------------------------------------------------------
         let health = health_at(game, t);
         if legacy_health {
@@ -567,6 +590,7 @@ impl HudState {
             self.last_health = health;
             draw_health(list, m, health, t, self.health_flash);
         }
+
 
         // --- Unstable rate bar (skin style, bottom centre) ------------------------
         if self.ur_bar {
@@ -611,7 +635,7 @@ impl HudState {
         // ArgonSkin.cs 布局: BottomRight + Position(-(hit_error_offset_width
         // + padding), -(padding*2 + song_progress_offset_height)) = (-36, -66)
         // —— 右边距 36,底边与 combo 同一水平线(combo 也是 -66)。
-        let x1 = m.virt([1024.0 - 36.0, 0.0])[0];
+        let x1 = m.screen_w - 36.0 * m.virt;
         let y1 = m.virt([0.0, 768.0 - 66.0])[1];
         let x0 = x1 - total_w * m.virt;
         let y0 = y1 - COUNTER_H * m.virt;
@@ -731,8 +755,9 @@ impl HudState {
 
         // Virtual-space layout (lazer HUD units: strip 14, spine 2, chevron
         // 8, centre marker 8, tick thickness 4, half width spans the meh
-        // window).
-        let centre = m.virt([512.0, 736.0]);
+        // window). `BarHitErrorMeter` anchors BottomCentre: x tracks the
+        // canvas centre (ratio-independent), y is 736 local units.
+        let centre = [m.screen_w * 0.5, 736.0 * m.virt];
         let cy = centre[1];
         let half_w = 230.0 * m.virt;
         let px = |ms: f64, scale: f32| -> f32 { (ms / meh).clamp(-1.0, 1.0) as f32 * half_w * scale };
@@ -1209,19 +1234,25 @@ impl LegacyHud {
 /// `LegacyDefaultComboCounter` state: the stepped `DisplayedCount` with
 /// its delayed +1 queue, the additive pop-out burst, the small pulse on
 /// the displayed text, and the break roll + fade.
+///
+/// Alpha follows lazer exactly: the sprite is shown INSTANTLY
+/// (`displayedCountSpriteText.Show()`) on any nonzero display and hidden
+/// instantly on a change to 0 — the only gradual fade (100ms) happens
+/// when a break roll-down REACHES 0 (`onDisplayedCountRolling` →
+/// `FadeOut(fade_out_duration)`).
 struct LegacyCombo {
     prev: i32,
     displayed: f64,
-    /// Scheduled `scheduledPopOutSmall` fire times (each steps the
-    /// displayed count +1 toward `target`).
-    steps: Vec<f64>,
-    target: i32,
-    visible: bool,
-    alpha: f64,
-    alpha_anim: Option<(f64, f64, f64)>, // (start, from, to) 100ms linear
-    roll: Option<(f64, f64, f64, f64)>,  // (start, from, to, dur) linear
-    big_pop: Option<(f64, i32)>,         // (burst time, burst text value)
+    /// The single `Scheduler.AddDelayed` +1 (`big_pop_out_duration - 140`
+    /// = 160ms). Each new increment bumps `scheduledPopOutCurrentId`,
+    /// invalidating the previous task — newest wins, never a queue.
+    pending_step: Option<f64>,
+    roll: Option<(f64, f64, f64, f64)>, // (start, from, to, dur) linear
+    big_pop: Option<(f64, i32)>,        // (burst time, burst text value)
     small_pop: Option<f64>,
+    alpha: f64,
+    /// 100ms fade-to-0 fired when the break roll-down lands on 0.
+    zero_fade: Option<f64>,
 }
 
 impl LegacyCombo {
@@ -1229,68 +1260,72 @@ impl LegacyCombo {
         LegacyCombo {
             prev: 0,
             displayed: 0.0,
-            steps: Vec::new(),
-            target: 0,
-            visible: false,
-            alpha: 0.0,
-            alpha_anim: None,
+            pending_step: None,
             roll: None,
             big_pop: None,
             small_pop: None,
+            alpha: 0.0,
+            zero_fade: None,
         }
     }
 
     fn update(&mut self, current: i32, t: f64) {
         if current != self.prev {
             if current == 0 && self.prev > 0 {
-                // onCountRolling: fade out (100ms) + proportional roll to 0
-                // (`difference * 20ms`, linear `TransformTo`).
-                self.alpha_anim = Some((t, self.alpha, 0.0));
-                self.roll = Some((t, self.displayed, 0.0, self.displayed * 20.0));
-                self.steps.clear();
+                // onCountRolling: proportional roll to 0
+                // (`difference * 20ms`, linear `TransformTo`). The text
+                // stays opaque (Show() per rolled step) until the roll
+                // lands on 0, which starts the 100ms fade.
+                self.roll = Some((t, self.displayed, 0.0, (self.displayed * 20.0).max(1.0)));
+                self.pending_step = None;
                 self.big_pop = None;
                 self.small_pop = None;
+                self.alpha = 1.0;
+                self.zero_fade = None;
             } else if current == self.prev + 1 {
-                // onCountIncrement: big additive pop-out now, the displayed
-                // value steps up 160ms later (big_pop_out_duration - 140).
+                // updateCount's non-rolling path first completes any running
+                // roll and snaps `DisplayedCount = prev` (FinishTransforms);
+                // without the snap a mid-roll displayed value would keep
+                // counting up from the pre-break combo. Then: the pending +1
+                // is invalidated, the big additive pop-out shows the NEW
+                // value now, and the displayed value steps up 160ms later.
+                self.displayed = self.prev as f64;
+                self.pending_step = Some(t + 160.0);
                 self.big_pop = Some((t, current));
-                self.small_pop = Some(t);
-                self.steps.push(t + 160.0);
-                self.target = current;
-                self.visible = true;
-                self.alpha_anim = Some((t, self.alpha, 1.0));
                 self.roll = None;
+                self.alpha = 1.0;
+                self.zero_fade = None;
             } else {
-                // onCountChange: jump.
+                // onCountChange: jump (slider tails); instant show/hide.
                 self.displayed = current as f64;
-                self.target = current;
-                self.steps.clear();
+                self.pending_step = None;
                 self.roll = None;
                 self.big_pop = None;
                 self.small_pop = None;
-                self.visible = current > 0;
-                self.alpha_anim = Some((t, self.alpha, if current > 0 { 1.0 } else { 0.0 }));
+                self.alpha = if current > 0 { 1.0 } else { 0.0 };
+                self.zero_fade = None;
             }
             self.prev = current;
         }
 
-        // Fire due steps (`scheduledPopOutSmall`, guarded by
-        // `DisplayedCount < currentValue`).
-        let mut fired = false;
-        while self.steps.first().is_some_and(|&s| s <= t) {
-            self.steps.remove(0);
-            if self.displayed < self.target as f64 {
+        // `scheduledPopOutSmall`: the delayed +1 (fires the small pulse
+        // via `onDisplayedCountIncrement`).
+        if let Some(s) = self.pending_step {
+            if t >= s {
+                self.pending_step = None;
                 self.displayed += 1.0;
-                fired = true;
+                self.small_pop = Some(s);
             }
         }
-        let _ = fired;
 
         if let Some((start, from, to, dur)) = self.roll {
             self.displayed = value_at(t, start, start + dur, from, to, Easing::Linear);
+            if self.displayed <= 0.0 && self.zero_fade.is_none() {
+                self.zero_fade = Some(t);
+            }
         }
-        if let Some((start, from, to)) = self.alpha_anim {
-            self.alpha = value_at(t, start, start + 100.0, from, to, Easing::Linear);
+        if let Some(start) = self.zero_fade {
+            self.alpha = value_at(t, start, start + 100.0, 1.0, 0.0, Easing::Linear);
         }
     }
 
@@ -1408,10 +1443,11 @@ impl HudState {
         self.l_acc_h = font.max_digit_h() * 0.6 * 0.96;
         let right = m.screen_w - 17.0 * v;
         let baseline = m.virt([0.0, top_units])[1] + font.max_digit_h() * k;
-        // `accuracy.ScreenSpaceDeltaToParentSpace(accuracy.Size).X`: the
-        // SCALED size (component Scale 0.6*0.96) - the song-progress
-        // circle's X offset uses this, not the raw text width.
-        self.l_acc_w = font.run_width(&text, true) * 0.6 * 0.96;
+        // The scaled quad width the song-progress circle anchors to:
+        // framework's `TextBuilder.Bounds` keep the last glyph's FULL
+        // advance (spacing only applies BETWEEN glyphs), one overlap wider
+        // than the run's advance sum.
+        self.l_acc_w = (font.run_width(&text, true) + font.overlap) * 0.6 * 0.96;
         font.draw_right(list, assets.atlas, &text, right, baseline, k, Colour::WHITE, Blend::Alpha);
     }
 
@@ -1421,8 +1457,8 @@ impl HudState {
     /// (`transformPopOutSmall`) and steps up 160ms later.
     fn draw_legacy_combo(&mut self, assets: &Assets, list: &mut DrawList, m: &Mapper, t: f64) {
         let combo = &self.l_combo;
-        let (big_pop, small_scale, visible, alpha, displayed, roll_active) =
-            (combo.big_pop, combo.small_scale(t) as f32, combo.visible, combo.alpha as f32, combo.displayed.round() as i64, combo.roll.is_some());
+        let (big_pop, small_scale, alpha, displayed, roll_active) =
+            (combo.big_pop, combo.small_scale(t) as f32, combo.alpha as f32, combo.displayed.round() as i64, combo.roll.is_some());
 
         let Some(font) = self.legacy.as_ref().and_then(|l| l.combo.as_ref()) else { return };
 
@@ -1433,7 +1469,12 @@ impl HudState {
         let text = |value: i32| format!("{}x", value);
 
         // Additive pop-out behind (`popOutCount`): text of the burst value,
-        // scale 1.56 → 1 and alpha .6 → 0 over 300ms, linear.
+        // scale 1.56 → 1 and alpha .6 → 0 over 300ms, linear. Lazer gives
+        // the burst `OriginPosition = (3, 0.625H+9)` ("in stable, the
+        // bigger pop out scales a bit to the left") with the same Position
+        // as the displayed text, so its box sits 3 units LEFT of the
+        // display and the scale origin sits 6 units above the box bottom —
+        // scaled, the box left is `10-3s` and bottom `752+6s`.
         if let Some((start, value)) = big_pop {
             let x = t - start;
             if x < 300.0 {
@@ -1444,8 +1485,8 @@ impl HudState {
                         list,
                         assets.atlas,
                         &text(value),
-                        left,
-                        baseline,
+                        (10.0 - 3.0 * s) * v,
+                        (768.0 - 10.0 - 6.0 + 6.0 * s) * v,
                         k * s,
                         Colour::WHITE.opacity(a),
                         Blend::Additive,
@@ -1455,20 +1496,18 @@ impl HudState {
             }
         }
 
-        if visible && alpha > 0.004 {
-            if displayed > 0 || roll_active {
-                font.draw_left(
-                    list,
-                    assets.atlas,
-                    &text(displayed as i32),
-                    left,
-                    baseline,
-                    k * small_scale,
-                    Colour::WHITE.opacity(alpha),
-                    Blend::Alpha,
-                    false,
-                );
-            }
+        if alpha > 0.004 && (displayed > 0 || roll_active) {
+            font.draw_left(
+                list,
+                assets.atlas,
+                &text(displayed as i32),
+                left,
+                baseline,
+                k * small_scale,
+                Colour::WHITE.opacity(alpha),
+                Blend::Alpha,
+                false,
+            );
         }
     }
 
@@ -1654,7 +1693,7 @@ impl HudState {
         let text_colour = hud.input_text_colour;
 
         // Display container: CentreRight anchor, TopRight origin, (0, -64).
-        let tr = [m.virt([1024.0, 0.0])[0], m.screen_h * 0.5 - 64.0 * v];
+        let tr = [m.screen_w, m.screen_h * 0.5 - 64.0 * v];
 
         // Background strip: Sprite anchored TopRight/origin TopLeft,
         // Scale (1.05, 1), Rotation 90 - scale applies first, then the
