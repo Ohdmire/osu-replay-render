@@ -513,6 +513,19 @@ fn build(
         })
         .collect();
 
+    // The timeline is in judgement APPLICATION order, and a hit applied
+    // late (a slow slider tail judged after the next object's miss) keeps
+    // its earlier object time - HUD timelines scan these with break /
+    // partition_point, which assume monotonic time. Clamp each event to
+    // run at or after its predecessor so causal order and time order
+    // agree.
+    let mut last = f64::NEG_INFINITY;
+    let mut score_events = score_events;
+    for e in &mut score_events {
+        e.time = e.time.max(last);
+        last = e.time;
+    }
+
     // UR-relevant hits with cumulative Welford statistics - exactly the
     // event set `ScoreProcessor.unstable_rate` counts (has_windows && hit).
     let mut ur_events: Vec<UrEvent> = Vec::new();
@@ -540,6 +553,13 @@ fn build(
     }
     let w = engine.windows();
     let hit_windows = (w.great, w.ok, w.meh);
+
+    // Same monotonic-time clamp for the UR bar's binary search.
+    let mut last_ur = f64::NEG_INFINITY;
+    for e in &mut ur_events {
+        e.time = e.time.max(last_ur);
+        last_ur = e.time;
+    }
 
     // Timeline -> per-object judgement states + display events.
     let mut events: Vec<EventView> = Vec::new();
