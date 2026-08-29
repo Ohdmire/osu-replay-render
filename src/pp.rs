@@ -129,6 +129,9 @@ pub fn calculate(map_path: &str, mods_bits: u32, classic: bool, engine: &Engine)
     let mut events: Vec<(f64, f64)> = Vec::new();
     let mut next_obj = 0usize;
     let mut max_combo = 0i32;
+    // Keep the pair timeline monotonic (`pp_at` binary-searches it): late
+    // judgements carry earlier object times, same as `score_events`.
+    let mut last_t = f64::NEG_INFINITY;
 
     for e in &engine.timeline {
         if e.label == "smax" || e.label.starts_with("stick") {
@@ -144,7 +147,8 @@ pub fn calculate(map_path: &str, mods_bits: u32, classic: bool, engine: &Engine)
         // Advance every object that has fully judged, in order.
         while next_obj < n_objects && remaining[next_obj] == 0 {
             if let Some(attrs) = gradual.next(state.clone()) {
-                events.push((e.time, attrs.pp));
+                last_t = last_t.max(e.time);
+                events.push((last_t, attrs.pp));
             }
             next_obj += 1;
         }
@@ -155,7 +159,8 @@ pub fn calculate(map_path: &str, mods_bits: u32, classic: bool, engine: &Engine)
     if gradual.len() > 0 {
         if let Some(attrs) = gradual.last(state.clone()) {
             let t = engine.timeline.last().map(|e| e.time).unwrap_or(0.0);
-            events.push((t, attrs.pp));
+            last_t = last_t.max(t);
+            events.push((last_t, attrs.pp));
         }
     }
 
