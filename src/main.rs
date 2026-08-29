@@ -72,6 +72,8 @@ struct Options {
     /// Whether the UR bar's window guide lines (colour axis) render.
     /// Default on; `--no-guides` disables them.
     guides: bool,
+    /// Whether the live PP counter renders. Default on; `--no-pp` hides it.
+    pp: bool,
     /// Optional BGM muxed into the output (`--audio [file]`; without a
     /// value the beatmap's own audio is used).
     audio: Option<String>,
@@ -128,7 +130,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
     let autoplay = args.iter().any(|a| a == "--autoplay");
     let min_args = if autoplay { 2 } else { 3 };
     if args.len() < min_args {
-        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--hd] [--no-hd] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro|dir] [--argon-hud] [--no-guides] [--audio [file.mp3]] [--audio-offset ms] [--bg] [--bg-opacity 0..1] [--cursor-size 0.1..=2] [--hitsounds] [--skin-colours] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
+        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--hd] [--no-hd] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro|dir] [--argon-hud] [--no-guides] [--no-pp] [--audio [file.mp3]] [--audio-offset ms] [--bg] [--bg-opacity 0..1] [--cursor-size 0.1..=2] [--hitsounds] [--skin-colours] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
     }
     let map_path = args[1].clone();
     let replay_path = if autoplay { None } else { Some(args[2].clone()) };
@@ -149,6 +151,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
         limit: None,
         ffmpeg_extra: Vec::new(),
         guides: true,
+        pp: true,
         audio: None,
         bg: false,
         bg_opacity: 0.3,
@@ -241,6 +244,9 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
             }
             "--no-guides" => {
                 opts.guides = false;
+            }
+            "--no-pp" => {
+                opts.pp = false;
             }
             "--audio" => {
                 // Optional value: an explicit file, else the beatmap's own
@@ -578,6 +584,7 @@ fn main() {
     let mut state = SceneState::new(&game, opts.width, opts.height);
     state.pro_skin = opts.skin == "argon-pro";
     state.hud.ur_guides = opts.guides;
+    state.hud.pp_display = opts.pp;
     state.hud.argon_hud = opts.argon_hud;
     state.bg_opacity = if has_bg { Some(opts.bg_opacity) } else { None };
     state.cursor_size = opts.cursor_size;
