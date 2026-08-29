@@ -1079,39 +1079,6 @@ impl ShelfPacker {
     }
 }
 
-fn decode_png(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
-    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
-    let mut reader = decoder.read_info().expect("png read info");
-    let mut buf = vec![0u8; reader.output_buffer_size()];
-    let info = reader.next_frame(&mut buf).expect("png decode");
-    let (w, h) = (info.width, info.height);
-    match info.color_type {
-        png::ColorType::Rgba => {}
-        png::ColorType::GrayscaleAlpha => {
-            let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-            for px in buf.chunks_exact(2) {
-                rgba.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
-            }
-            return (w, h, rgba);
-        }
-        png::ColorType::Grayscale => {
-            let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-            for px in &buf {
-                rgba.extend_from_slice(&[*px, *px, *px, 255]);
-            }
-            return (w, h, rgba);
-        }
-        png::ColorType::Rgb => {
-            let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-            for px in buf.chunks_exact(3) {
-                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
-            }
-            return (w, h, rgba);
-        }
-        other => panic!("unsupported png colour type {:?}", other),
-    }
-    (w, h, buf)
-}
 
 #[derive(Clone)]
 pub struct Image {
