@@ -607,7 +607,14 @@ fn main() {
             }
         }
     } else {
-        let step = 1000.0 / opts.fps;
+        // Rate mods (DT/NC 1.5, HT 0.75) compress the replay's map-time
+        // timeline onto the video's wall timeline: one output frame
+        // (1/fps wall s) covers `rate` × 1/fps map ms — the 60fps branch
+        // gets this for free from the engine's game-frame snapshot
+        // cadence, and the audio side (hitsound placements / BGM atempo)
+        // assumes it. Without the factor a DT export plays at the map's
+        // original speed and desyncs from its audio.
+        let step = 1000.0 / opts.fps * game.rate;
         let mut t = first_snap.max(start.min(last_snap));
         while t <= last_snap.min(end) {
             frame_times.push(t);
