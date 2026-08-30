@@ -26,6 +26,38 @@ use skin::SkinTexture;
 
 const TORUS_BOLD_FONT: &[u8] = include_bytes!("../assets/fonts/Torus-Bold.otf");
 const TORUS_SEMI_BOLD_FONT: &[u8] = include_bytes!("../assets/fonts/Torus-SemiBold.otf");
+/// Torus Light: the expanded panel's score counter (`TotalScoreCounter`,
+/// Torus 60 Light fixedWidth).
+const TORUS_LIGHT_FONT: &[u8] = include_bytes!("../assets/fonts/Torus-Light.otf");
+/// Torus Regular: the judgement/statistic counter values
+/// (`StatisticCounter`, Torus 20 fixedWidth).
+const TORUS_REGULAR_FONT: &[u8] = include_bytes!("../assets/fonts/Torus-Regular.otf");
+/// Venera: the rank letter's typeface (`RankText`, OsuFont.Numeric Bold;
+/// the official ppy distribution is Venera 500 from osu-web).
+const VENERA_FONT: &[u8] = include_bytes!("../assets/fonts/Venera-500.otf");
+
+/// Glyph-region weights (`Region::Glyph::weight`).
+pub const WEIGHT_SEMIBOLD: u8 = 0;
+pub const WEIGHT_BOLD: u8 = 1;
+pub const WEIGHT_LIGHT: u8 = 2;
+pub const WEIGHT_VENERA: u8 = 3;
+pub const WEIGHT_REGULAR: u8 = 4;
+
+/// The four text fonts packed into the atlas (Torus family + Venera for
+/// the rank letter).
+#[derive(Clone)]
+pub struct Fonts {
+    /// Torus Bold (emphasis, avatar placeholder).
+    pub bold: TtfFont,
+    /// Torus SemiBold (labels, counters).
+    pub semibold: TtfFont,
+    /// Torus Light: the score counter (`TotalScoreCounter`, Torus 60 Light).
+    pub light: TtfFont,
+    /// Venera: the rank letter (`RankText`, OsuFont.Numeric).
+    pub venera: TtfFont,
+    /// Torus Regular: the judgement/statistic counter values.
+    pub regular: TtfFont,
+}
 const CURSOR_TRAIL_PNG: &[u8] = include_bytes!("../assets/cursor/cursortrail.png");
 
 /// Built-in lazer mod icons (`osu-resources` `Textures/Icons/Mods`,
@@ -168,25 +200,21 @@ const COUNTER_WIREFRAMES_PNG: &[u8] = include_bytes!("../assets/counter/argon-co
 /// the scene builder. Skin textures are packed as `Region::Skin(i)`
 /// entries and their handles handed back to the skin so its
 /// `get_texture` serves atlas regions.
+/// BREAKING (0.7.0): returns `(Atlas, Fonts)` — the extra Torus Light /
+/// Venera fonts back the results screen's score counter and rank letter.
+/// `avatar_image` (`--avatar` / config `avatar`) is packed as
+/// `Region::Avatar`: cover-cropped square, pre-masked rounded corners.
 pub fn build_atlas(
-    bg_image: Option<Image>,
-    skin: &mut dyn skin::SkinTextureSource,
-    max_dim: u32,
-) -> (Atlas, TtfFont, TtfFont) {
-    build_atlas_with(bg_image, None, skin, max_dim)
-}
-
-/// `build_atlas` with an optional custom avatar image for the results
-/// screen (`--avatar` / config `avatar`): cover-cropped square with
-/// pre-masked rounded corners, packed as `Region::Avatar`.
-pub fn build_atlas_with(
     bg_image: Option<Image>,
     avatar_image: Option<Image>,
     skin: &mut dyn skin::SkinTextureSource,
     max_dim: u32,
-) -> (Atlas, TtfFont, TtfFont) {
-    let (mut bold, mut bold_images) = TtfFont::rasterize(TORUS_BOLD_FONT, true);
-    let (mut semibold, mut semibold_images) = TtfFont::rasterize(TORUS_SEMI_BOLD_FONT, false);
+) -> (Atlas, Fonts) {
+    let (mut bold, mut bold_images) = TtfFont::rasterize(TORUS_BOLD_FONT, WEIGHT_BOLD);
+    let (mut semibold, mut semibold_images) = TtfFont::rasterize(TORUS_SEMI_BOLD_FONT, WEIGHT_SEMIBOLD);
+    let (mut light, mut light_images) = TtfFont::rasterize(TORUS_LIGHT_FONT, WEIGHT_LIGHT);
+    let (mut venera, mut venera_images) = TtfFont::rasterize(VENERA_FONT, WEIGHT_VENERA);
+    let (mut regular, mut regular_images) = TtfFont::rasterize(TORUS_REGULAR_FONT, WEIGHT_REGULAR);
 
     let mut images: Vec<(Region, Image)> = Vec::new();
     if let Some(img) = bg_image {
@@ -205,6 +233,9 @@ pub fn build_atlas_with(
     }
     images.append(&mut bold_images);
     images.append(&mut semibold_images);
+    images.append(&mut light_images);
+    images.append(&mut venera_images);
+    images.append(&mut regular_images);
 
     for (d, png) in COUNTER_DIGITS.iter().enumerate() {
         let (w, h, rgba) = decode_png_bytes(png).expect("embedded png");
@@ -277,14 +308,17 @@ pub fn build_atlas_with(
     };
     skin.assign_regions(&skin_regions);
     if std::env::var("ATLAS_DEBUG").is_ok() {
-        for r in [Region::CounterDigit(b'5'), Region::Glyph { bold: true, c: 'G', em: 24 }, Region::Glyph { bold: true, c: 'G', em: 96 }, Region::Glyph { bold: false, c: '5', em: 48 }, Region::CounterWireframes] {
+        for r in [Region::CounterDigit(b'5'), Region::Glyph { weight: WEIGHT_BOLD, c: 'G', em: 24 }, Region::Glyph { weight: WEIGHT_BOLD, c: 'G', em: 96 }, Region::Glyph { weight: WEIGHT_SEMIBOLD, c: '5', em: 48 }, Region::CounterWireframes] {
             let rect = atlas.region_rect(r);
             let ink = atlas.ink(r);
             eprintln!("ATLAS {:?}: rect=({:.0},{:.0},{:.0},{:.0}) ink=({:.0},{:.0},{:.0},{:.0})", r, rect.x0, rect.y0, rect.x1, rect.y1, ink[0], ink[1], ink[2], ink[3]);
         }
     }
-    bold.patch_rects(&atlas, true);
-    semibold.patch_rects(&atlas, false);
+    bold.patch_rects(&atlas, WEIGHT_BOLD);
+    semibold.patch_rects(&atlas, WEIGHT_SEMIBOLD);
+    light.patch_rects(&atlas, WEIGHT_LIGHT);
+    venera.patch_rects(&atlas, WEIGHT_VENERA);
+    regular.patch_rects(&atlas, WEIGHT_REGULAR);
     if std::env::var("ATLAS_DUMP").is_ok() {
         let file = std::fs::File::create("atlas_dump.png").unwrap();
         let mut enc = png::Encoder::new(std::io::BufWriter::new(file), atlas.width, atlas.height);
@@ -294,7 +328,7 @@ pub fn build_atlas_with(
         writer.write_image_data(&atlas.rgba).unwrap();
         eprintln!("atlas dumped: {}x{}", atlas.width, atlas.height);
     }
-    (atlas, bold, semibold)
+    (atlas, Fonts { bold, semibold, light, venera, regular })
 }
 
 /// Decodes a PNG or JPEG file into an atlas image (RGBA).

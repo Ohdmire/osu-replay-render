@@ -386,7 +386,7 @@ fn draw_gradient_text(
         list.set_blend(Blend::Alpha);
         list.image_sub(
             atlas,
-            crate::draw::Region::Glyph { bold: false, c, em },
+            crate::draw::Region::Glyph { weight: 0, c, em },
             [x + w * 0.5, y0 + h_full * split * 0.5],
             [w, h_full * split],
             0.0,
@@ -399,7 +399,7 @@ fn draw_gradient_text(
         );
         list.image_sub(
             atlas,
-            crate::draw::Region::Glyph { bold: false, c, em },
+            crate::draw::Region::Glyph { weight: 0, c, em },
             [x + w * 0.5, y0 + h_full * (split + 1.0) * 0.5],
             [w, h_full * (1.0 - split)],
             0.0,
@@ -626,25 +626,37 @@ fn draw_gradient_arc(
     centre: [f32; 2],
     band_radius: f32,
     thickness: f32,
+    box_r: f32,
     sweep: f64,
 ) {
     let (c0, c1) = (Colour::from_hex(0x7CF6FF), Colour::from_hex(0xBAFFA9));
-    let segs = 48;
-    // Clockwise from the top (`angle_for_accuracy(0)` = -450 == -90 mod
-    // 360) through `sweep` of the circle, ending at the accuracy needle.
-    // The angle of accuracy a is -450 + 360a; sweeping POSITIVE degrees is
-    // clockwise on the y-down screen.
-    let start = -450.0;
+    let segs = 96;
+    let start = -450.0f32;
+    let r_in = band_radius - thickness * 0.5;
+    let r_out = band_radius + thickness * 0.5;
+    let pt = |rad: f32, a_deg: f32| -> [f32; 2] {
+        let (sn, cs) = a_deg.to_radians().sin_cos();
+        [centre[0] + rad * cs, centre[1] + rad * sn]
+    };
+    // framework `GradientVertical`: the colour varies with the vertex's Y
+    // across the drawable box (top #7CF6FF -> bottom #BAFFA9). Per-vertex
+    // colours keep the band continuous - no segment seams.
+    let col_at = |y: f32| -> Colour {
+        let t = ((y - (centre[1] - box_r)) / (2.0 * box_r)).clamp(0.0, 1.0);
+        Colour::lerp(c0, c1, t)
+    };
     for i in 0..segs {
         let f0 = i as f32 / segs as f32;
         let f1 = (i + 1) as f32 / segs as f32;
         let a0 = start + f0 * sweep as f32 * 360.0;
         let a1 = start + f1 * sweep as f32 * 360.0;
-        // Segment midpoint, for the vertical gradient sample.
-        let am = ((a0 + a1) * 0.5).to_radians();
-        let t = (am.sin() + 1.0) * 0.5;
-        let col = Colour::lerp(c0, c1, t);
-        list.arc(centre, band_radius, thickness, a0, a1, col, Blend::Alpha);
+        let (pi0, po0) = (pt(r_in, a0), pt(r_out, a0));
+        let (pi1, po1) = (pt(r_in, a1), pt(r_out, a1));
+        list.quad_gradient(
+            &[pi0, po0, po1, pi1],
+            [col_at(pi0[1]), col_at(po0[1]), col_at(po1[1]), col_at(pi1[1])],
+            Blend::Alpha,
+        );
     }
 }
 
@@ -654,7 +666,6 @@ pub fn draw(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut DrawList
     let s = m.virt; // virtual unit -> screen px
     let cw = m.screen_w / s; // canvas width in virtual units (1365.33 at 16:9)
     let px = |v: [f32; 2]| -> [f32; 2] { [v[0] * s, v[1] * s] };
-
     // Score values.
     let misses = stat_count(&game.final_statistics, HitResult::Miss) as i64;
     let rank = Rank::from_score(game.final_accuracy, misses, game.mods.hidden);
@@ -846,12 +857,13 @@ pub fn draw(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut DrawList
     } else {
         format!("mapped by {}", game.map_meta.creator)
     };
-    let creator_h = if creator_line.is_empty() { 0.0 } else { line_h(assets.semibold, &creator_line, 12.0) };
+    let creator_name = if creator_line.is_empty() { String::new() } else { game.map_meta.creator.clone() };
+    let creator_h = if creator_line.is_empty() { 0.0 } else { line_h(assets.regular, &creator_line, 12.0) };
     let mods = mod_list(&game.mods);
     let mods_row_h = if mods.is_empty() { 22.0 } else { 40.0 };
 
     let (row1, row2) = HitStat::rows(&game.final_statistics, &game.final_maximum_statistics);
-    let counter_h = |t: &str| line_h(assets.semibold, t, 20.0);
+    let counter_h = |t: &str| line_h(assets.regular, t, 20.0);
     let r1_h = 12.0 + counter_h("0") + 2.0;
     let r2_h = if row2.is_empty() { 0.0 } else { 12.0 + counter_h("0") + 2.0 };
     let top_stats_h = 12.0 + counter_h("0") + 2.0;
@@ -950,7 +962,7 @@ pub fn draw(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut DrawList
     // Accuracy gauge: full sweep to the adjusted target.
     let target = accuracy_gauge_target(game.final_accuracy, rank, failed_s);
     let acc_thickness = 0.2 * r_out;
-    draw_gradient_arc(list, px(cc), r_out - acc_thickness * 0.5, acc_thickness, target);
+    draw_gradient_arc(list, px(cc), r_out - acc_thickness * 0.5, acc_thickness, r_out, target);
 
     // Rank badges around the gauge. The badge container is the circle box
     // padded -20 horizontally / -15 vertically (elliptical placement), and
@@ -1009,12 +1021,14 @@ pub fn draw(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut DrawList
         );
     }
 
-    // Rank letter (RankText): white Torus 76 with the rank-coloured glow.
+    // Rank letter (lazer `RankText`: OsuFont.Numeric = Venera, size 76,
+    // spacing -15, white with the rank-coloured glow).
     list.glow(px(cc), 95.0 * s, rank.colour().opacity(0.30));
+    let rank_font = assets.venera;
     draw_ttf_text(
         list,
         assets.atlas,
-        assets.bold,
+        rank_font,
         true,
         rank.letter(),
         px(cc),
@@ -1026,11 +1040,12 @@ pub fn draw(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut DrawList
 
     y += CIRCLE_SIZE;
 
-    // Total score (Torus 60).
+    // Total score (lazer `TotalScoreCounter`: Torus 60 LIGHT fixedWidth).
+    let score_font = assets.light;
     draw_ttf_text(
         list,
         assets.atlas,
-        assets.semibold,
+        score_font,
         false,
         &score_text,
         px([c[0], y + (score_h - 5.0) * 0.5]),
@@ -1123,13 +1138,30 @@ pub fn draw(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut DrawList
     );
     y += diff_h;
     if !creator_line.is_empty() {
+        // "mapped by " regular + the creator's name semibold
+        // (lazer's OsuTextFlowContainer weight override).
+        let w_prefix = ttf_measure(assets.regular, "mapped by ", 12.0, 0.0).0;
+        let w_name = ttf_measure(assets.semibold, &creator_name, 12.0, 0.0).0;
+        let x0 = c[0] - (w_prefix + w_name) * 0.5;
+        draw_ttf_text(
+            list,
+            assets.atlas,
+            assets.regular,
+            false,
+            "mapped by ",
+            px([x0 + w_prefix * 0.5, y + creator_h * 0.5]),
+            12.0 * s,
+            Colour::from_hex(0xDDDDDD),
+            0.0,
+            Blend::Alpha,
+        );
         draw_ttf_text(
             list,
             assets.atlas,
             assets.semibold,
             false,
-            &creator_line,
-            px([c[0], y + creator_h * 0.5]),
+            &creator_name,
+            px([x0 + w_prefix + w_name * 0.5, y + creator_h * 0.5]),
             12.0 * s,
             Colour::from_hex(0xDDDDDD),
             0.0,
@@ -1168,9 +1200,9 @@ pub fn draw(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut DrawList
         );
         // Value counter (+ optional /max suffix and PERFECT tag): the whole
         // run is centred under the header.
-        let vh = line_h(assets.semibold, value, 20.0);
+        let vh = line_h(assets.regular, value, 20.0);
         let vy = ytop + 12.0 + 2.0 + vh * 0.5;
-        let vw = ttf_measure(assets.semibold, value, 20.0, -2.0).0;
+        let vw = ttf_measure(assets.regular, value, 20.0, -2.0).0;
         let perfect_w = if perfect {
             10.0 + ttf_measure(assets.semibold, "PERFECT", 11.0, 0.0).0
         } else {
@@ -1180,7 +1212,7 @@ pub fn draw(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut DrawList
         draw_ttf_text(
             list,
             assets.atlas,
-            assets.semibold,
+            assets.regular,
             false,
             value,
             px([vx + vw * 0.5, vy]),
@@ -1191,17 +1223,17 @@ pub fn draw(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut DrawList
         );
         vx += vw;
         if let Some(sfx) = suffix {
-            let sw = ttf_measure(assets.semibold, sfx, 12.0, -2.0).0;
+            let sw = ttf_measure(assets.regular, sfx, 12.0, -2.0).0;
             vx += 2.0;
             draw_ttf_text(
                 list,
                 assets.atlas,
-                assets.semibold,
+                assets.regular,
                 false,
                 sfx,
                 px([vx + sw * 0.5, vy + vh * 0.5 - 6.0]),
                 12.0 * s,
-                Colour::from_hex(0xBBBBBB),
+                Colour::WHITE,
                 -2.0,
                 Blend::Alpha,
             );
@@ -1231,7 +1263,7 @@ pub fn draw(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut DrawList
     let combo_val = combo.to_string();
     let combo_sfx = format!("/{}", combo_max);
     let pp_val = if game.pp.is_nan() { "0".to_string() } else { format!("{}", game.pp.round()) };
-    let th = 12.0 + 2.0 + line_h(assets.semibold, "0", 20.0);
+    let th = 12.0 + 2.0 + line_h(assets.regular, "0", 20.0);
     draw_stat(
         list,
         c[0] - inner_w * 0.5,
@@ -1301,7 +1333,7 @@ pub fn draw(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut DrawList
 
 fn suffix_w(assets: &Assets, suffix: Option<&str>) -> f32 {
     match suffix {
-        Some(sfx) => ttf_measure(assets.semibold, sfx, 12.0, -2.0).0,
+        Some(sfx) => ttf_measure(assets.regular, sfx, 12.0, -2.0).0,
         None => 0.0,
     }
 }

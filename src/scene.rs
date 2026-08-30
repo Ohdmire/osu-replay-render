@@ -304,6 +304,11 @@ pub struct Assets<'a> {
     pub atlas: &'a Atlas,
     pub bold: &'a TtfFont,
     pub semibold: &'a TtfFont,
+    /// Torus Light (score counter) / Venera (rank letter).
+    pub light: &'a TtfFont,
+    pub venera: &'a TtfFont,
+    /// Torus Regular (judgement/statistic counter values).
+    pub regular: &'a TtfFont,
     /// The resolved skin (user legacy skin with argon fallback).
     pub skin: &'a skin::ResolvedSkin,
 }

@@ -41,7 +41,7 @@
 //!                          --png-dir out --fps 1 --results 1)
 //!   --limit <n>            Render at most n frames (testing)
 
-use osu_replay_render::{build_atlas_with, decode_image_file, draw, draw::Image, game, hitsound, osu_background_file, osu_general_value, render::Renderer, scene, skin};
+use osu_replay_render::{build_atlas, decode_image_file, draw, draw::Image, game, hitsound, osu_background_file, osu_general_value, render::Renderer, scene, skin};
 
 use scene::{Assets, SceneState};
 use std::io::Write;
@@ -771,7 +771,7 @@ fn main() {
     // 8192 is the GLES/GL-compat floor for max_texture_dimension2d:
     // capping here keeps the atlas creatable on every backend (desktop
     // Vulkan/dGPU simply packs wider instead of taller).
-    let (atlas, bold, semibold) = build_atlas_with(bg_image, avatar_image, &mut resolved_skin, 8192);
+    let (atlas, fonts) = build_atlas(bg_image, avatar_image, &mut resolved_skin, 8192);
     eprintln!("atlas: {}x{}", atlas.width, atlas.height);
 
     let mut renderer = Renderer::new(opts.width, opts.height, &atlas);
@@ -982,7 +982,7 @@ fn main() {
     let total = frame_times.len();
     let t0 = std::time::Instant::now();
     let mut list = draw::DrawList::new();
-    let assets = Assets { atlas: &atlas, bold: &bold, semibold: &semibold, skin: &resolved_skin };
+    let assets = Assets { atlas: &atlas, bold: &fonts.bold, semibold: &fonts.semibold, light: &fonts.light, venera: &fonts.venera, regular: &fonts.regular, skin: &resolved_skin };
     let stats = std::env::var("RENDER_STATS").is_ok();
     let (mut s_build, mut s_render, mut s_write) = (0.0f64, 0.0f64, 0.0f64);
     // Index of the next frame to be written out; lags behind the frame
