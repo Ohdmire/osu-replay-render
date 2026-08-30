@@ -235,6 +235,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         }
         let a = aa(r - d) * col.a;
         c = vec4<f32>(col.rgb * a, a);
+    } else if (mode == 11.0) {
+        // Rounded rectangle: aux.y = corner radius, colour2.xy = half
+        // extents. Corner colours interpolate into the vertical gradient.
+        let half_ = in.color2.xy;
+        let r = min(in.aux.y, min(half_.x, half_.y));
+        let q = abs(in.local) - (half_ - vec2<f32>(r));
+        let d = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
+        let a = aa(-d) * in.color.a;
+        c = vec4<f32>(in.color.rgb * a, a);
     } else {
         // Flat colour.
         c = vec4<f32>(in.color.rgb * in.color.a, in.color.a);

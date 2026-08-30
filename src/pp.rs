@@ -40,9 +40,48 @@ pub struct PpData {
     pub pp: f64,
     /// FC max PP of the map+mods (`performance()` off the full attrs).
     pub pp_max: f64,
+    /// Star rating of the map+mods (the results screen's
+    /// `StarRatingDisplay` feed).
+    pub stars: f64,
+    /// Component breakdowns (achieved, FC max) for the results screen's
+    /// `PerformanceBreakdownChart` (`GetAttributesForDisplay`).
+    pub breakdown: PpBreakdown,
+    pub breakdown_max: PpBreakdown,
+    /// Aim strain peaks per 400ms section (`Difficulty::strains`), the
+    /// classic difficulty-over-time graph feed.
+    pub strain_aim: Vec<f64>,
+    /// Time-mapped difficulty graph points `(time, aim, speed)`: the
+    /// per-object strains of the aim and speed skills against the
+    /// difficulty objects' times (one entry per object past the first).
+    /// Empty when the object counts don't line up.
+    pub strain_points: Vec<(f64, f64, f64)>,
     /// `(time, pp)` after each finished top-level object, in order - the
     /// live counter timeline ([`pp_at`] binary-searches it).
     pub events: Vec<(f64, f64)>,
+}
+
+/// PP components (`OsuPerformanceAttributes` minus the total).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PpBreakdown {
+    pub total: f64,
+    pub aim: f64,
+    pub speed: f64,
+    pub accuracy: f64,
+    pub flashlight: f64,
+    pub reading: f64,
+}
+
+impl PpBreakdown {
+    fn of(a: &rosu_pp::osu::OsuPerformanceAttributes) -> PpBreakdown {
+        PpBreakdown {
+            total: a.pp,
+            aim: a.pp_aim,
+            speed: a.pp_speed,
+            accuracy: a.pp_acc,
+            flashlight: a.pp_flashlight,
+            reading: a.pp_reading,
+        }
+    }
 }
 
 /// Folds one judgement into the running state. Judgements that carry no
@@ -102,12 +141,36 @@ pub fn calculate(map_path: &str, mods_bits: u32, classic: bool, engine: &Engine)
         rosu_pp::any::DifficultyAttributes::Osu(attrs) => attrs,
         _ => return None,
     };
-    let max_pp = rosu_pp::osu::OsuPerformance::new(attrs)
+    // Difficulty-over-time graph: the aim skill's per-object strains
+    // (the section peaks lost their fixed time axis in the pp-rework).
+    // Entry j belongs to the (j+1)-th top-level object, so the times come
+    // from the judge's own object list when the counts line up.
+    let (strain_aim, strain_points) = match difficulty.clone().strains(&map) {
+        rosu_pp::any::Strains::Osu(s) => {
+            let n_obj = engine.objects().len();
+            let points = if s.aim_objects.len() + 1 == n_obj && s.speed.len() + 1 == n_obj {
+                s.aim_objects
+                    .iter()
+                    .zip(&s.speed)
+                    .enumerate()
+                    .filter_map(|(j, (&aim, &speed))| {
+                        engine.objects().get(j + 1).map(|o| (o.start_time, aim, speed))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (s.aim, points)
+        }
+        _ => (Vec::new(), Vec::new()),
+    };
+    let max_pp = rosu_pp::osu::OsuPerformance::new(attrs.clone())
         .lazer(!classic)
         .mods(rosu_pp::model::mods::rosu_mods::GameModsLegacy::from_bits(mods_bits))
         .calculate()
-        .ok()?
-        .pp();
+        .ok()?;
+    let breakdown_max = PpBreakdown::of(&max_pp);
+    let max_pp = max_pp.pp();
 
     // Live timeline: advance the gradual calculator one object each time
     // the next object (in beatmap order) finishes judging.
@@ -132,6 +195,8 @@ pub fn calculate(map_path: &str, mods_bits: u32, classic: bool, engine: &Engine)
     // Keep the pair timeline monotonic (`pp_at` binary-searches it): late
     // judgements carry earlier object times, same as `score_events`.
     let mut last_t = f64::NEG_INFINITY;
+    // The last gradual result (the score's own performance attributes).
+    let mut last_attrs: Option<rosu_pp::osu::OsuPerformanceAttributes> = None;
 
     for e in &engine.timeline {
         if e.label == "smax" || e.label.starts_with("stick") {
@@ -149,6 +214,7 @@ pub fn calculate(map_path: &str, mods_bits: u32, classic: bool, engine: &Engine)
             if let Some(attrs) = gradual.next(state.clone()) {
                 last_t = last_t.max(e.time);
                 events.push((last_t, attrs.pp));
+                last_attrs = Some(attrs);
             }
             next_obj += 1;
         }
@@ -161,12 +227,14 @@ pub fn calculate(map_path: &str, mods_bits: u32, classic: bool, engine: &Engine)
             let t = engine.timeline.last().map(|e| e.time).unwrap_or(0.0);
             last_t = last_t.max(t);
             events.push((last_t, attrs.pp));
+            last_attrs = Some(attrs);
         }
     }
 
     let pp = events.last().map(|&(_, pp)| pp).unwrap_or(0.0);
+    let breakdown = last_attrs.as_ref().map(PpBreakdown::of).unwrap_or_default();
 
-    Some(PpData { pp, pp_max: max_pp, events })
+    Some(PpData { pp, pp_max: max_pp, stars: attrs.stars, breakdown, breakdown_max, strain_aim, strain_points, events })
 }
 
 /// Live PP at time `t` (latest event at/before `t`; 0.0 before the first).

@@ -13,6 +13,8 @@ pollster = "0.4"
 png = "0.17"
 jpeg-decoder = "0.3"
 ab_glyph = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # Local judge checkout ahead of the published git rev (health processor +
 # break periods); drop this once osu-replay-judge is pushed.

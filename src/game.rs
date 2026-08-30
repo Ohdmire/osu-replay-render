@@ -2,6 +2,7 @@
 //! beatmap + engine run) into render-friendly views.
 
 use crate::draw::Colour;
+use crate::osu_metadata;
 use osu_replay_judge::engine::Engine;
 
 pub use osu_replay_judge::engine::FrameSnap;
@@ -256,6 +257,37 @@ pub struct KeyCountEvent {
 /// Z = K1 (left), X = K2 (right), C = smoke.
 pub const KEY_ACTIONS: [&str; 3] = ["Z", "X", "C"];
 
+/// One circle-judgement hit with the spatial data the results screen's
+/// `AccuracyHeatmap` needs (lazer `HitEvent` for `HitCircle`s, with
+/// `LastHitObject` and `CursorPositionAtHit`).
+#[derive(Clone, Copy, Debug)]
+pub struct ResultsHitEvent {
+    /// Judgement time (gameplay clock ms).
+    pub time: f64,
+    /// Raw hit offset (gameplay clock ms, `HitEvent.TimeOffset`).
+    pub offset: f64,
+    pub result: HitResult,
+    /// Stacked playfield position of the circle that was hit.
+    pub pos: [f32; 2],
+    /// Stacked position of the previous circle (None on the first).
+    pub last_pos: Option<[f32; 2]>,
+    /// Cursor position (playfield coords) at the hit time.
+    pub cursor: [f32; 2],
+    /// Circle radius in playfield units (CS-scaled `OBJECT_RADIUS`).
+    pub radius: f32,
+}
+
+/// Beatmap `[Metadata]` (results-screen header): lazer prefers the
+/// romanised `Title`/`Artist` with the unicode variants as fallback.
+#[derive(Clone, Debug, Default)]
+pub struct MapMeta {
+    pub title: String,
+    pub artist: String,
+    /// Difficulty name (`Version`).
+    pub version: String,
+    pub creator: String,
+}
+
 pub struct GameData {
     pub score_events: Vec<ScoreEvent>,
     /// Timed hits for the unstable-rate bar (UR-relevant events only).
@@ -292,15 +324,43 @@ pub struct GameData {
     /// Key-tap count timeline for the key overlay (rising edges only).
     pub key_events: Vec<KeyCountEvent>,
     pub player: String,
+    /// When the score was set: raw Windows FILETIME ticks from the .osr
+    /// header (None for autoplay previews).
+    pub played_at_ticks: Option<u64>,
     pub final_score: i64,
     pub final_classic_score: i64,
     pub final_max_combo: i32,
     pub final_accuracy: f64,
+    /// Final judgement counts (`ScoreProcessor.Statistics`) and the
+    /// autoplay-simulated maximums (`MaximumStatistics`) - the results
+    /// screen's `HitResultStatistic` feed.
+    pub final_statistics: Vec<(HitResult, i32)>,
+    pub final_maximum_statistics: Vec<(HitResult, i32)>,
+    /// Maximum achievable combo (`ScoreInfo.GetMaximumAchievableCombo`).
+    pub max_combo_achievable: i32,
+    /// The replay's mods (acronyms / rates for the results ModDisplay).
+    pub mods: Mods,
+    /// Beatmap metadata (`[Metadata]`) for the results screen header.
+    pub map_meta: MapMeta,
+    /// Star rating of the map+mods (rosu-pp); NaN when unavailable.
+    pub stars: f64,
     /// Performance points of the judged replay (`rosu-pp`,
     /// pp-rework-202607 port of lazer's calculator) and the FC max PP of
     /// the map+mods. `NaN` when rosu-pp could not parse the map.
     pub pp: f64,
     pub pp_max: f64,
+    /// PP component breakdowns (achieved, FC) for the results screen's
+    /// `PerformanceBreakdownChart`. `None` when PP is unavailable.
+    pub pp_breakdown: Option<(crate::pp::PpBreakdown, crate::pp::PpBreakdown)>,
+    /// Aim strain peaks per 400ms section (the results screen's
+    /// difficulty-over-time graph). Empty when PP is unavailable.
+    pub strain_aim: Vec<f64>,
+    /// Time-mapped difficulty graph points `(time, aim, speed)` for the
+    /// results screen's Difficulty Graph card.
+    pub strain_points: Vec<(f64, f64, f64)>,
+    /// Circle hit events for the results statistics (`Timing Distribution`
+    /// graph, `UnstableRate` / `AverageHitError`, `AccuracyHeatmap`).
+    pub results_hit_events: Vec<ResultsHitEvent>,
     /// Live PP timeline (`OsuGradualPerformance`, advanced once per fully
     /// judged object): `(time, pp)` pairs - the in-game PP counter feed
     /// (`pp::pp_at` queries it). Empty when PP is unavailable.
@@ -353,8 +413,7 @@ fn with_lead_in(mut snapshots: Vec<FrameSnap>, rate: f64) -> Vec<FrameSnap> {
     snapshots
 }
 
-pub fn load(map_path: &str, replay_path: &str) -> Result<GameData, String> {
-    let content = std::fs::read_to_string(map_path).map_err(|e| format!("cannot read beatmap: {}", e))?;
+pub fn load(map_path: &str, replay_path: &str) -> Result<GameData, String> {    let content = std::fs::read_to_string(map_path).map_err(|e| format!("cannot read beatmap: {}", e))?;
     let map = beatmap::decode(&content)?;
     let rep = replay::decode_file(replay_path, map.version)?;
 
@@ -367,12 +426,17 @@ pub fn load(map_path: &str, replay_path: &str) -> Result<GameData, String> {
     let mut engine = Engine::new(processed, &mods);
     engine.run(&rep.frames);
 
-    let mut data = build(mods, classic, map.combo_colours, &engine)?;
+    let mut data = build(mods, classic, map.combo_colours, osu_metadata(map_path), &engine)?;
     data.player = rep.header.player_name.clone();
+    data.played_at_ticks = Some(rep.header.timestamp);
     if let Some(pp) = crate::pp::calculate(map_path, rep.header.mods, classic, &engine) {
         data.pp = pp.pp;
         data.pp_max = pp.pp_max;
         data.pp_events = pp.events;
+        data.stars = pp.stars;
+        data.pp_breakdown = Some((pp.breakdown, pp.breakdown_max));
+        data.strain_aim = pp.strain_aim;
+        data.strain_points = pp.strain_points;
     }
     Ok(data)
 }
@@ -396,7 +460,7 @@ pub fn load_autoplay(map_path: &str) -> Result<GameData, String> {
     let mut engine = Engine::new(processed, &mods);
     engine.run(&frames);
 
-    let mut data = build(mods, classic, map.combo_colours, &engine)?;
+    let mut data = build(mods, classic, map.combo_colours, osu_metadata(map_path), &engine)?;
     // lazer's autoplay attribution; HUD counters stay hidden (see
     // GameData::autoplay).
     data.player = "osu!".to_string();
@@ -405,6 +469,10 @@ pub fn load_autoplay(map_path: &str) -> Result<GameData, String> {
         data.pp = pp.pp;
         data.pp_max = pp.pp_max;
         data.pp_events = pp.events;
+        data.stars = pp.stars;
+        data.pp_breakdown = Some((pp.breakdown, pp.breakdown_max));
+        data.strain_aim = pp.strain_aim;
+        data.strain_points = pp.strain_points;
     }
     Ok(data)
 }
@@ -413,6 +481,7 @@ fn build(
     mods: Mods,
     classic: bool,
     map_colours: Vec<[u8; 3]>,
+    map_meta: MapMeta,
     engine: &Engine,
 ) -> Result<GameData, String> {
     let engine_objects: &[ProcObject] = engine.objects();
@@ -700,6 +769,57 @@ fn build(
         .map(|o| o.index)
         .unwrap_or(0);
 
+    // Circle hit events for the results statistics (lazer's
+    // `timedHitEvents`: `HitObject is HitCircle && !(SliderTailCircle)` =
+    // circles + slider heads, hits only). The cursor position at the hit
+    // time is interpolated off the engine's snapshots (`CursorPositionAtHit`).
+    let snaps = &engine.snapshots;
+    let cursor_at = |t: f64| -> [f32; 2] {
+        if snaps.is_empty() {
+            return [256.0, 192.0];
+        }
+        let idx = snaps.partition_point(|s| s.time <= t).saturating_sub(1);
+        let cur = snaps[idx].cursor;
+        if let Some(next) = snaps.get(idx + 1) {
+            let span = next.time - snaps[idx].time;
+            if span > 0.0 && t > snaps[idx].time {
+                let f = ((t - snaps[idx].time) / span).clamp(0.0, 1.0) as f32;
+                return [cur.x + (next.cursor.x - cur.x) * f, cur.y + (next.cursor.y - cur.y) * f];
+            }
+        }
+        [cur.x, cur.y]
+    };
+    let mut results_hit_events: Vec<ResultsHitEvent> = Vec::new();
+    {
+        let mut last_circle_pos: Option<[f32; 2]> = None;
+        for entry in &engine.timeline {
+            let is_circle = matches!(entry.label.as_str(), "circle" | "head");
+            if !is_circle {
+                continue;
+            }
+            let obj = &objects[entry.object_index];
+            if !matches!(
+                entry.result,
+                HitResult::Meh | HitResult::Ok | HitResult::Good | HitResult::Great | HitResult::Perfect
+            ) {
+                // Misses carry no cursor position in lazer either
+                // (`e.Position == null`), but still advance the chain.
+                last_circle_pos = Some(obj.position);
+                continue;
+            }
+            results_hit_events.push(ResultsHitEvent {
+                time: entry.time,
+                offset: entry.time_offset,
+                result: entry.result,
+                pos: obj.position,
+                last_pos: last_circle_pos,
+                cursor: cursor_at(entry.time),
+                radius: obj.radius,
+            });
+            last_circle_pos = Some(obj.position);
+        }
+    }
+
     Ok(GameData {
         score_events,
         ur_events,
@@ -717,12 +837,48 @@ fn build(
         spinner_max_ticks,
         key_events,
         player: String::new(),
+        played_at_ticks: None,
         final_score: engine.score.total_score(),
         final_classic_score: engine.score.classic_display_score(),
         final_max_combo: engine.score.highest_combo,
         final_accuracy: engine.score.accuracy(),
+        final_statistics: engine.score.statistics.clone(),
+        final_maximum_statistics: engine.score.maximum_statistics.clone(),
+        // `ScoreInfo.GetMaximumAchievableCombo`: the sum of the maximum
+        // statistics over the combo-affecting results. Clamped to the
+        // achieved combo (the invariant lazer maintains by construction —
+        // the judge's autoplay simulation can disagree with its own
+        // playthrough by a few nested judgements).
+        max_combo_achievable: (engine
+            .score
+            .maximum_statistics
+            .iter()
+            .filter(|(r, _)| {
+                matches!(
+                    r,
+                    HitResult::Miss
+                        | HitResult::Meh
+                        | HitResult::Ok
+                        | HitResult::Good
+                        | HitResult::Great
+                        | HitResult::Perfect
+                        | HitResult::LargeTickHit
+                        | HitResult::LargeTickMiss
+                        | HitResult::SliderTailHit
+                )
+            })
+            .map(|&(_, c)| c)
+            .sum::<i32>())
+        .max(engine.score.highest_combo),
+        mods: mods.clone(),
+        map_meta,
+        stars: f64::NAN,
         pp: f64::NAN,
         pp_max: f64::NAN,
+        pp_breakdown: None,
+        strain_aim: Vec::new(),
+        strain_points: Vec::new(),
+        results_hit_events,
         pp_events: Vec::new(),
         autoplay: false,
         miss_times,
