@@ -9,6 +9,7 @@ pub mod hitsound;
 pub mod hud;
 pub mod pp;
 pub mod render;
+pub mod results;
 pub mod scene;
 /// osu!(lazer) skinning abstraction port: user skin directories
 /// (`--skin <dir>`) with the built-in argon skin as fallback.
@@ -23,9 +24,45 @@ pub use raw_window_handle;
 use draw::{Atlas, Image, Region, TtfFont};
 use skin::SkinTexture;
 
-const TORUS_BOLD_TTF: &[u8] = include_bytes!("../assets/fonts/TorusPro-Bold.ttf");
-const TORUS_SEMI_BOLD_TTF: &[u8] = include_bytes!("../assets/fonts/TorusPro-SemiBold.ttf");
+const TORUS_BOLD_FONT: &[u8] = include_bytes!("../assets/fonts/Torus-Bold.otf");
+const TORUS_SEMI_BOLD_FONT: &[u8] = include_bytes!("../assets/fonts/Torus-SemiBold.otf");
 const CURSOR_TRAIL_PNG: &[u8] = include_bytes!("../assets/cursor/cursortrail.png");
+
+/// Built-in lazer mod icons (`osu-resources` `Textures/Icons/Mods`,
+/// MIT-licensed). Index order matches `Region::ModIcon`.
+pub const MOD_ICON_NAMES: [&str; 14] = [
+    "easy",
+    "no-fail",
+    "hidden",
+    "hard-rock",
+    "sudden-death",
+    "perfect",
+    "double-time",
+    "nightcore",
+    "half-time",
+    "flashlight",
+    "spun-out",
+    "classic",
+    "score-v2",
+    "touch-device",
+];
+const MOD_ICON_PNGS: [&[u8]; 14] = [
+    include_bytes!("../assets/modicons/mod-easy.png"),
+    include_bytes!("../assets/modicons/mod-no-fail.png"),
+    include_bytes!("../assets/modicons/mod-hidden.png"),
+    include_bytes!("../assets/modicons/mod-hard-rock.png"),
+    include_bytes!("../assets/modicons/mod-sudden-death.png"),
+    include_bytes!("../assets/modicons/mod-perfect.png"),
+    include_bytes!("../assets/modicons/mod-double-time.png"),
+    include_bytes!("../assets/modicons/mod-nightcore.png"),
+    include_bytes!("../assets/modicons/mod-half-time.png"),
+    include_bytes!("../assets/modicons/mod-flashlight.png"),
+    include_bytes!("../assets/modicons/mod-spun-out.png"),
+    include_bytes!("../assets/modicons/mod-classic.png"),
+    include_bytes!("../assets/modicons/mod-score-v2.png"),
+    include_bytes!("../assets/modicons/mod-touch-device.png"),
+];
+const MOD_ICON_BG_PNG: &[u8] = include_bytes!("../assets/modicons/mod-icon.png");
 const REPEAT_EDGE_PNG: &[u8] = include_bytes!("../assets/cursor/repeat-edge-piece.png");
 const APPROACH_CIRCLE_PNG: &[u8] = include_bytes!("../assets/cursor/approachcircle.png");
 
@@ -42,6 +79,86 @@ const COUNTER_DIGITS: [&[u8]; 10] = [
     include_bytes!("../assets/counter/argon-counter-9.png"),
 ];
 const COUNTER_DOT_PNG: &[u8] = include_bytes!("../assets/counter/argon-counter-dot.png");
+
+/// Lazer `ResultsScreen.BACKGROUND_BLUR` (blur sigma) expressed in
+/// virtual 1024x768 canvas units: 10 screen px at 1080p is
+/// `10 * 768 / 1080` units (the canvas scale is height-bound at 16:9).
+const RESULTS_BG_BLUR_UNITS: f32 = 10.0 * 768.0 / 1080.0;
+
+/// Separable 3-pass box blur — the standard fast gaussian approximation.
+/// `sigma` is in image pixels; the buffer is RGBA8.
+fn blur_image(img: &Image, sigma: f32) -> Image {
+    let mut out = img.rgba.clone();
+    if sigma <= 0.05 || img.width < 2 || img.height < 2 {
+        return Image { width: img.width, height: img.height, rgba: out };
+    }
+    // Box half-width whose triple pass matches the gaussian: one box pass
+    // over [-r, r] has variance r(r+2)/6, three passes r(r+2)/2.
+    let r = (((2.0 * sigma * sigma + 1.0).sqrt()) as usize).max(1);
+    let (w, h) = (img.width as usize, img.height as usize);
+    let mut tmp = vec![0u8; out.len()];
+    for _ in 0..3 {
+        box_blur_axis(&out, &mut tmp, w, h, r, true);
+        box_blur_axis(&tmp, &mut out, w, h, r, false);
+    }
+    Image { width: img.width, height: img.height, rgba: out }
+}
+
+/// One box-blur pass along x (`horizontal`) or y on RGBA8, edge-clamped
+/// (sliding window sum, O(1) per pixel).
+fn box_blur_axis(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize, horizontal: bool) {
+    let div = (2 * r + 1) as u32;
+    let (lines, len) = if horizontal { (h, w) } else { (w, h) };
+    for line in 0..lines {
+        let base = if horizontal { line * w * 4 } else { line * 4 };
+        let stride = if horizontal { 4 } else { w * 4 };
+        for c in 0..4 {
+            let at = |i: usize| src[base + i * stride + c] as u32;
+            let mut sum: u32 = (0..=r).map(|i| at(i.min(len - 1))).sum();
+            sum += at(0) * r as u32;
+            for i in 0..len {
+                dst[base + i * stride + c] = (sum / div) as u8;
+                let add = at((i + r + 1).min(len - 1));
+                let sub = at(i.saturating_sub(r));
+                sum = sum + add - sub;
+            }
+        }
+    }
+}
+
+/// Prepares a custom results-screen avatar: cover-crop to a square and
+/// pre-mask the rounded corners (radius = `corner_ratio` of the side;
+/// the renderer draws it over the placeholder box whose 80-unit square
+/// uses `CORNER_RADIUS` 20, hence 0.25).
+pub fn rounded_avatar(img: &Image, corner_ratio: f32) -> Image {
+    // Cover-crop to a square (centre).
+    let side = img.width.min(img.height) as i64;
+    let x0 = (img.width as i64 - side) / 2;
+    let y0 = (img.height as i64 - side) / 2;
+    let mut rgba = vec![0u8; (side * side * 4) as usize];
+    for row in 0..side {
+        let src = ((y0 + row) * img.width as i64 + x0) as usize * 4;
+        let dst = (row * side) as usize * 4;
+        rgba[dst..dst + side as usize * 4].copy_from_slice(&img.rgba[src..src + side as usize * 4]);
+    }
+    // Rounded-corner alpha mask (per-pixel distance to the corner arc).
+    let r = (side as f32 * corner_ratio).min(side as f32 * 0.5);
+    for row in 0..side {
+        for col in 0..side {
+            let (x, y) = (col as f32 + 0.5, row as f32 + 0.5);
+            // The nearest corner-arc centre: the point clamped into
+            // [r, side - r] on both axes.
+            let (cx, cy) = (x.min(side as f32 - r).max(r), y.min(side as f32 - r).max(r));
+            let d = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
+            if d > r {
+                let a = ((r + 1.0 - d).clamp(0.0, 1.0) * 255.0) as u32;
+                let i = (row * side + col) as usize * 4 + 3;
+                rgba[i] = (rgba[i] as u32 * a / 255) as u8;
+            }
+        }
+    }
+    Image { width: side as u32, height: side as u32, rgba }
+}
 const COUNTER_PERCENT_PNG: &[u8] = include_bytes!("../assets/counter/argon-counter-percentage.png");
 const COUNTER_X_PNG: &[u8] = include_bytes!("../assets/counter/argon-counter-x.png");
 const COUNTER_WIREFRAMES_PNG: &[u8] = include_bytes!("../assets/counter/argon-counter-wireframes.png");
@@ -56,12 +173,35 @@ pub fn build_atlas(
     skin: &mut dyn skin::SkinTextureSource,
     max_dim: u32,
 ) -> (Atlas, TtfFont, TtfFont) {
-    let (mut bold, mut bold_images) = TtfFont::rasterize(TORUS_BOLD_TTF, true);
-    let (mut semibold, mut semibold_images) = TtfFont::rasterize(TORUS_SEMI_BOLD_TTF, false);
+    build_atlas_with(bg_image, None, skin, max_dim)
+}
+
+/// `build_atlas` with an optional custom avatar image for the results
+/// screen (`--avatar` / config `avatar`): cover-cropped square with
+/// pre-masked rounded corners, packed as `Region::Avatar`.
+pub fn build_atlas_with(
+    bg_image: Option<Image>,
+    avatar_image: Option<Image>,
+    skin: &mut dyn skin::SkinTextureSource,
+    max_dim: u32,
+) -> (Atlas, TtfFont, TtfFont) {
+    let (mut bold, mut bold_images) = TtfFont::rasterize(TORUS_BOLD_FONT, true);
+    let (mut semibold, mut semibold_images) = TtfFont::rasterize(TORUS_SEMI_BOLD_FONT, false);
 
     let mut images: Vec<(Region, Image)> = Vec::new();
     if let Some(img) = bg_image {
+        // Results-screen copy: lazer's `ResultsScreen` blurs the beatmap
+        // background with `BACKGROUND_BLUR = 10` (the framework blur
+        // SIGMA in screen px; 10 px at 1080p = 7.11 virtual units) and
+        // fades it to `Gray(0.5)`. The blur is baked here in the image's
+        // own pixels so the drawn sigma is that many virtual units.
+        let sigma = RESULTS_BG_BLUR_UNITS * img.width as f32 / 1365.3333;
+        let blurred = blur_image(&img, sigma);
         images.push((Region::Background, img));
+        images.push((Region::BackgroundBlurred, blurred));
+    }
+    if let Some(avatar) = avatar_image {
+        images.push((Region::Avatar, rounded_avatar(&avatar, 0.25)));
     }
     images.append(&mut bold_images);
     images.append(&mut semibold_images);
@@ -90,6 +230,14 @@ pub fn build_atlas(
     {
         let (w, h, rgba) = decode_png_bytes(APPROACH_CIRCLE_PNG).expect("embedded png");
         images.push((Region::ApproachCircle, Image { width: w, height: h, rgba }));
+    }
+    for (i, png) in MOD_ICON_PNGS.iter().enumerate() {
+        let (w, h, rgba) = decode_png_bytes(png).expect("embedded mod icon png");
+        images.push((Region::ModIcon(i as u16), Image { width: w, height: h, rgba }));
+    }
+    {
+        let (w, h, rgba) = decode_png_bytes(MOD_ICON_BG_PNG).expect("embedded mod icon bg png");
+        images.push((Region::ModIconBg, Image { width: w, height: h, rgba }));
     }
 
     // Skin textures (`--skin <dir>` / built-in argon sprites): decode,
@@ -208,6 +356,45 @@ pub fn osu_general_value(map_path: &str, key: &str) -> Option<String> {
             continue;
         }
         if in_general {
+            if let Some((k, v)) = line.split_once(':') {
+                if k.trim().eq_ignore_ascii_case(key) {
+                    return Some(v.trim().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The beatmap's `[Metadata]` (title/artist/version/creator), romanised
+/// first with unicode fallback - lazer's `RomanisableString` default.
+pub fn osu_metadata(map_path: &str) -> game::MapMeta {
+    let section = |key: &str| -> String {
+        osu_section_value(map_path, "Metadata", key).unwrap_or_default()
+    };
+    let pick = |romanised: &str, unicode: &str| -> String {
+        let r = section(romanised);
+        if r.is_empty() { section(unicode) } else { r }
+    };
+    game::MapMeta {
+        title: pick("Title", "TitleUnicode"),
+        artist: pick("Artist", "ArtistUnicode"),
+        version: section("Version"),
+        creator: section("Creator"),
+    }
+}
+
+/// A value from an arbitrary `[Section]` of the beatmap file.
+fn osu_section_value(map_path: &str, section: &str, key: &str) -> Option<String> {
+    let content = std::fs::read_to_string(map_path).ok()?;
+    let mut in_section = false;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_section = line.eq_ignore_ascii_case(&format!("[{}]", section));
+            continue;
+        }
+        if in_section {
             if let Some((k, v)) = line.split_once(':') {
                 if k.trim().eq_ignore_ascii_case(key) {
                     return Some(v.trim().to_string());

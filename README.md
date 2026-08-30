@@ -42,6 +42,9 @@ osu_replay_render <beatmap.osu> [replay.osr] [options]
 | `--hitsounds` | 导出时离线合成**单独一条音效轨**并混入输出(与 `--audio` BGM 经 `amix` 求和,`normalize=0` 保持原始比例;无 BGM 时音效轨即音轨)。复刻 lazer 游戏音频语义:仅命中判定触发(`ArmedState.Hit`,miss 不发声);音色/音量按 .osu 采样数据解析(时间点 bank/音量、对象 hitSample、滑条 edgeSounds/edgeSets;采样点取 `CONTROL_POINT_LENIENCY` 5ms 语义);圆点=hitnormal+whistle/finish/clap,滑条=头/反复/尾节点音+slidertick+跟踪期 sliderslide/sliderwhistle 循环(跟踪断开即截断);音量下限 5%、声像随物件 X(`PositionalHitsoundsLevel` 0.8)、采样**原速回放**——任何 mod 下都不变调(含 NC),DT/HT/NC 只压缩触发时机;MISS 不触发物件音,连击归零播 `combobreak`(`ComboEffects`:旧 combo>20 或首次中断,`AlwaysPlayFirstComboBreak` 默认开;该样本 ArgonPro 集没有,按查找链取 Argon 集)。音源为 **ArgonPro** 资源集(内嵌):所有 gameplay 查找都命中该集、查找链不再下落——其滑条滑动循环音(sliderslide/sliderwhistle)是空条目=**静音**,即 ArgonPro 不播滑条滑动声;头/尾/反复节点音与 slidertick 为真采样,正常播放 |
 | `--bg` | 绘制谱面背景图（`[Events]` 的 `0,0,"..."`，相对谱面目录，PNG/JPEG），全屏铺满 |
 | `--bg-opacity <0..1>` | 背景不透明度，默认 **0.3** = 1 − DimLevel（lazer `OsuSetting.DimLevel` 默认 0.7，与游戏内"背景暗度"语义一致） |
+| `--results <secs>` | 玩法结束后追加结算屏（lazer `Screens/Ranking`）：**展开状态的 ScorePanel** 静态终帧——顶部头像/用户名条、标题/作者、准确率环（背景环 + 渐变计量表 + D~SS 分级色环 + 达成档位徽章 + 大档位字母）、总分、星数胶囊/模式图标/Mod 徽章、难度名与作者、ACCURACY/COMBO/PP 与判定统计行（GREAT/OK/MEH/MISS 及 L TICK/SLIDER TAIL/BONUS 行），底部 #333 按钮栏。背景为谱面背景图的高斯模糊副本（lazer `ResultsScreen` 的 `BACKGROUND_BLUR` σ=10px@1080p）按 `Gray(0.5)` 压暗铺满，与 lazer 一致；谱面无背景图时为清屏色。不做入场动画（准确率环/计数器直接呈终值）；rank 按 `RankFromScore` 截断 + osu! miss 降级 + HD 银牌计算。默认 **4 秒**；带音频导出时音轨自动以静音补齐到结算屏结束。`--no-results` 关闭。**`--results-only`** 则完全不渲染玩法、只输出结算屏（海报/预览模式，时长同样由 `--results` 控制；单图示例：`--results-only --png-dir out --fps 1 --results 1`） |
+| `--avatar <image>` | 结算屏头像图片（jpg/png）：居中裁方 + 预圆角（与占位框同为 20/80 圆角），画在头像框里；不传时沿用玩家首字母占位。等价 config 键 `"avatar"` |
+| `--config <file.json>` | JSON 配置文件：键与 CLI 长参数一一对应（snake_case），如 `{"avatar": "a.png", "out": "x.mp4", "results": 5, "results_only": true, "bg": true, "bg_opacity": 0.3, "skin": "dir", "size": "1920x1080", "fps": 60, "hd": "on", "hitsounds": true, "master_volume": 0.8, "ffmpeg_extra": ["-movflags", "+faststart"]}`。config 先应用，**显式 CLI 参数始终覆盖 config**（与出现顺序无关） |
 | `--limit <n>` | 最多渲染 n 帧（测试用） |
 
 示例：
@@ -104,7 +107,7 @@ if renderer.pending_len() > 0 {
 ## 已实现（Argon）
 
 - **圆**：四层渐变圆身（外填充/外渐变/内渐变/内填充）、白描边、combo
-  数字（TorusPro Bold）、approach circle、命中动画复刻
+  数字（Torus Bold）、approach circle、命中动画复刻
   `ArgonMainCirclePiece.updateStateTransforms`：填充层 150ms OutQuint
   隐藏、数字 75ms 消失、外渐变延迟 12.5ms 变白（80ms）后线性淡出
   （150ms）、描边弹性收缩至 0.8×（400ms OutElasticHalf）+ 800ms 颜色
@@ -221,7 +224,7 @@ if renderer.pending_len() > 0 {
 
 `assets/`(全部经 `include_bytes!` 内嵌进二进制,**运行时不依赖 CWD**,
 可直接被其他程序作为库调用):
-- `fonts/TorusPro-*.ttf` — 文字渲染（ab_glyph 启动时按 24/48/96 三档
+- `fonts/Torus-*.otf` — 文字渲染（Torus，与 lazer 一致；ab_glyph 启动时按 24/48/96 三档
   em 栅格化进图集）。
 - `counter/argon-counter-*.png` — lazer 官方 HUD 计数器纹理数字
   （来自 [osu-resources](https://github.com/ppy/osu-resources)，MIT/CC-BY-NC 4.0）。

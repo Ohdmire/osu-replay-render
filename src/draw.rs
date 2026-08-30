@@ -229,6 +229,9 @@ pub const MODE_FLAT: f32 = 6.0;
 pub const MODE_ARC: f32 = 7.0;
 pub const MODE_CAPDISC: f32 = 8.0;
 pub const MODE_GLOWRING: f32 = 9.0;
+/// Rounded rectangle: aux.y = corner radius, colour2.xy = half extents
+/// (local space is centred). Corner colours give the vertical gradient.
+pub const MODE_ROUNDED: f32 = 11.0;
 pub const MODE_GLOWFILL: f32 = 10.0;
 
 #[repr(C)]
@@ -269,6 +272,10 @@ pub struct BodyDraw {
 #[allow(dead_code)]
 #[derive(Default)]
 pub struct DrawList {
+    /// Global alpha multiplier applied to every pushed vertex (scene
+    /// transitions: the results screen cross-fades over the final
+    /// gameplay frame).
+    pub global_alpha: f32,
     pub bodies: Vec<BodyDraw>,
     /// Draw-order anchors for bodies: (index-stream position, body index).
     /// Recorded where the body is pushed during scene construction so the
@@ -288,6 +295,7 @@ pub struct DrawList {
 impl DrawList {
     pub fn new() -> DrawList {
         DrawList {
+            global_alpha: 1.0,
             bodies: Vec::new(),
             body_marks: Vec::new(),
             vertices: Vec::with_capacity(1 << 16),
@@ -335,14 +343,28 @@ impl DrawList {
         self.flush_run();
     }
 
-    fn quad(&mut self, v: [Vertex; 4]) {
+    fn quad(&mut self, mut v: [Vertex; 4]) {
+        let a = self.global_alpha;
+        if a < 1.0 {
+            for vtx in &mut v {
+                vtx.color[3] *= a;
+                vtx.color2[3] *= a;
+            }
+        }
         let base = self.vertices.len() as u32;
         self.vertices.extend_from_slice(&v);
         self.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
         self.run_len += 6;
     }
 
-    fn tri(&mut self, v: [Vertex; 3]) {
+    fn tri(&mut self, mut v: [Vertex; 3]) {
+        let a = self.global_alpha;
+        if a < 1.0 {
+            for vtx in &mut v {
+                vtx.color[3] *= a;
+                vtx.color2[3] *= a;
+            }
+        }
         let base = self.vertices.len() as u32;
         self.vertices.extend_from_slice(&v);
         self.indices.extend_from_slice(&[base, base + 1, base + 2]);
@@ -444,6 +466,38 @@ impl DrawList {
             corner([r, -r], top),
             corner([r, r], bottom),
             corner([-r, r], bottom),
+        ]);
+    }
+
+    /// Rounded rectangle centred at `center`, vertical colour gradient
+    /// (framework `Container` + `CornerRadius` masking).
+    pub fn rounded_rect(
+        &mut self,
+        center: [f32; 2],
+        size: [f32; 2],
+        radius: f32,
+        top: Colour,
+        bottom: Colour,
+        blend: Blend,
+    ) {
+        let hw = size[0] * 0.5;
+        let hh = size[1] * 0.5;
+        // Pad the quad past the corners so AA has room on every edge.
+        let pad = radius.max(1.0) + 1.5;
+        let corner = |p: [f32; 2], col: Colour| Vertex {
+            pos: [center[0] + p[0], center[1] + p[1]],
+            local: p,
+            color: [col.r, col.g, col.b, col.a],
+            color2: [hw, hh, 0.0, 0.0],
+            uv: [0.0; 4],
+            aux: [MODE_ROUNDED, radius, 0.0, 0.0],
+        };
+        self.set_blend(blend);
+        self.quad([
+            corner([-hw - pad, -hh - pad], top),
+            corner([hw + pad, -hh - pad], top),
+            corner([hw + pad, hh + pad], bottom),
+            corner([-hw - pad, hh + pad], bottom),
         ]);
     }
 
@@ -778,7 +832,7 @@ impl DrawList {
 }
 
 // ---------------------------------------------------------------------------
-// TTF fonts (TorusPro): rasterised into the atlas at startup
+// TTF/OTF fonts (Torus): rasterised into the atlas at startup
 // ---------------------------------------------------------------------------
 
 /// Em size classes rasterised per glyph; small text gets its own bitmaps so
@@ -789,6 +843,7 @@ const TTF_CHARS: &[char] = &[
     'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
     'a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p','q','r','s','t','u','v','w','x','y','z',
     '0','1','2','3','4','5','6','7','8','9','.',',','%','x','+','-','!','/',':',
+    ' ', '(', ')', '\'', '&',
 ];
 
 #[derive(Clone, Copy)]
@@ -830,7 +885,23 @@ impl TtfFont {
                     _ => continue,
                 };
                 let glyph = gid.with_scale_and_position(scale, ab_glyph::Point { x: 0.0, y: 0.0 });
-                let Some(outlined) = font.outline_glyph(glyph) else { continue };
+                let advance = scaled.h_advance(gid);
+                let Some(outlined) = font.outline_glyph(glyph) else {
+                    // Whitespace: no outline to raster, but the advance
+                    // must survive so words keep their spacing.
+                    glyphs.insert(
+                        (c, em),
+                        TtfGlyph {
+                            rect: Rect { x0: 0.0, y0: 0.0, x1: 0.0, y1: 0.0 },
+                            w: 0.0,
+                            h: 0.0,
+                            xoff: 0.0,
+                            yoff: 0.0,
+                            advance,
+                        },
+                    );
+                    continue;
+                };
 
                 // NOTE: ab_glyph bounds are y-up around the baseline, so
                 // min.y is NEGATIVE for glyphs above it. Casts to u32 must
@@ -887,7 +958,7 @@ impl TtfFont {
         }
     }
 
-    fn class_for(size_px: f32) -> u32 {
+    pub fn class_for(size_px: f32) -> u32 {
         // Pick the smallest class that is >= the requested size, else the
         // largest (downscale beats heavy upscale beyond 2x).
         if size_px <= 24.0 {
@@ -982,6 +1053,11 @@ pub fn draw_ttf_text(
             Some(g) => g,
             None => continue,
         };
+        if g.w <= 0.0 || g.h <= 0.0 {
+            // Whitespace: advance only, nothing to draw.
+            pen_x += g.advance * scale + spacing;
+            continue;
+        }
         let aw = atlas.width as f32;
         let ah = atlas.height as f32;
         let gx0 = g.rect.x0 / aw;
@@ -1031,9 +1107,21 @@ pub enum Region {
     ApproachCircle,
     /// Full-screen beatmap background (`--bg`).
     Background,
+    /// The beatmap background pre-blurred for the results screen
+    /// (lazer `ResultsScreen` blurs the background with
+    /// `BACKGROUND_BLUR` sigma and fades it to gray).
+    BackgroundBlurred,
+    /// The results-screen avatar (`--avatar <image>` / config `avatar`):
+    /// cover-cropped to a square with pre-masked rounded corners.
+    Avatar,
     /// A user-skin texture (`--skin <dir>`): index into the skin's
     /// texture table, assigned when the atlas is built.
     Skin(u32),
+    /// A built-in lazer mod icon (`assets/modicons/mod-*.png`): index
+    /// into the MOD_ICON_NAMES table.
+    ModIcon(u16),
+    /// The hexagonal ModIcon background (`mod-icon.png`).
+    ModIconBg,
 }
 
 pub struct Atlas {

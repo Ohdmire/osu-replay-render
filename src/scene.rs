@@ -587,6 +587,12 @@ pub struct SceneState {
     pub mapper: Mapper,
     /// Beatmap background opacity (`--bg`); None draws no background.
     pub bg_opacity: Option<f32>,
+    /// A beatmap background exists in the atlas (drives the results
+    /// screen's blurred background, which shows regardless of `--bg`).
+    pub has_bg: bool,
+    /// A custom avatar image exists in the atlas (`--avatar` / config
+    /// `avatar`); the results screen draws it instead of the initial.
+    pub has_avatar: bool,
     /// 物件之间的引导线(follow points);默认开,实时预览可关。
     pub follow_points: bool,
     /// 光标尺寸倍率(lazer `OsuSetting.GameplayCursorSize`:默认 1.0,
@@ -606,6 +612,16 @@ pub struct SceneState {
     /// Hidden mod active (from `GameData::hidden`); pub so a host can
     /// force HD visuals live on top of the replay's own mods.
     pub hidden: bool,
+    /// Results-screen cutoff: at times >= this the frame draws the (static,
+    /// expanded) lazer results screen instead of gameplay. `None` = never.
+    pub results_at: Option<f64>,
+    /// Gameplay FADE-OUT length in frames at the results handover.
+    pub results_fade_frames: u32,
+    /// Results screen FADE-IN length in frames (starts once the fade-out
+    /// finished). 0 = appear instantly.
+    pub results_fadein_frames: u32,
+    /// Results frames drawn so far (drives the cross-fade).
+    results_frame: u32,
     /// Resolved legacy skin sprites (lazily built on the first frame a
     /// legacy skin is active).
     legacy: Option<LegacyCache>,
@@ -618,6 +634,8 @@ impl SceneState {
             pro_skin: false,
             mapper: Mapper::new(width, height),
             bg_opacity: None,
+            has_bg: false,
+            has_avatar: false,
             follow_points: true,
             cursor_size: 1.0,
             cursor_expand: 1.0,
@@ -628,6 +646,10 @@ impl SceneState {
             spinner_anims: (0..game.objects.len()).map(|_| SpinnerAnim::new()).collect(),
             hud: hud::HudState::new(),
             hidden: game.hidden,
+            results_at: None,
+            results_fade_frames: 0,
+            results_fadein_frames: 0,
+            results_frame: 0,
             legacy: None,
             last_t: f64::NEG_INFINITY,
         }
@@ -641,6 +663,28 @@ impl SceneState {
         list: &mut DrawList,
     ) {
         let t = snap.time;
+
+        // Sequential handover: the gameplay FADES OUT first, then the
+        // results screen FADES IN over the background.
+        let is_results = self.results_at.is_some_and(|ra| t >= ra);
+        let (mut gameplay_alpha, mut results_alpha) = (1.0f32, 0.0f32);
+        if is_results {
+            let n = self.results_frame;
+            self.results_frame += 1;
+            let (fo, fi) = (self.results_fade_frames, self.results_fadein_frames);
+            if n < fo {
+                gameplay_alpha = 1.0 - n as f32 / fo as f32;
+            } else if fi == 0 {
+                results_alpha = 1.0;
+            } else {
+                results_alpha = ((n - fo) as f32 / fi as f32).min(1.0);
+            }
+        } else {
+            self.results_frame = 0;
+        }
+        let prev_alpha = list.global_alpha;
+        list.global_alpha = gameplay_alpha;
+
         let dt = if self.last_t > f64::NEG_INFINITY / 2.0 && t > self.last_t {
             (t - self.last_t).max(0.001)
         } else {
@@ -778,6 +822,21 @@ impl SceneState {
 
         // 8. HUD.
         self.hud.draw(game, assets, list, &self.mapper, t);
+
+        // 9. Results screen: fades in once the gameplay has fully faded
+        // out (sequential, not a cross-fade).
+        list.global_alpha = prev_alpha;
+        if results_alpha > 0.0 {
+            let view = crate::results::ResultsView {
+                game,
+                classic_score: self.hud.is_classic_score(),
+                has_bg: self.has_bg,
+                has_avatar: self.has_avatar,
+            };
+            list.global_alpha = results_alpha;
+            crate::results::draw(&view, assets, &self.mapper, list);
+            list.global_alpha = prev_alpha;
+        }
 
         self.last_t = t;
     }

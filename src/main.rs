@@ -32,9 +32,16 @@
 //!                          "Beatmap skins" off). Default: the beatmap's
 //!                          colours win; the skin's only apply when the
 //!                          beatmap ships none
+//!   --results <secs>       Seconds of the (static, expanded) results
+//!                          screen appended after gameplay (default 4;
+//!                          --no-results disables)
+//!   --results-only         Render ONLY the results screen (poster mode:
+//!                          no gameplay frames; pair with --png-dir for a
+//!                          single preview image, e.g. --results-only
+//!                          --png-dir out --fps 1 --results 1)
 //!   --limit <n>            Render at most n frames (testing)
 
-use osu_replay_render::{build_atlas, decode_image_file, draw, draw::Image, game, hitsound, osu_background_file, osu_general_value, render::Renderer, scene, skin};
+use osu_replay_render::{build_atlas_with, decode_image_file, draw, draw::Image, game, hitsound, osu_background_file, osu_general_value, render::Renderer, scene, skin};
 
 use scene::{Assets, SceneState};
 use std::io::Write;
@@ -121,6 +128,133 @@ struct Options {
     /// default the skin's own score/accuracy/combo/health/key pieces are
     /// used when it provides them.
     argon_hud: bool,
+    /// Seconds of the (static, expanded) results screen appended after
+    /// gameplay (`--results <secs>`; default 4, `--no-results` disables).
+    results: f64,
+    /// Render ONLY the results screen, no gameplay frames
+    /// (`--results-only`; duration still set by `--results`).
+    results_only: bool,
+    /// Custom results-screen avatar image (`--avatar <image>` / config
+    /// `avatar`): cover-cropped square with rounded corners.
+    avatar: Option<String>,
+}
+
+/// `--config <file.json>`: every key mirrors the matching CLI flag
+/// (snake_case). Explicit CLI flags win over the config regardless of
+/// the order they appear in.
+#[derive(serde::Deserialize)]
+struct ConfigJson {
+    out: Option<String>,
+    png_dir: Option<String>,
+    size: Option<String>,
+    fps: Option<f64>,
+    start: Option<f64>,
+    end: Option<f64>,
+    score: Option<String>,
+    skin: Option<String>,
+    encoder: Option<String>,
+    quality: Option<u32>,
+    limit: Option<usize>,
+    no_guides: Option<bool>,
+    no_pp: Option<bool>,
+    audio: Option<String>,
+    bg: Option<bool>,
+    bg_opacity: Option<f32>,
+    cursor_size: Option<f32>,
+    audio_offset: Option<f64>,
+    autoplay: Option<bool>,
+    hd: Option<String>,
+    hitsounds: Option<bool>,
+    hitsounds_volume: Option<f32>,
+    bgm_volume: Option<f32>,
+    master_volume: Option<f32>,
+    skin_colours: Option<bool>,
+    argon_hud: Option<bool>,
+    results: Option<f64>,
+    results_only: Option<bool>,
+    avatar: Option<String>,
+    ffmpeg_extra: Option<Vec<String>>,
+}
+
+/// `--skin` value shared by the CLI flag and the config's `skin` key.
+fn set_skin(opts: &mut Options, skin: &str) -> Result<(), String> {
+    if skin == "argon" || skin == "argon-pro" {
+        opts.skin = skin.to_string();
+        opts.skin_dir = None;
+    } else {
+        // A user skin directory (unpacked .osk): legacy skin rendering
+        // with per-element argon fallbacks.
+        let p = std::path::Path::new(skin);
+        if !p.is_dir() {
+            return Err(format!("skin: not a directory: {} (or argon|argon-pro)", skin));
+        }
+        opts.skin_dir = Some(p.to_path_buf());
+        opts.skin = "argon".to_string();
+    }
+    Ok(())
+}
+
+/// Applies the config over the current options (config wins over the
+/// defaults; CLI wins over the config since it is applied afterwards).
+fn apply_config(opts: &mut Options, c: ConfigJson) -> Result<(), String> {
+    if c.out.is_some() { opts.out = c.out; }
+    if c.png_dir.is_some() { opts.png_dir = c.png_dir; }
+    if let Some(s) = c.size {
+        let mut it = s.split('x');
+        opts.width = it.next().and_then(|v| v.parse().ok()).ok_or("config size: bad WxH")?;
+        opts.height = it.next().and_then(|v| v.parse().ok()).ok_or("config size: bad WxH")?;
+    }
+    if let Some(v) = c.fps { opts.fps = v; }
+    if c.start.is_some() { opts.start = c.start; }
+    if c.end.is_some() { opts.end = c.end; }
+    if let Some(v) = c.score {
+        if v == "classic" {
+            opts.classic_score = true;
+        }
+    }
+    if let Some(v) = c.skin {
+        set_skin(opts, &v)?;
+    }
+    if let Some(v) = c.encoder {
+        if !matches!(v.as_str(), "auto" | "x264" | "x265" | "nvenc") {
+            return Err("config encoder must be auto, x264, x265 or nvenc".into());
+        }
+        opts.encoder = v;
+    }
+    if let Some(v) = c.quality { opts.quality = v; }
+    if let Some(v) = c.limit { opts.limit = Some(v); }
+    if let Some(true) = c.no_guides { opts.guides = false; }
+    if let Some(true) = c.no_pp { opts.pp = false; }
+    if c.audio.is_some() { opts.audio = c.audio; }
+    if let Some(true) = c.bg { opts.bg = true; }
+    if let Some(v) = c.bg_opacity { opts.bg_opacity = v; }
+    if let Some(v) = c.cursor_size { opts.cursor_size = v; }
+    if c.audio_offset.is_some() { opts.audio_offset = c.audio_offset; }
+    if let Some(true) = c.autoplay { opts.autoplay = true; }
+    if let Some(v) = c.hd {
+        opts.hd = match v.as_str() {
+            "on" => HdMode::On,
+            "off" => HdMode::Off,
+            "auto" => HdMode::Auto,
+            other => return Err(format!("config hd must be auto, on or off (got {})", other)),
+        };
+    }
+    if let Some(true) = c.hitsounds { opts.hitsounds = true; }
+    if let Some(v) = c.hitsounds_volume { opts.hitsounds_volume = v; }
+    if let Some(v) = c.bgm_volume { opts.bgm_volume = v; }
+    if let Some(v) = c.master_volume { opts.master_volume = v; }
+    if let Some(true) = c.skin_colours { opts.skin_colours = true; }
+    if let Some(true) = c.argon_hud { opts.argon_hud = true; }
+    if let Some(v) = c.results { opts.results = v; }
+    if let Some(true) = c.results_only {
+        opts.results_only = true;
+        if opts.results <= 0.0 {
+            opts.results = 4.0;
+        }
+    }
+    if c.avatar.is_some() { opts.avatar = c.avatar; }
+    if let Some(v) = c.ffmpeg_extra { opts.ffmpeg_extra = v; }
+    Ok(())
 }
 
 fn parse_args() -> Result<(Options, String, Option<String>), String> {
@@ -130,7 +264,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
     let autoplay = args.iter().any(|a| a == "--autoplay");
     let min_args = if autoplay { 2 } else { 3 };
     if args.len() < min_args {
-        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--hd] [--no-hd] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro|dir] [--argon-hud] [--no-guides] [--no-pp] [--audio [file.mp3]] [--audio-offset ms] [--bg] [--bg-opacity 0..1] [--cursor-size 0.1..=2] [--hitsounds] [--skin-colours] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
+        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--hd] [--no-hd] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro|dir] [--argon-hud] [--no-guides] [--no-pp] [--audio [file.mp3]] [--audio-offset ms] [--bg] [--bg-opacity 0..1] [--cursor-size 0.1..=2] [--hitsounds] [--skin-colours] [--results secs] [--results-only] [--avatar image] [--config file.json] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
     }
     let map_path = args[1].clone();
     let replay_path = if autoplay { None } else { Some(args[2].clone()) };
@@ -165,7 +299,36 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
         master_volume: 0.6,
         skin_colours: false,
         argon_hud: false,
+        results: 4.0,
+        results_only: false,
+        avatar: None,
     };
+    // `--config <file.json>` pre-pass: the JSON provides base values;
+    // explicit CLI flags win over it regardless of order. Relative
+    // `avatar` paths resolve against the config file's directory.
+    let mut i = min_args;
+    while i < args.len() {
+        if args[i] == "--config" {
+            i += 1;
+            let path = args.get(i).ok_or("--config needs a JSON file")?;
+            let text = std::fs::read_to_string(path).map_err(|e| format!("--config: cannot read {}: {}", path, e))?;
+            let cfg: ConfigJson =
+                serde_json::from_str(&text).map_err(|e| format!("--config: bad JSON in {}: {}", path, e))?;
+            let mut cfg = cfg;
+            if let Some(a) = &cfg.avatar {
+                if std::path::Path::new(a).is_relative() {
+                    let dir = std::path::Path::new(path).parent().unwrap_or(std::path::Path::new("."));
+                    let joined = dir.join(a);
+                    if joined.exists() {
+                        cfg.avatar = Some(joined.to_string_lossy().into_owned());
+                    }
+                }
+            }
+            apply_config(&mut opts, cfg)?;
+        }
+        i += 1;
+    }
+    let mut i = min_args;
     let mut i = min_args;
     while i < args.len() {
         match args[i].as_str() {
@@ -208,19 +371,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
             "--skin" => {
                 i += 1;
                 let skin = args.get(i).cloned().ok_or("--skin needs a value")?;
-                if skin == "argon" || skin == "argon-pro" {
-                    opts.skin = skin;
-                    opts.skin_dir = None;
-                } else {
-                    // A user skin directory (unpacked .osk): legacy skin
-                    // rendering with per-element argon fallbacks.
-                    let p = std::path::Path::new(&skin);
-                    if !p.is_dir() {
-                        return Err(format!("--skin: not a directory: {} (or argon|argon-pro)", skin));
-                    }
-                    opts.skin_dir = Some(p.to_path_buf());
-                    opts.skin = "argon".to_string();
-                }
+                set_skin(&mut opts, &skin)?;
             }
             "--encoder" => {
                 i += 1;
@@ -307,6 +458,33 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
             }
             "--argon-hud" => {
                 opts.argon_hud = true;
+            }
+            "--results" => {
+                i += 1;
+                opts.results = args
+                    .get(i)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("bad --results (expected seconds)")?;
+                if opts.results < 0.0 || opts.results > 300.0 {
+                    return Err("--results must be within 0..300 seconds".into());
+                }
+            }
+            "--no-results" => {
+                opts.results = 0.0;
+            }
+            "--results-only" => {
+                opts.results_only = true;
+                if opts.results <= 0.0 {
+                    opts.results = 4.0;
+                }
+            }
+            "--avatar" => {
+                i += 1;
+                opts.avatar = Some(args.get(i).cloned().ok_or("--avatar needs an image path")?);
+            }
+            "--config" => {
+                // Consumed by the pre-pass; skip its value here.
+                i += 1;
             }
             "--master-volume" => {
                 i += 1;
@@ -533,31 +711,31 @@ fn main() {
         None => None,
     };
 
-    // Resolve the beatmap background (`--bg`): the `[Events]` background
-    // image, decoded into the atlas and drawn full-screen at
-    // `--bg-opacity` (default 1 - DimLevel 0.7, matching lazer).
-    let bg_image: Option<Image> = if opts.bg {
-        match osu_background_file(&map_path) {
-            Some(name) => {
-                let p = map_dir.join(&name);
-                match decode_image_file(&p) {
-                    Ok(img) => {
-                        eprintln!("background: {} ({}x{}, opacity {:.2})", p.display(), img.width, img.height, opts.bg_opacity);
-                        Some(img)
-                    }
-                    Err(e) => {
-                        eprintln!("warning: {} - rendering without background", e);
-                        None
-                    }
+    // Resolve the beatmap background: the `[Events]` background image,
+    // decoded into the atlas (raw + pre-blurred copy). Gameplay draws it
+    // full-screen at `--bg-opacity` when `--bg` is on (default
+    // 1 - DimLevel 0.7, matching lazer); the results screen always draws
+    // the blurred copy (lazer `ResultsScreen`).
+    let bg_image: Option<Image> = match osu_background_file(&map_path) {
+        Some(name) => {
+            let p = map_dir.join(&name);
+            match decode_image_file(&p) {
+                Ok(img) => {
+                    eprintln!("background: {} ({}x{})", p.display(), img.width, img.height);
+                    Some(img)
+                }
+                Err(e) => {
+                    eprintln!("warning: {} - rendering without background", e);
+                    None
                 }
             }
-            None => {
-                eprintln!("warning: beatmap has no background image - rendering without background");
-                None
-            }
         }
-    } else {
-        None
+        None => {
+            if opts.bg {
+                eprintln!("warning: beatmap has no background image - rendering without background");
+            }
+            None
+        }
     };
 
     let has_bg = bg_image.is_some();
@@ -574,10 +752,26 @@ fn main() {
     };
     game::apply_skin_combo_colours(&mut game, &resolved_skin, opts.skin_colours);
 
+    // Custom results-screen avatar (`--avatar <image>` / config
+    // `avatar`): decoded into the atlas, pre-cropped and pre-rounded.
+    let avatar_image: Option<Image> = match &opts.avatar {
+        Some(p) => match decode_image_file(std::path::Path::new(p)) {
+            Ok(img) => {
+                eprintln!("avatar: {} ({}x{})", p, img.width, img.height);
+                Some(img)
+            }
+            Err(e) => {
+                eprintln!("warning: {} - falling back to the initial placeholder", e);
+                None
+            }
+        },
+        None => None,
+    };
+
     // 8192 is the GLES/GL-compat floor for max_texture_dimension2d:
     // capping here keeps the atlas creatable on every backend (desktop
     // Vulkan/dGPU simply packs wider instead of taller).
-    let (atlas, bold, semibold) = build_atlas(bg_image, &mut resolved_skin, 8192);
+    let (atlas, bold, semibold) = build_atlas_with(bg_image, avatar_image, &mut resolved_skin, 8192);
     eprintln!("atlas: {}x{}", atlas.width, atlas.height);
 
     let mut renderer = Renderer::new(opts.width, opts.height, &atlas);
@@ -586,7 +780,9 @@ fn main() {
     state.hud.ur_guides = opts.guides;
     state.hud.pp_display = opts.pp;
     state.hud.argon_hud = opts.argon_hud;
-    state.bg_opacity = if has_bg { Some(opts.bg_opacity) } else { None };
+    state.bg_opacity = if has_bg && opts.bg { Some(opts.bg_opacity) } else { None };
+    state.has_bg = has_bg;
+    state.has_avatar = opts.avatar.is_some();
     state.cursor_size = opts.cursor_size;
     if opts.classic_score {
         state.hud.use_classic_score();
@@ -629,6 +825,36 @@ fn main() {
     if frame_times.is_empty() {
         eprintln!("error: no frames to render");
         std::process::exit(1);
+    }
+
+    // Results screen (`--results`, default 4s): appended after gameplay as
+    // the static expanded end-state (lazer ResultsScreen, no entrance
+    // animations). The frames are duplicates of the last gameplay time —
+    // `state.results_at` switches the scene builder over. `--results-only`
+    // drops the gameplay frames entirely and renders JUST the results
+    // screen (poster/preview generation).
+    let results_frames = (opts.results * opts.fps).round() as usize;
+    let mut frame_times = frame_times;
+    if opts.results_only {
+        let last = *frame_times.last().unwrap();
+        let n = results_frames.max(1);
+        frame_times.clear();
+        for _ in 0..n {
+            frame_times.push(last);
+        }
+        state.results_at = Some(last);
+        eprintln!("results-only: {} frames ({:.1}s)", n, opts.results);
+    } else if results_frames > 0 {
+        let last = *frame_times.last().unwrap();
+        for _ in 0..results_frames {
+            frame_times.push(last);
+        }
+        state.results_at = Some(last);
+        // Sequential handover: the gameplay fades out (0.35s), then the
+        // results screen fades in (0.45s); poster mode shows it instantly.
+        state.results_fade_frames = (0.35 * opts.fps).round() as u32;
+        state.results_fadein_frames = (0.45 * opts.fps).round() as u32;
+        eprintln!("results: +{} frames ({:.1}s, expanded panel, fade-out 0.35s + fade-in 0.45s)", results_frames, opts.results);
     }
 
     if opts.hitsounds && opts.out.is_none() {
@@ -902,6 +1128,16 @@ fn main() {
             } else {
                 String::new()
             };
+            // Results tail: the video runs past the music by the appended
+            // results frames. Pad the mix with silence and pin the output
+            // length to the video track (plain -shortest would cut the
+            // results off as soon as the music ends).
+            let results_tail = if results_frames > 0 {
+                format!("apad,atrim=duration={:.3}", frame_times.len() as f64 / opts.fps)
+            } else {
+                String::new()
+            };
+            let shortest = if results_frames > 0 { "" } else { "-shortest" };
             match (&audio_path, &hits_path) {
                 (Some(_), Some(hits)) => {
                     cmd.arg("-i").arg(hits);
@@ -910,13 +1146,17 @@ fn main() {
                     } else {
                         format!("[1:a]{}[bgm];[bgm]", bgm_filters.join(","))
                     };
-                    cmd.arg("-filter_complex").arg(format!("{head}amix=inputs=2:normalize=0{master}[aout]"));
+                    let pad = if results_tail.is_empty() { String::new() } else { format!(",{}", results_tail) };
+                    cmd.arg("-filter_complex").arg(format!("{head}amix=inputs=2:normalize=0{master}{pad}[aout]"));
                     cmd.arg("-map").arg("0:v").arg("-map").arg("[aout]");
                 }
                 (Some(_), None) => {
                     let mut filters = bgm_filters.clone();
                     if !master.is_empty() {
                         filters.push(master.trim_start_matches(',').to_string());
+                    }
+                    if !results_tail.is_empty() {
+                        filters.push(results_tail.clone());
                     }
                     if !filters.is_empty() {
                         cmd.arg("-af").arg(filters.join(","));
@@ -925,23 +1165,32 @@ fn main() {
                 }
                 (None, Some(hits)) => {
                     cmd.arg("-i").arg(hits);
+                    let mut filters = Vec::new();
                     if !master.is_empty() {
-                        cmd.arg("-af").arg(master.trim_start_matches(','));
+                        filters.push(master.trim_start_matches(',').to_string());
+                    }
+                    if !results_tail.is_empty() {
+                        filters.push(results_tail.clone());
+                    }
+                    if !filters.is_empty() {
+                        cmd.arg("-af").arg(filters.join(","));
                     }
                     cmd.arg("-map").arg("0:v").arg("-map").arg("1:a");
                 }
                 (None, None) => unreachable!(),
             }
-            let status = cmd
-                .arg("-c:v").arg("copy")
+            cmd.arg("-c:v").arg("copy")
                 // Pin the video track timescale to the fps so each frame is
                 // exactly one tick and the container reports avg_frame_rate
                 // 60/1; a source with microsecond timestamps (e.g. the
                 // raw-h264 demuxer rounds 1/60s to 16667us) would otherwise
                 // yield 1000000/16667 (~59.9988).
                 .arg("-video_track_timescale").arg(opts.fps.round().max(1.0).to_string())
-                .arg("-c:a").arg("aac").arg("-b:a").arg("192k")
-                .arg("-shortest")
+                .arg("-c:a").arg("aac").arg("-b:a").arg("192k");
+            if !shortest.is_empty() {
+                cmd.arg(shortest);
+            }
+            let status = cmd
                 .arg("-movflags").arg("+faststart")
                 .arg(out)
                 .status()

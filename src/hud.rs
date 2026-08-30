@@ -345,6 +345,11 @@ impl HudState {
         self.classic_score = enabled;
     }
 
+    /// Whether the score displays use the classic (stable) total.
+    pub fn is_classic_score(&self) -> bool {
+        self.classic_score
+    }
+
     pub fn draw(
         &mut self,
         game: &GameData,
