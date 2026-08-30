@@ -327,8 +327,10 @@ pub struct GameData {
 /// 完整渲染:判定引擎的快照从「首物件时间 − 抢先量」才开始,谱面前奏
 /// 无 note 的空段没有快照。这里按 60fps 游戏帧节奏补齐 [0, 首个快照)
 /// 的 idle 快照(光标静止取首快照位置、无按键),使时间轴从 0 开始,
-/// 音频与视频都覆盖完整前奏。首个快照时间 <= 0 时无需补齐。
-fn with_lead_in(mut snapshots: Vec<FrameSnap>) -> Vec<FrameSnap> {
+/// 音频与视频都覆盖完整前奏。首个快照时间 <= 0 时无需补齐。补齐间隔
+/// 与引擎的快照节奏一致(1000/60 × rate 游戏时钟毫秒/帧),否则速率
+/// 模组下前奏段与正片的回放速度会不一致(60fps 导出走快照 1:1)。
+fn with_lead_in(mut snapshots: Vec<FrameSnap>, rate: f64) -> Vec<FrameSnap> {
     if snapshots.first().is_some_and(|s| s.time > 0.0) {
         let first = snapshots[0].clone();
         let mut lead: Vec<FrameSnap> = Vec::new();
@@ -343,7 +345,7 @@ fn with_lead_in(mut snapshots: Vec<FrameSnap>) -> Vec<FrameSnap> {
                 sliders: Vec::new(),
                 spinners: Vec::new(),
             });
-            t += 1000.0 / 60.0;
+            t += 1000.0 / 60.0 * rate;
         }
         lead.extend(snapshots);
         snapshots = lead;
@@ -704,7 +706,7 @@ fn build(
         hit_windows,
         objects,
         events,
-        snapshots: with_lead_in(engine.snapshots.clone()),
+        snapshots: with_lead_in(engine.snapshots.clone(), mods.rate),
         combo_colours,
         has_beatmap_colours: !map_colours.is_empty(),
         rate: mods.rate,
