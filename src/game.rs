@@ -791,32 +791,45 @@ fn build(
     };
     let mut results_hit_events: Vec<ResultsHitEvent> = Vec::new();
     {
-        let mut last_circle_pos: Option<[f32; 2]> = None;
+        // `ScoreProcessor`'s `LastHitObject` chain: the previously judged
+        // object of ANY kind, advanced on every judgement (misses and
+        // nested slider results included). Its `StackedEndPosition` is the
+        // heatmap's movement start: circles/heads/spinners at their
+        // centre, the slider body and tail at the slider end, ticks and
+        // repeats at their path position (labels carry the nested index).
+        let judged_end = |obj: &ObjView, label: &str| -> [f32; 2] {
+            match label {
+                "tail" | "slider" => obj.end_position,
+                l if l.starts_with("tick") || l.starts_with("repeat") => {
+                    let digits = l.find(|c: char| c.is_ascii_digit()).unwrap_or(l.len());
+                    let idx = l[digits..].parse::<usize>().unwrap_or(0);
+                    obj.nested.get(idx).map(|n| n.position).unwrap_or(obj.position)
+                }
+                _ => obj.position,
+            }
+        };
+        let mut last_end: Option<[f32; 2]> = None;
         for entry in &engine.timeline {
-            let is_circle = matches!(entry.label.as_str(), "circle" | "head");
-            if !is_circle {
-                continue;
-            }
             let obj = &objects[entry.object_index];
-            if !matches!(
-                entry.result,
-                HitResult::Meh | HitResult::Ok | HitResult::Good | HitResult::Great | HitResult::Perfect
-            ) {
-                // Misses carry no cursor position in lazer either
-                // (`e.Position == null`), but still advance the chain.
-                last_circle_pos = Some(obj.position);
-                continue;
+            let this_end = judged_end(obj, &entry.label);
+            let is_circle = matches!(entry.label.as_str(), "circle" | "head");
+            if is_circle
+                && matches!(
+                    entry.result,
+                    HitResult::Meh | HitResult::Ok | HitResult::Good | HitResult::Great | HitResult::Perfect
+                )
+            {
+                results_hit_events.push(ResultsHitEvent {
+                    time: entry.time,
+                    offset: entry.time_offset,
+                    result: entry.result,
+                    pos: obj.position,
+                    last_pos: last_end,
+                    cursor: cursor_at(entry.time),
+                    radius: obj.radius,
+                });
             }
-            results_hit_events.push(ResultsHitEvent {
-                time: entry.time,
-                offset: entry.time_offset,
-                result: entry.result,
-                pos: obj.position,
-                last_pos: last_circle_pos,
-                cursor: cursor_at(entry.time),
-                radius: obj.radius,
-            });
-            last_circle_pos = Some(obj.position);
+            last_end = Some(this_end);
         }
     }
 

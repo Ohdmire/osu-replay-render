@@ -860,6 +860,7 @@ pub struct TtfGlyph {
     pub advance: f32,
 }
 
+#[derive(Clone)]
 pub struct TtfFont {
     /// (char, em) -> glyph.
     pub glyphs: HashMap<(char, u32), TtfGlyph>,
@@ -868,7 +869,7 @@ pub struct TtfFont {
 }
 
 impl TtfFont {
-    pub fn rasterize(bytes: &[u8], bold: bool) -> (TtfFont, Vec<(Region, Image)>) {
+    pub fn rasterize(bytes: &[u8], weight: u8) -> (TtfFont, Vec<(Region, Image)>) {
         let font = ab_glyph::FontArc::try_from_vec(bytes.to_vec()).expect("load ttf");
 
         let mut glyphs = HashMap::new();
@@ -939,7 +940,7 @@ impl TtfFont {
                     },
                 );
                 images.push((
-                    Region::Glyph { bold, c, em },
+                    Region::Glyph { weight, c, em },
                     Image { width: w, height: h, rgba },
                 ));
             }
@@ -949,9 +950,9 @@ impl TtfFont {
     }
 
     /// Patches glyph uv rects after the atlas is built.
-    pub fn patch_rects(&mut self, atlas: &Atlas, bold: bool) {
+    pub fn patch_rects(&mut self, atlas: &Atlas, weight: u8) {
         for ((c, em), g) in self.glyphs.iter_mut() {
-            let region = Region::Glyph { bold, c: *c, em: *em };
+            let region = Region::Glyph { weight, c: *c, em: *em };
             if let Some(r) = atlas.rects.get(&region) {
                 g.rect = *r;
             }
@@ -1096,7 +1097,7 @@ pub fn draw_ttf_text(
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Region {
     /// TTF glyph rasterised at a specific em size class.
-    Glyph { bold: bool, c: char, em: u32 },
+    Glyph { weight: u8, c: char, em: u32 },
     CounterDigit(u8), // b'0'..=b'9'
     CounterDot,
     CounterPercent,
