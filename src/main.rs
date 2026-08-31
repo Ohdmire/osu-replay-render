@@ -5,8 +5,10 @@
 //!
 //! Options:
 //!   --autoplay             Generate the replay from the beatmap (lazer
-//!                          OsuAutoGenerator port) - beatmap preview, no
-//!                          .osr needed
+//!                          OsuAutoGenerator port) - no .osr needed
+//!   --hud [on|off]         Gameplay HUD visibility, default on; `off` hides
+//!                          score/accuracy/combo/health/UR bar/key overlay/
+//!                          PP counter (`--hud` alone = on)
 //!   --out <file.mp4>       Pipe frames to ffmpeg and encode (default if given)
 //!   --png-dir <dir>        Write PNG frames to a directory instead
 //!   --size <WxH>           Output size (default 1920x1080)
@@ -79,6 +81,10 @@ struct Options {
     /// Whether the UR bar's window guide lines (colour axis) render.
     /// Default on; `--no-guides` disables them.
     guides: bool,
+    /// Whether the gameplay HUD renders (score/accuracy/combo/health/UR
+    /// bar/key overlay/PP counter). Default on; `--hud off` hides it all
+    /// (independent of `--autoplay`, which no longer touches the HUD).
+    hud: bool,
     /// Whether the live PP counter renders. Default on; `--no-pp` hides it.
     pp: bool,
     /// Optional BGM muxed into the output (`--audio [file]`; without a
@@ -156,6 +162,7 @@ struct ConfigJson {
     quality: Option<u32>,
     limit: Option<usize>,
     no_guides: Option<bool>,
+    hud: Option<bool>,
     no_pp: Option<bool>,
     audio: Option<String>,
     bg: Option<bool>,
@@ -174,6 +181,16 @@ struct ConfigJson {
     results_only: Option<bool>,
     avatar: Option<String>,
     ffmpeg_extra: Option<Vec<String>>,
+}
+
+/// `--hud <value>`: `on`/`off`, with `true`/`false`/`1`/`0` aliases
+/// (config mirrors it as the JSON boolean `"hud"`).
+fn parse_hud_value(v: &str) -> Result<bool, String> {
+    match v {
+        "on" | "true" | "1" => Ok(true),
+        "off" | "false" | "0" => Ok(false),
+        other => Err(format!("--hud must be on or off (got {})", other)),
+    }
 }
 
 /// `--skin` value shared by the CLI flag and the config's `skin` key.
@@ -224,6 +241,7 @@ fn apply_config(opts: &mut Options, c: ConfigJson) -> Result<(), String> {
     if let Some(v) = c.quality { opts.quality = v; }
     if let Some(v) = c.limit { opts.limit = Some(v); }
     if let Some(true) = c.no_guides { opts.guides = false; }
+    if let Some(v) = c.hud { opts.hud = v; }
     if let Some(true) = c.no_pp { opts.pp = false; }
     if c.audio.is_some() { opts.audio = c.audio; }
     if let Some(true) = c.bg { opts.bg = true; }
@@ -264,7 +282,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
     let autoplay = args.iter().any(|a| a == "--autoplay");
     let min_args = if autoplay { 2 } else { 3 };
     if args.len() < min_args {
-        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--hd] [--no-hd] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro|dir] [--argon-hud] [--no-guides] [--no-pp] [--audio [file.mp3]] [--audio-offset ms] [--bg] [--bg-opacity 0..1] [--cursor-size 0.1..=2] [--hitsounds] [--skin-colours] [--results secs] [--results-only] [--avatar image] [--config file.json] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
+        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--hud on|off] [--hd] [--no-hd] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro|dir] [--argon-hud] [--no-guides] [--no-pp] [--audio [file.mp3]] [--audio-offset ms] [--bg] [--bg-opacity 0..1] [--cursor-size 0.1..=2] [--hitsounds] [--skin-colours] [--results secs] [--results-only] [--avatar image] [--config file.json] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
     }
     let map_path = args[1].clone();
     let replay_path = if autoplay { None } else { Some(args[2].clone()) };
@@ -285,6 +303,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
         limit: None,
         ffmpeg_extra: Vec::new(),
         guides: true,
+        hud: true,
         pp: true,
         audio: None,
         bg: false,
@@ -395,6 +414,17 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
             }
             "--no-guides" => {
                 opts.guides = false;
+            }
+            "--hud" => {
+                // Optional value: bare `--hud` means on (the default);
+                // `--hud on|off` (true/false aliases) overrides.
+                opts.hud = match args.get(i + 1) {
+                    Some(v) if !v.starts_with("--") => {
+                        i += 1;
+                        parse_hud_value(v)?
+                    }
+                    _ => true,
+                };
             }
             "--no-pp" => {
                 opts.pp = false;
@@ -778,6 +808,7 @@ fn main() {
     let mut state = SceneState::new(&game, opts.width, opts.height);
     state.pro_skin = opts.skin == "argon-pro";
     state.hud.ur_guides = opts.guides;
+    state.hud.visible = opts.hud;
     state.hud.pp_display = opts.pp;
     state.hud.argon_hud = opts.argon_hud;
     state.bg_opacity = if has_bg && opts.bg { Some(opts.bg_opacity) } else { None };
@@ -851,10 +882,10 @@ fn main() {
         }
         state.results_at = Some(last);
         // Sequential handover: the gameplay fades out (0.35s), then the
-        // results screen fades in (0.45s); poster mode shows it instantly.
+        // results screen appears instantly after the fade-out.
         state.results_fade_frames = (0.35 * opts.fps).round() as u32;
-        state.results_fadein_frames = (0.45 * opts.fps).round() as u32;
-        eprintln!("results: +{} frames ({:.1}s, expanded panel, fade-out 0.35s + fade-in 0.45s)", results_frames, opts.results);
+        state.results_fadein_frames = 0;
+        eprintln!("results: +{} frames ({:.1}s, expanded panel, gameplay fade-out 0.35s)", results_frames, opts.results);
     }
 
     if opts.hitsounds && opts.out.is_none() {

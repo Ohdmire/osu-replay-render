@@ -198,6 +198,9 @@ impl KeyAnim {
 }
 
 pub struct HudState {
+    /// Whether the whole gameplay HUD (score/acc/combo/health/UR bar/key
+    /// overlay/PP counter) renders. Default on; `--no-hud` turns it off.
+    pub visible: bool,
     score: Rolling,
     acc: Rolling,
     /// Live PP counter (`ArgonPerformancePointsCounter`: int, 250ms roll).
@@ -294,6 +297,7 @@ pub struct HudState {
 impl HudState {
     pub fn new() -> HudState {
         HudState {
+            visible: true,
             score: Rolling::new(),
             acc: Rolling::with_initial(100.0),
             pp: Rolling::new(),
@@ -358,10 +362,9 @@ impl HudState {
         m: &Mapper,
         t: f64,
     ) {
-        // Autoplay (beatmap preview): score/accuracy/combo, the UR bar and
-        // the health bar are all perfect by construction and say nothing
-        // about the beatmap — hide the entire HUD.
-        if game.autoplay {
+        // `--no-hud`: the whole gameplay HUD is skipped; the playfield
+        // (objects, cursor, judgement bursts) still renders.
+        if !self.visible {
             return;
         }
 
@@ -600,7 +603,7 @@ impl HudState {
         // object): green (199,255,47), mirrored, counting DOWN from clock
         // start; gameplay: progress through [first object start, last
         // object end], time clamped to the last hit (`SongProgress.Update`).
-        if legacy_acc && !game.autoplay {
+        if legacy_acc {
             let first = game.objects.first().map(|o| o.start_time).unwrap_or(0.0);
             let last = game.objects.last().map(|o| o.end_time).unwrap_or(0.0);
             let (progress, is_intro) = if t < first {

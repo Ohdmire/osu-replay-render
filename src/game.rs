@@ -271,7 +271,9 @@ pub struct ResultsHitEvent {
     pub pos: [f32; 2],
     /// Stacked position of the previous circle (None on the first).
     pub last_pos: Option<[f32; 2]>,
-    /// Cursor position (playfield coords) at the hit time.
+    /// Cursor position (playfield coords) at the hit — lazer
+    /// `ClosestPressPosition`: the press closest to the object centre
+    /// between spawn and judgement, at the replay frame's exact cursor.
     pub cursor: [f32; 2],
     /// Circle radius in playfield units (CS-scaled `OBJECT_RADIUS`).
     pub radius: f32,
@@ -358,17 +360,14 @@ pub struct GameData {
     /// Time-mapped difficulty graph points `(time, aim, speed)` for the
     /// results screen's Difficulty Graph card.
     pub strain_points: Vec<(f64, f64, f64)>,
-    /// Circle hit events for the results statistics (`Timing Distribution`
-    /// graph, `UnstableRate` / `AverageHitError`, `AccuracyHeatmap`).
+    /// Circle hit events for the results statistics (`AccuracyHeatmap`:
+    /// hits + misses; the `Timing Distribution` graph / `UnstableRate` /
+    /// `AverageHitError` use the hits only).
     pub results_hit_events: Vec<ResultsHitEvent>,
     /// Live PP timeline (`OsuGradualPerformance`, advanced once per fully
     /// judged object): `(time, pp)` pairs - the in-game PP counter feed
     /// (`pp::pp_at` queries it). Empty when PP is unavailable.
     pub pp_events: Vec<(f64, f64)>,
-    /// Autoplay mod (beatmap preview): hide the score/accuracy/combo
-    /// counters and the UR bar — the numbers are all perfect and carry no
-    /// information about the beatmap.
-    pub autoplay: bool,
     /// Judgement times of every negative-increase miss (`Miss`,
     /// `LargeTickMiss`, `SmallTickMiss` - `ArgonHealthDisplay`'s
     /// `onNewJudgement` miss condition; `IgnoreMiss` carries no health
@@ -461,10 +460,8 @@ pub fn load_autoplay(map_path: &str) -> Result<GameData, String> {
     engine.run(&frames);
 
     let mut data = build(mods, classic, map.combo_colours, osu_metadata(map_path), &engine)?;
-    // lazer's autoplay attribution; HUD counters stay hidden (see
-    // GameData::autoplay).
+    // lazer's autoplay attribution.
     data.player = "osu!".to_string();
-    data.autoplay = true;
     if let Some(pp) = crate::pp::calculate(map_path, 0, classic, &engine) {
         data.pp = pp.pp;
         data.pp_max = pp.pp_max;
@@ -769,26 +766,15 @@ fn build(
         .map(|o| o.index)
         .unwrap_or(0);
 
-    // Circle hit events for the results statistics (lazer's
-    // `timedHitEvents`: `HitObject is HitCircle && !(SliderTailCircle)` =
-    // circles + slider heads, hits only). The cursor position at the hit
-    // time is interpolated off the engine's snapshots (`CursorPositionAtHit`).
-    let snaps = &engine.snapshots;
-    let cursor_at = |t: f64| -> [f32; 2] {
-        if snaps.is_empty() {
-            return [256.0, 192.0];
-        }
-        let idx = snaps.partition_point(|s| s.time <= t).saturating_sub(1);
-        let cur = snaps[idx].cursor;
-        if let Some(next) = snaps.get(idx + 1) {
-            let span = next.time - snaps[idx].time;
-            if span > 0.0 && t > snaps[idx].time {
-                let f = ((t - snaps[idx].time) / span).clamp(0.0, 1.0) as f32;
-                return [cur.x + (next.cursor.x - cur.x) * f, cur.y + (next.cursor.y - cur.y) * f];
-            }
-        }
-        [cur.x, cur.y]
-    };
+    // Circle hit events for the results statistics (lazer `HitEvent` for
+    // `HitCircle`s incl. slider heads — `HitObject is HitCircle &&
+    // !(SliderTailCircle)` — hits AND misses). The hit position is lazer's
+    // `HitReceptor.ClosestPressPosition`: the press closest to the object
+    // centre among all presses from spawn to judgement, recorded with the
+    // replay frame's exact cursor; entries without a press are skipped
+    // (lazer `Position == null`). Misses feed only the heatmap (their
+    // `MissPoint` x-marks); the timing graph / UR keep hits only.
+    let presses = &engine.presses;
     let mut results_hit_events: Vec<ResultsHitEvent> = Vec::new();
     {
         // `ScoreProcessor`'s `LastHitObject` chain: the previously judged
@@ -813,21 +799,30 @@ fn build(
             let obj = &objects[entry.object_index];
             let this_end = judged_end(obj, &entry.label);
             let is_circle = matches!(entry.label.as_str(), "circle" | "head");
-            if is_circle
-                && matches!(
-                    entry.result,
-                    HitResult::Meh | HitResult::Ok | HitResult::Good | HitResult::Great | HitResult::Perfect
-                )
-            {
-                results_hit_events.push(ResultsHitEvent {
-                    time: entry.time,
-                    offset: entry.time_offset,
-                    result: entry.result,
-                    pos: obj.position,
-                    last_pos: last_end,
-                    cursor: cursor_at(entry.time),
-                    radius: obj.radius,
-                });
+            if is_circle {
+                // Press window = the receptor's lifetime (spawn ..=
+                // judgement, +2ms slop), any button. Classic-mode heads
+                // judge as `LargeTickHit`/`LargeTickMiss`; the heatmap has
+                // no result filter in lazer, so any result with a press
+                // lands a point (in-circle green / outside red x).
+                let t0 = obj.start_time - obj.preempt;
+                let cursor = presses
+                    .iter()
+                    .filter(|(t, _)| *t >= t0 && *t <= entry.time + 2.0)
+                    .map(|(_, p)| ((p.x - obj.position[0]).hypot(p.y - obj.position[1]), [p.x, p.y]))
+                    .min_by(|a, b| a.0.total_cmp(&b.0))
+                    .map(|(_, p)| p);
+                if let Some(cursor) = cursor {
+                    results_hit_events.push(ResultsHitEvent {
+                        time: entry.time,
+                        offset: entry.time_offset,
+                        result: entry.result,
+                        pos: obj.position,
+                        last_pos: last_end,
+                        cursor,
+                        radius: obj.radius,
+                    });
+                }
             }
             last_end = Some(this_end);
         }
@@ -893,7 +888,6 @@ fn build(
         strain_points: Vec::new(),
         results_hit_events,
         pp_events: Vec::new(),
-        autoplay: false,
         miss_times,
         hidden: mods.hidden,
         hd_first_object,

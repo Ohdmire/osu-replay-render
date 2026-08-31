@@ -169,7 +169,7 @@ fn colour_for_hit_result(result: HitResult) -> Colour {
 /// Star-rating spectrum (`OsuColour.STAR_DIFFICULTY_SPECTRUM`,
 /// `ColourUtils.SampleFromLinearGradient`).
 fn star_colour(stars: f64) -> Colour {
-    let stops: [(f64, u32); 12] = [
+    const STOPS: [(f64, u32); 13] = [
         (0.1, 0xAAAAAA),
         (0.1, 0x4290FB),
         (1.25, 0x4FC0FF),
@@ -181,29 +181,46 @@ fn star_colour(stars: f64) -> Colour {
         (5.8, 0xC645B8),
         (6.7, 0x6563DE),
         (7.7, 0x18158E),
+        (9.0, 0x000000),
         (10.0, 0x000000),
     ];
-    let stars = (stars * 100.0).round() / 100.0;
-    for w in stops.windows(2) {
-        let (p0, c0) = w[0];
-        let (p1, c1) = w[1];
-        if stars <= p1 || p1 == stops[stops.len() - 1].0 {
-            let t = if p1 - p0 <= 0.0 { 0.0 } else { ((stars - p0) / (p1 - p0)).clamp(0.0, 1.0) };
-            return Colour::lerp(Colour::from_hex(c0), Colour::from_hex(c1), t as f32);
-        }
-    }
-    Colour::from_hex(0x000000)
+    sample_gradient(&STOPS, stars)
 }
 
-/// Star-rating pill text colour (`OsuColour.ForStarDifficultyText`).
+/// Star-rating pill text colour (`OsuColour.ForStarDifficultyText`): black 75%
+/// below 6.5, `Orange1` until the 9.0 gradient cutoff, then the text spectrum.
 fn star_text_colour(stars: f64) -> Colour {
+    const TEXT_STOPS: [(f64, u32); 5] = [
+        (9.0, 0xF6F05C),
+        (9.9, 0xFF8068),
+        (10.6, 0xFF4E6F),
+        (11.5, 0xC645B8),
+        (12.4, 0x6563DE),
+    ];
     if stars < 6.5 {
         return Colour::from_hex(0x000000).opacity(0.75);
     }
     if stars < 9.0 {
         return Colour::from_hex(0xFFD966);
     }
-    star_colour(stars)
+    sample_gradient(&TEXT_STOPS, stars)
+}
+
+/// `ColourUtils.SampleFromLinearGradient`: piecewise-linear sample over `stops`.
+fn sample_gradient(stops: &[(f64, u32)], stars: f64) -> Colour {
+    let stars = (stars * 100.0).round() / 100.0;
+    if stars <= stops[0].0 {
+        return Colour::from_hex(stops[0].1);
+    }
+    for w in stops.windows(2) {
+        let (p0, c0) = w[0];
+        let (p1, c1) = w[1];
+        if stars <= p1 {
+            let t = if p1 - p0 <= 0.0 { 0.0 } else { ((stars - p0) / (p1 - p0)).clamp(0.0, 1.0) };
+            return Colour::lerp(Colour::from_hex(c0), Colour::from_hex(c1), t as f32);
+        }
+    }
+    Colour::from_hex(stops[stops.len() - 1].1)
 }
 
 // -- ModDisplay ----------------------------------------------------------------
@@ -1443,6 +1460,13 @@ fn draw_statistics(game: &GameData, assets: &Assets, m: &Mapper, list: &mut Draw
 
     // -- Item heights (content) ------------------------------------------
     let ev = &game.results_hit_events;
+    // lazer's timed hit events: hits only (misses exist on the heatmap as
+    // `MissPoint` x-marks but carry no timing-graph / UR sample).
+    let timed: Vec<crate::game::ResultsHitEvent> = ev
+        .iter()
+        .filter(|e| matches!(e.result, HitResult::Meh | HitResult::Ok | HitResult::Good | HitResult::Great | HitResult::Perfect))
+        .copied()
+        .collect();
     // Performance Breakdown rows.
     let breakdown = game.pp_breakdown.unwrap_or_default();
     let attr_rows: [(&str, f64, f64); 5] = [
@@ -1599,7 +1623,7 @@ fn draw_statistics(game: &GameData, assets: &Assets, m: &Mapper, list: &mut Draw
         let bars_h = graph_h - STAT_FONT;
         let bottom = t_area[1] + bars_h;
         // Bin size from the worst offset.
-        let max_off = ev.iter().map(|e| e.offset.abs()).fold(0.0f64, f64::max);
+        let max_off = timed.iter().map(|e| e.offset.abs()).fold(0.0f64, f64::max);
         let bin_size = ((max_off / TIMING_BINS as f64).ceil() as i64).max(1) as f64;
         let total_bins = TIMING_BINS * 2 + 1;
         // (result, count) per bin, stacked bottom-up in display order.
@@ -1612,7 +1636,7 @@ fn draw_statistics(game: &GameData, assets: &Assets, m: &Mapper, list: &mut Draw
         ];
         let mut bins: Vec<[i32; 5]> = vec![[0; 5]; total_bins];
         let mut max_count: i32 = 0;
-        for e in ev {
+        for e in &timed {
             let idx = (TIMING_BINS as f64 + (e.offset / bin_size).round()) as i64;
             if idx < 0 || idx >= total_bins as i64 {
                 continue;
@@ -1704,7 +1728,7 @@ fn draw_statistics(game: &GameData, assets: &Assets, m: &Mapper, list: &mut Draw
         }
         // Simple statistic table: Average Hit Error / Unstable Rate.
         let table_y = t_area[1] + graph_h + 15.0;
-        let (avg, ur) = hit_error_stats(ev, game.rate);
+        let (avg, ur) = hit_error_stats(&timed, game.rate);
         let avg_text = match avg {
             Some(v) => format!("{:.2} ms {}", v.abs(), if v < 0.0 { "early" } else { "late" }),
             None => "(not available)".to_string(),
