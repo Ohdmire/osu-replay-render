@@ -740,14 +740,14 @@ dependencies = [
 
 [[package]]
 name = "osu_replay_judge"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "lzma-rs",
 ]
 
 [[package]]
 name = "osu_replay_render"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "ab_glyph",
  "jpeg-decoder",

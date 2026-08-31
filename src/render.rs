@@ -435,6 +435,16 @@ impl Renderer {
         &self.adapter
     }
 
+    /// 诊断用一行 GPU/后端描述:后端、适配器名、vendor/device ID 与
+    /// 驱动版本(日志记录用)。
+    pub fn gpu_info(&self) -> String {
+        let i = self.adapter.get_info();
+        format!(
+            "{:?} · {} · vendor {:#06x} device {:#06x} · driver {} ({})",
+            i.backend, i.name, i.vendor, i.device, i.driver, i.driver_info
+        )
+    }
+
     pub fn device(&self) -> &wgpu::Device {
         &self.device
     }

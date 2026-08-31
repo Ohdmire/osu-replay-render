@@ -71,6 +71,11 @@ fn f32_bytes(v: &[f32]) -> &[u8] {
 }
 
 impl SurfaceRenderer {
+    /// 诊断用一行 GPU/后端描述(委托内部 Renderer)。
+    pub fn gpu_info(&self) -> String {
+        self.renderer.gpu_info()
+    }
+
     /// Creates the renderer plus a wgpu surface for the given raw window
     /// handle (Windows: Win32;Linux: Xlib/XWayland)。The scene is rendered
     /// internally at `width`x`height` and letterboxed onto the window.
