@@ -133,8 +133,12 @@ fn probe_video(info: &mut VideoInfo) {
 
 /// Parses the beatmap's storyboard (no GPU state). `None` when the map has
 /// none (no Events elements besides the old-style background row, which
-/// the host already draws as `Region::Background`).
-pub fn parse_beatmap(map_path: &std::path::Path) -> Option<ParsedStoryboard> {
+/// the host already draws as `Region::Background`). `beatmap_background`
+/// is the `[Events]` background filename parsed with the beatmap.
+pub fn parse_beatmap(
+    map_path: &std::path::Path,
+    beatmap_background: Option<&str>,
+) -> Option<ParsedStoryboard> {
     let loaded = osu_storyboard_render::loader::load_beatmap(map_path, true)?;
     let root = loaded.root.clone();
     let mut story = loaded.story;
@@ -163,8 +167,8 @@ pub fn parse_beatmap(map_path: &std::path::Path) -> Option<ParsedStoryboard> {
     // 还垫一层背景"。剔除条件与下方 ReplacesBackground 的判定同源
     // (引用同一背景文件),仅收紧到"完全无命令"——带命令的用法是
     // 真实故事板内容,保留。
-    if let Some(bg) = crate::osu_background_file(map_path.to_str().unwrap_or_default()) {
-        let bg = osu_storyboard_render::render::texture::normalize_path(&bg).to_lowercase();
+    if let Some(bg) = beatmap_background {
+        let bg = osu_storyboard_render::render::texture::normalize_path(bg).to_lowercase();
         story.elements.retain(|e| {
             let s = e.sprite();
             !(s.layer == Layer::Background
@@ -184,9 +188,9 @@ pub fn parse_beatmap(map_path: &std::path::Path) -> Option<ParsedStoryboard> {
     // 背景抑制(lazer `Storyboard.ReplacesBackground`):Background 层存在
     // 引用谱面背景文件的元素。旧版背景行已被 loader 剔除(lazer 的解码器
     // 同样不把它算作 storyboard 元素),因此这里比较的是 .osb/手写精灵。
-    let replaces_background = crate::osu_background_file(map_path.to_str().unwrap_or_default())
+    let replaces_background = beatmap_background
         .map(|bg| {
-            let bg = osu_storyboard_render::render::texture::normalize_path(&bg).to_lowercase();
+            let bg = osu_storyboard_render::render::texture::normalize_path(bg).to_lowercase();
             story.elements.iter().any(|e| {
                 e.sprite().layer == Layer::Background
                     && osu_storyboard_render::render::texture::normalize_path(&e.sprite().path)

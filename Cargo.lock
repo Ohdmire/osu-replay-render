@@ -787,6 +787,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "osu-parse"
+version = "0.1.0"
+dependencies = [
+ "lzma-rs",
+]
+
+[[package]]
 name = "osu-storyboard-render"
 version = "0.1.0"
 dependencies = [
@@ -794,6 +801,7 @@ dependencies = [
  "bytemuck",
  "image",
  "log",
+ "osu-parse",
  "pollster",
  "wgpu",
 ]
@@ -802,7 +810,7 @@ dependencies = [
 name = "osu_replay_judge"
 version = "0.3.1"
 dependencies = [
- "lzma-rs",
+ "osu-parse",
 ]
 
 [[package]]
@@ -811,6 +819,7 @@ version = "0.8.0"
 dependencies = [
  "ab_glyph",
  "jpeg-decoder",
+ "osu-parse",
  "osu-storyboard-render",
  "osu_replay_judge",
  "png 0.17.16",
