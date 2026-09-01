@@ -94,6 +94,12 @@ struct Options {
     bg: bool,
     /// Background opacity 0..1 (lazer: 1 - DimLevel, default DimLevel 0.7).
     bg_opacity: f32,
+    /// Render the beatmap storyboard (`--storyboard`): the `.osu` Events +
+    /// shared `.osb` composite, below-layers dimmed with `bg_opacity`
+    /// (osu! dims the storyboard with the background; undimmed at 1.0 when
+    /// the background is off), Foreground/Overlay layers over the
+    /// playfield.
+    storyboard: bool,
     /// Cursor size multiplier 0.1..=2 (lazer `GameplayCursorSize`,
     /// default 1). Scales the cursor and trail for every skin path.
     cursor_size: f32,
@@ -167,6 +173,7 @@ struct ConfigJson {
     audio: Option<String>,
     bg: Option<bool>,
     bg_opacity: Option<f32>,
+    storyboard: Option<bool>,
     cursor_size: Option<f32>,
     audio_offset: Option<f64>,
     autoplay: Option<bool>,
@@ -246,6 +253,7 @@ fn apply_config(opts: &mut Options, c: ConfigJson) -> Result<(), String> {
     if c.audio.is_some() { opts.audio = c.audio; }
     if let Some(true) = c.bg { opts.bg = true; }
     if let Some(v) = c.bg_opacity { opts.bg_opacity = v; }
+    if let Some(v) = c.storyboard { opts.storyboard = v; }
     if let Some(v) = c.cursor_size { opts.cursor_size = v; }
     if c.audio_offset.is_some() { opts.audio_offset = c.audio_offset; }
     if let Some(true) = c.autoplay { opts.autoplay = true; }
@@ -282,7 +290,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
     let autoplay = args.iter().any(|a| a == "--autoplay");
     let min_args = if autoplay { 2 } else { 3 };
     if args.len() < min_args {
-        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--hud on|off] [--hd] [--no-hd] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro|dir] [--argon-hud] [--no-guides] [--no-pp] [--audio [file.mp3]] [--audio-offset ms] [--bg] [--bg-opacity 0..1] [--cursor-size 0.1..=2] [--hitsounds] [--skin-colours] [--results secs] [--results-only] [--avatar image] [--config file.json] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
+        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--hud on|off] [--hd] [--no-hd] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro|dir] [--argon-hud] [--no-guides] [--no-pp] [--audio [file.mp3]] [--audio-offset ms] [--bg] [--bg-opacity 0..1] [--storyboard] [--cursor-size 0.1..=2] [--hitsounds] [--skin-colours] [--results secs] [--results-only] [--avatar image] [--config file.json] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
     }
     let map_path = args[1].clone();
     let replay_path = if autoplay { None } else { Some(args[2].clone()) };
@@ -308,6 +316,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
         audio: None,
         bg: false,
         bg_opacity: 0.3,
+        storyboard: false,
         cursor_size: 1.0,
         audio_offset: None,
         autoplay,
@@ -442,6 +451,9 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
             }
             "--bg" => {
                 opts.bg = true;
+            }
+            "--storyboard" => {
+                opts.storyboard = true;
             }
             "--bg-opacity" => {
                 i += 1;
@@ -770,6 +782,45 @@ fn main() {
 
     let has_bg = bg_image.is_some();
 
+    // Storyboard (`--storyboard`): parse before the atlas so the composite
+    // slots can be reserved; the GPU layer attaches after the renderer.
+    let sb_parsed = if opts.storyboard {
+        let parsed = osu_replay_render::storyboard::parse_beatmap(std::path::Path::new(&map_path));
+        if let Some(p) = &parsed {
+            if let Some(v) = p.video() {
+                eprintln!(
+                    "storyboard video: {} ({}x{}@{:.3}, starts {}ms{})",
+                    v.path.display(),
+                    v.width,
+                    v.height,
+                    v.fps,
+                    v.start_ms,
+                    if v.duration_ms > 0.0 { format!(", {:.1}s", v.duration_ms / 1000.0) } else { String::new() }
+                );
+            }
+            if p.replaces_background() {
+                eprintln!("storyboard replaces the background (lazer ReplacesBackground)");
+            }
+        }
+        if parsed.is_none() {
+            eprintln!("warning: beatmap has no storyboard - rendering without one");
+        }
+        parsed
+    } else {
+        None
+    };
+    // Composite slot size: the output resolution, capped at 1080p so huge
+    // renders don't balloon the atlas (the scene upsamples linearly).
+    let sb_slot = (
+        opts.width.min(1920).max(1) & !1,
+        opts.height.min(1080).max(1) & !1,
+    );
+    let storyboard_slots = sb_parsed.as_ref().map(|p| osu_replay_render::StoryboardSlots {
+        width: sb_slot.0,
+        height: sb_slot.1,
+        foreground: p.has_foreground(),
+    });
+
     // Skin resolution (`--skin <dir>`: user legacy skin with argon
     // fallbacks). Default combo colours: the beatmap's `[Colours]` win
     // (lazer "Beatmap skins" on); `--skin-colours` forces the skin's.
@@ -801,10 +852,15 @@ fn main() {
     // 8192 is the GLES/GL-compat floor for max_texture_dimension2d:
     // capping here keeps the atlas creatable on every backend (desktop
     // Vulkan/dGPU simply packs wider instead of taller).
-    let (atlas, fonts) = build_atlas(bg_image, avatar_image, &mut resolved_skin, 8192);
+    let (atlas, fonts) = build_atlas(bg_image, avatar_image, &mut resolved_skin, 8192, storyboard_slots);
     eprintln!("atlas: {}x{}", atlas.width, atlas.height);
 
     let mut renderer = Renderer::new(opts.width, opts.height, &atlas);
+    // Storyboard GPU layer on the renderer's device; below-layers dim with
+    // the background (osu! DimLevel semantics), full when it is off.
+    let mut sb_layer = sb_parsed.map(|p| {
+        p.into_layer(renderer.device(), renderer.queue(), sb_slot.0, sb_slot.1)
+    });
     let mut state = SceneState::new(&game, opts.width, opts.height);
     state.pro_skin = opts.skin == "argon-pro";
     state.hud.ur_guides = opts.guides;
@@ -812,6 +868,15 @@ fn main() {
     state.hud.pp_display = opts.pp;
     state.hud.argon_hud = opts.argon_hud;
     state.bg_opacity = if has_bg && opts.bg { Some(opts.bg_opacity) } else { None };
+    state.storyboard = if sb_layer.is_some() {
+        Some(if has_bg && opts.bg { opts.bg_opacity } else { 1.0 })
+    } else {
+        None
+    };
+    state.storyboard_fg = sb_layer.as_ref().is_some_and(|l| l.has_foreground());
+    // 故事板开启即隐藏背景图(本渲染器的规则;lazer 的 ReplacesBackground
+    // 仅在 .osb 重新声明背景文件时隐藏,已按日志形式保留检测)。
+    state.sb_replaces_bg = sb_layer.is_some();
     state.has_bg = has_bg;
     state.has_avatar = opts.avatar.is_some();
     state.cursor_size = opts.cursor_size;
@@ -1032,6 +1097,11 @@ fn main() {
             }
         }
         let tb = std::time::Instant::now();
+        // Storyboard composites first: the atlas copies are queue-ordered
+        // ahead of the scene submission below.
+        if let Some(sb) = &mut sb_layer {
+            sb.render(ft as f32, &mut renderer, &atlas);
+        }
         // Pipelined: submit this frame WITHOUT waiting for the GPU, and
         // only read back the OLDEST in-flight frame once the pipeline has
         // reached depth 2. Until then the GPU renders ahead while the CPU
