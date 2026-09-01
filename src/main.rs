@@ -43,7 +43,7 @@
 //!                          --png-dir out --fps 1 --results 1)
 //!   --limit <n>            Render at most n frames (testing)
 
-use osu_replay_render::{build_atlas, decode_image_file, draw, draw::Image, game, hitsound, osu_background_file, osu_general_value, render::Renderer, scene, skin};
+use osu_replay_render::{build_atlas, decode_image_file, draw, draw::Image, game, hitsound, render::Renderer, scene, skin};
 
 use scene::{Assets, SceneState};
 use std::io::Write;
@@ -739,8 +739,7 @@ fn main() {
             Some(explicit.clone())
         }
         Some(_) => {
-            let name = osu_general_value(&map_path, "AudioFilename")
-                .unwrap_or_else(|| "audio.mp3".to_string());
+            let name = game.map_audio.clone().unwrap_or_else(|| "audio.mp3".to_string());
             let p = map_dir.join(&name);
             if p.exists() {
                 eprintln!("audio: {} (from beatmap)", p.display());
@@ -758,7 +757,7 @@ fn main() {
     // full-screen at `--bg-opacity` when `--bg` is on (default
     // 1 - DimLevel 0.7, matching lazer); the results screen always draws
     // the blurred copy (lazer `ResultsScreen`).
-    let bg_image: Option<Image> = match osu_background_file(&map_path) {
+    let bg_image: Option<Image> = match game.map_background.clone() {
         Some(name) => {
             let p = map_dir.join(&name);
             match decode_image_file(&p) {
@@ -785,7 +784,10 @@ fn main() {
     // Storyboard (`--storyboard`): parse before the atlas so the composite
     // slots can be reserved; the GPU layer attaches after the renderer.
     let sb_parsed = if opts.storyboard {
-        let parsed = osu_replay_render::storyboard::parse_beatmap(std::path::Path::new(&map_path));
+        let parsed = osu_replay_render::storyboard::parse_beatmap(
+            std::path::Path::new(&map_path),
+            game.map_background.as_deref(),
+        );
         if let Some(p) = &parsed {
             if let Some(v) = p.video() {
                 eprintln!(
@@ -958,27 +960,20 @@ fn main() {
     }
 
     // Hitsound track (`--hitsounds`): synthesized offline from the
-    // judgement timeline plus the .osu sample data (hit-only triggers,
-    // beatmap banks/volumes, slider slide loops, samples at their
-    // natural rate — rate mods only compress the trigger times), on the
-    // export's wall timeline so it muxes 1:1 with the video. Written as a
-    // temp WAV, mixed into the output in the second pass below.
+    // judgement timeline plus the .osu sample data parsed with the beatmap
+    // (hit-only triggers, beatmap banks/volumes, slider slide loops,
+    // samples at their natural rate — rate mods only compress the trigger
+    // times), on the export's wall timeline so it muxes 1:1 with the
+    // video. Written as a temp WAV, mixed into the output in the second
+    // pass below.
     let hits_path: Option<String> = if opts.hitsounds && opts.out.is_some() {
-        match std::fs::read_to_string(&map_path) {
-            Ok(content) => {
-                let t0 = frame_times[0];
-                let wall_secs = frame_times.len() as f64 / opts.fps;
-                let wav = hitsound::render_track_wav(&game, &content, t0, wall_secs, game.rate, opts.hitsounds_volume, &resolved_skin);
-                let p = format!("{}.hits.wav", opts.out.as_ref().unwrap());
-                std::fs::write(&p, wav).unwrap_or_else(|e| panic!("write {}: {}", p, e));
-                eprintln!("hitsounds: {} ({} samples, {:.1}s)", p, if resolved_skin.is_legacy() { "user skin mixed with ArgonPro" } else { "ArgonPro" }, wall_secs);
-                Some(p)
-            }
-            Err(e) => {
-                eprintln!("warning: cannot re-read beatmap for hitsounds: {} - skipping", e);
-                None
-            }
-        }
+        let t0 = frame_times[0];
+        let wall_secs = frame_times.len() as f64 / opts.fps;
+        let wav = hitsound::render_track_wav(&game, &game.sample_data, t0, wall_secs, game.rate, opts.hitsounds_volume, &resolved_skin);
+        let p = format!("{}.hits.wav", opts.out.as_ref().unwrap());
+        std::fs::write(&p, wav).unwrap_or_else(|e| panic!("write {}: {}", p, e));
+        eprintln!("hitsounds: {} ({} samples, {:.1}s)", p, if resolved_skin.is_legacy() { "user skin mixed with ArgonPro" } else { "ArgonPro" }, wall_secs);
+        Some(p)
     } else {
         None
     };

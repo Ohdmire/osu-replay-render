@@ -6,6 +6,8 @@ license = "MIT"
 
 [dependencies]
 osu_replay_judge = { git = "https://github.com/Ohdmire/osu-replay-judge.git", branch = "master" }
+# Shared .osu/.osb/.osr parsing (same checkout the patched judge re-exports).
+osu-parse = { path = "../osu-parse" }
 rosu-pp = { git = "https://github.com/Apeuriox/rosu-pp.git", branch = "pp-rework-202607" }
 # Beatmap storyboard layer (.osu Events + shared .osb) — same checkout as
 # the standalone renderer, library target only (no winit/zip on Android).
