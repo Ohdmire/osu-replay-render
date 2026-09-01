@@ -76,6 +76,23 @@ impl SurfaceRenderer {
         self.renderer.gpu_info()
     }
 
+    /// The device/queue the scene renders with (shared with the window
+    /// surface) — embedders build their auxiliary layers (e.g. the
+    /// storyboard composites) on the SAME device.
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// Mutable access to the internal offscreen renderer (auxiliary
+    /// layers need to copy into its atlas before a frame is encoded).
+    pub fn renderer_mut(&mut self) -> &mut Renderer {
+        &mut self.renderer
+    }
+
     /// Creates the renderer plus a wgpu surface for the given raw window
     /// handle (Windows: Win32;Linux: Xlib/XWayland)。The scene is rendered
     /// internally at `width`x`height` and letterboxed onto the window.
