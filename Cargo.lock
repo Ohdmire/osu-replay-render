@@ -797,6 +797,7 @@ dependencies = [
 [[package]]
 name = "osu-storyboard-render"
 version = "0.1.1"
+source = "git+https://github.com/Ohdmire/osu-storyboard-render.git?branch=main#474557ffc421af30bf21d86c67ef2cb0a9b8e806"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -810,6 +811,7 @@ dependencies = [
 [[package]]
 name = "osu_replay_judge"
 version = "0.3.1"
+source = "git+https://github.com/Ohdmire/osu-replay-judge.git?branch=master#319dad75c4ccc6ae3c9db173ddff663c0990bd6b"
 dependencies = [
  "osu-parse",
 ]
@@ -1024,6 +1026,7 @@ checksum = "cc58d42f8f2308b4b241de147827af84179d0a318de250495c7c5e47cb701cd9"
 [[package]]
 name = "rosu-pp"
 version = "4.0.1"
+source = "git+https://github.com/Apeuriox/rosu-pp.git?branch=pp-rework-202607#9a073d29611ef936b581a08d3c5b288ef5427301"
 dependencies = [
  "divan",
  "rosu-map",
