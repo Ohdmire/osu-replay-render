@@ -878,8 +878,11 @@ impl SceneState {
             );
         }
 
-        // 8. HUD.
-        self.hud.draw(game, assets, list, &self.mapper, t);
+        // 8. HUD.结算阶段隐藏(不随 gameplay 淡出):分数/血条等留在
+        // 屏幕上会和结算页互相打架,进结算即消失。
+        if !is_results {
+            self.hud.draw(game, assets, list, &self.mapper, t);
+        }
 
         // 9. Results screen: fades in once the gameplay has fully faded
         // out (sequential, not a cross-fade).
