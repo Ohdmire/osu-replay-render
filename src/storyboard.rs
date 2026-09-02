@@ -269,6 +269,8 @@ impl ParsedStoryboard {
             height,
             video,
             replaces_bg,
+            elements_enabled: true,
+            video_enabled: true,
         }
     }
 }
@@ -354,6 +356,10 @@ pub struct StoryboardLayer {
     video: Option<VideoState>,
     /// lazer `storyboardReplacesBackground`:宿主不应再画 Region::Background。
     replaces_bg: bool,
+    /// 元素层开关(`--storyboard`):off 时只画视频层,精灵层全部跳过。
+    elements_enabled: bool,
+    /// 视频层开关(`--video`):off 时不解码也不画视频。
+    video_enabled: bool,
 }
 
 impl StoryboardLayer {
@@ -371,7 +377,27 @@ impl StoryboardLayer {
         self.video.as_ref().map(|v| &v.info)
     }
 
-    /// Android 侧投递一帧解码视频(RGBA 行主序)。
+    /// 元素层开关(`--storyboard`):off 时本层只承载视频。
+    pub fn set_elements_enabled(&mut self, on: bool) {
+        self.elements_enabled = on;
+    }
+
+    pub fn elements_enabled(&self) -> bool {
+        self.elements_enabled
+    }
+
+    /// 视频层开关(`--video`):off 时不解码(Android 侧邮箱也随之静默)
+    /// 也不画视频。
+    pub fn set_video_enabled(&mut self, on: bool) {
+        self.video_enabled = on;
+    }
+
+    pub fn video_enabled(&self) -> bool {
+        self.video_enabled
+    }
+
+    /// Android 侧投递一帧解码视频(GL 读回)。缓冲应已为顶左行序
+    /// (与桌面 ffmpeg 路径一致),方向由读回端保证,绘制不翻。
     pub fn write_video_frame(&mut self, w: u32, h: u32, rgba: &[u8]) {
         if let Some(v) = &mut self.video {
             self.sb.write_frame(VIDEO_KEY, w, h, rgba);
@@ -379,6 +405,8 @@ impl StoryboardLayer {
             v.info.height = v.info.height.max(h);
         }
     }
+
+
 
     /// 标记视频时长(Kotlin MediaExtractor 探明后上报;驱动结尾淡出)。
     pub fn set_video_duration(&mut self, ms: f32) {
@@ -408,19 +436,26 @@ impl StoryboardLayer {
         if let Some((w, h, rgba)) = ext_frame {
             self.write_video_frame(*w, *h, rgba);
         }
-        self.pump_video(t);
+        if self.video_enabled {
+            self.pump_video(t);
+        }
 
-        let below_draws = build_draws_filtered(
-            &mut self.sb,
-            &mut self.assets,
-            &self.compiled,
-            t,
-            FailState::Pass,
-            |layer| !matches!(layer, Layer::Foreground | Layer::Overlay),
-        );
-        let mut below_draws = below_draws;
-        if let Some(d) = self.video_draw(t) {
-            below_draws.insert(0, d);
+        let mut below_draws = if self.elements_enabled {
+            build_draws_filtered(
+                &mut self.sb,
+                &mut self.assets,
+                &self.compiled,
+                t,
+                FailState::Pass,
+                |layer| !matches!(layer, Layer::Foreground | Layer::Overlay),
+            )
+        } else {
+            Vec::new()
+        };
+        if self.video_enabled {
+            if let Some(d) = self.video_draw(t) {
+                below_draws.insert(0, d);
+            }
         }
         let view = self.below.create_view(&Default::default());
         self.sb.render(
@@ -435,14 +470,18 @@ impl StoryboardLayer {
         out.copy_into_atlas(&self.below, atlas, Region::Storyboard);
 
         if let Some(above) = &self.above {
-            let above_draws = build_draws_filtered(
-                &mut self.sb,
-                &mut self.assets,
-                &self.compiled,
-                t,
-                FailState::Pass,
-                |layer| matches!(layer, Layer::Foreground | Layer::Overlay),
-            );
+            let above_draws = if self.elements_enabled {
+                build_draws_filtered(
+                    &mut self.sb,
+                    &mut self.assets,
+                    &self.compiled,
+                    t,
+                    FailState::Pass,
+                    |layer| matches!(layer, Layer::Foreground | Layer::Overlay),
+                )
+            } else {
+                Vec::new()
+            };
             let view = above.create_view(&Default::default());
             self.sb.render(
                 &view,
