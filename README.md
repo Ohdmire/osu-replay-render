@@ -19,8 +19,7 @@ osu_replay_render <beatmap.osu> [replay.osr] [options]
 | 选项 | 说明 |
 | --- | --- |
 | `--autoplay` | **Autoplay mod**：不输入 .osr,由谱面直接生成回放（本地移植 lazer `OsuAutoGenerator`）。判定引擎照常判定生成帧（SS/满血/UR 0）;只负责生成回放,不对 HUD 做任何处理（玩家名显示 lazer 的 autoplay 署名 `osu!`） |
-| `--hd` | **强制 Hidden mod 视觉（on）**，覆盖回放原有 mods：物件提前淡出、缩圈隐藏（首个物件保留）。纯视觉覆盖——判定/分数仍按回放真实 mods 计算（HD 本就不影响判定） |
-| `--no-hd` | **强制关闭 HD 视觉（off）**，即使回放自带 HD 也以全可见渲染。缺省为 **auto**：跟随回放自身 mods |
+| `--hd <auto\|on\|off>` | Hidden 视觉覆盖：**on** 强制开启（物件提前淡出、缩圈隐藏，首个物件保留），**off** 即使回放自带 HD 也以全可见渲染，缺省 **auto** 跟随回放自身 mods。纯视觉覆盖——判定/分数仍按回放真实 mods 计算（HD 本就不影响判定）。裸 `--hd` 等价 `on`；config 键 `"hd"` 接受 `"auto"/"on"/"off"` |
 | `--out <file.mp4>` | 管道输出到 ffmpeg 编码为 mp4 (h264, crf 18) |
 | `--png-dir <dir>` | 输出 PNG 帧序列到目录 |
 | `--size <WxH>` | 输出分辨率，默认 1920x1080 |
@@ -33,18 +32,19 @@ osu_replay_render <beatmap.osu> [replay.osr] [options]
 | `--encoder <auto\|x264\|x265\|nvenc>` | 视频编码器：默认 `auto`（探测 NVENC 可用则用之，否则回退 x264）；NVENC 硬件编码（bgr0 直喂 + p5/hq/vbr/cq，**端到端约比 x264 快 1.7×、比 x265 快 3.2×**）；libx264 / libx265（preset medium + crf） |
 | `--quality <n>` | crf（软件）/ cq（nvenc），默认 18 |
 | `--hud <on\|off>` | 玩法 HUD 显隐（分数/准确率/连击/血条/UR 条/按键显示/PP 计数器），默认 **on**;`off` 时玩法物件与光标照常渲染。裸 `--hud` 等价 `on`;真值别名 `true/false/1/0`。与 `--autoplay` 互相独立（autoplay 不再隐含关 HUD）。config 键为 JSON 布尔 `"hud"`;库嵌入方用 `HudState.visible` |
-| `--no-guides` | 关闭 UR 条的窗口引导线（判定色色轴），默认开启渲染 |
-| `--no-pp` | 关闭实时 PP 计数器（lazer 的 legacy HUD 本没有 PP，渲染器默认给所有皮肤额外显示）；库嵌入方用 `HudState.pp_display` |
+| `--guides <on\|off>` | UR 条的窗口引导线（判定色色轴），默认 **on**。裸 `--guides` 等价 `on`；config 键 `"guides"` |
+| `--pp <on\|off>` | 实时 PP 计数器（lazer 的 legacy HUD 本没有 PP，渲染器默认给所有皮肤额外显示），默认 **on**。裸 `--pp` 等价 `on`；config 键 `"pp"`；库嵌入方用 `HudState.pp_display` |
 | `--audio [file]` | 输出混入 BGM（AAC 192k）：带路径用指定文件；不带值自动取谱面 `[General] AudioFilename`（相对谱面目录）。音频位置 = 回放时间 − 偏移；负的起始位置用前置静音（adelay）补齐（复刻 lazer 负时间不播歌的行为）。DT/HT 自动 `atempo` 变速**不变调**（时长随 rate 压缩、音调保持原曲,刻意偏离游戏内变调行为）;NC 保持游戏内 `asetrate` 变速**变调**（nightcore 的升调是其本体,音效仍原速） |
 | `--audio-offset <ms>` | BGM 对齐偏移，默认 **0**；需要时手动传入（内部按 lazer 语义 ×rate） |
 | `--bgm-volume <0..1>` | BGM 增益,默认 **0.6**(osu! 默认 `VolumeMusic`,`OsuGame.GetFrameworkConfigDefaults` 覆盖 framework 的 1.0) |
 | `--hitsounds-volume <0..1>` | 音效总线增益,默认 **0.6**(osu! 默认 `VolumeEffect`)。音效按谱面 authored 电平播放,仅在编码处以 tanh 软拐点代替硬削波 |
 | `--master-volume <0..1>` | 混合后主音量,默认 **0.6**(osu! 默认 `VolumeUniversal`)。游戏链路为通道×主音量(0.6×0.6=每总线 0.36),默认下音乐+音效峰约 0.72,基本不削波;要更响的成片可提到 1.0 |
 | `--hitsounds` | 导出时离线合成**单独一条音效轨**并混入输出(与 `--audio` BGM 经 `amix` 求和,`normalize=0` 保持原始比例;无 BGM 时音效轨即音轨)。复刻 lazer 游戏音频语义:仅命中判定触发(`ArmedState.Hit`,miss 不发声);音色/音量按 .osu 采样数据解析(时间点 bank/音量、对象 hitSample、滑条 edgeSounds/edgeSets;采样点取 `CONTROL_POINT_LENIENCY` 5ms 语义);圆点=hitnormal+whistle/finish/clap,滑条=头/反复/尾节点音+slidertick+跟踪期 sliderslide/sliderwhistle 循环(跟踪断开即截断);音量下限 5%、声像随物件 X(`PositionalHitsoundsLevel` 0.8)、采样**原速回放**——任何 mod 下都不变调(含 NC),DT/HT/NC 只压缩触发时机;MISS 不触发物件音,连击归零播 `combobreak`(`ComboEffects`:旧 combo>20 或首次中断,`AlwaysPlayFirstComboBreak` 默认开;该样本 ArgonPro 集没有,按查找链取 Argon 集)。音源为 **ArgonPro** 资源集(内嵌):所有 gameplay 查找都命中该集、查找链不再下落——其滑条滑动循环音(sliderslide/sliderwhistle)是空条目=**静音**,即 ArgonPro 不播滑条滑动声;头/尾/反复节点音与 slidertick 为真采样,正常播放 |
-| `--bg` | 绘制谱面背景图（`[Events]` 的 `0,0,"..."`，相对谱面目录，PNG/JPEG），全屏铺满 |
+| `--bg <on\|off>` | 谱面背景图（`[Events]` 的 `0,0,"..."`，相对谱面目录，PNG/JPEG）全屏铺满，默认 **on**；裸 `--bg` 等价 `on`。**`--storyboard`/`--video` 任一开启时强制隐藏**（此开关随之无效，层自己铺满背景）；两者全关时正常生效 |
 | `--bg-opacity <0..1>` | 背景不透明度，默认 **0.3** = 1 − DimLevel（lazer `OsuSetting.DimLevel` 默认 0.7，与游戏内"背景暗度"语义一致） |
-| `--storyboard` | 渲染谱面故事板（`.osu` `[Events]` + 同目录共用 `.osb` 合并，osu! 稳定版语义；依赖 [osu-storyboard-render](../osu-storyboard-render) 库）。Background/Fail/Pass 层合成在游戏区**下方**，随背景暗度一起变暗（`--bg-opacity`；背景关闭时全亮）；Foreground/Overlay 层画在游戏区**上方**、HUD 之下，不变暗。回放渲染无失败状态，Fail/Pass 取 Pass 层。合成层分辨率取输出尺寸（封顶 1080p），逐帧 GPU 拷入图集，无回读。视频/音效元素不渲染；`T` 触发器不激活 |
-| `--results <secs>` | 玩法结束后追加结算界面（lazer `Screens/Ranking`）：**展开状态的 ScorePanel** 静态终帧——顶部头像/用户名条、标题/作者、准确率环（背景环 + 渐变计量表 + D~SS 分级色环 + 达成档位徽章 + 大档位字母）、总分、星数胶囊/模式图标/Mod 徽章、难度名与作者、ACCURACY/COMBO/PP 与判定统计行（GREAT/OK/MEH/MISS 及 L TICK/SLIDER TAIL/BONUS 行），底部 #333 按钮栏。背景为谱面背景图的高斯模糊副本（lazer `ResultsScreen` 的 `BACKGROUND_BLUR` σ=10px@1080p）按 `Gray(0.5)` 压暗铺满，与 lazer 一致；谱面无背景图时为清屏色。不做入场动画（准确率环/计数器直接呈终值）；rank 按 `RankFromScore` 截断 + osu! miss 降级 + HD 银牌计算。默认 **4 秒**；带音频导出时音轨自动以静音补齐到结算屏结束。`--no-results` 关闭。**`--results-only`** 则完全不渲染玩法、只输出结算屏（海报/预览模式，时长同样由 `--results` 控制；单图示例：`--results-only --png-dir out --fps 1 --results 1`） |
+| `--storyboard <on\|off>` | 渲染谱面故事板（`.osu` `[Events]` + 同目录共用 `.osb` 合并，osu! 稳定版语义；依赖 [osu-storyboard-render](../osu-storyboard-render) 库），默认 **off**；裸 `--storyboard` 等价 `on`。Background/Fail/Pass 层合成在游戏区**下方**，随背景暗度一起变暗（`--bg-opacity`；背景关闭时全亮）；Foreground/Overlay 层画在游戏区**上方**、HUD 之下，不变暗。回放渲染无失败状态，Fail/Pass 取 Pass 层。合成层分辨率取输出尺寸（封顶 1080p），逐帧 GPU 拷入图集，无回读。音效元素不渲染；`T` 触发器不激活 |
+| `--video <on\|off>` | 渲染谱面**故事板视频**（`Video,offset,"file"` 元素，lazer Video 层：Background 之下、居中 cover 铺满、起始 500ms 淡入/结尾 500ms 淡出），默认 **off**；裸 `--video` 等价 `on`；config 键 `"video"`。与 `--storyboard` 相互独立：只开视频不画故事板精灵。桌面端经 **ffmpeg rawvideo（RGBA）管道**逐帧解码、按渲染时刻帧对齐上纹理 |
+| `--results <secs>` | 玩法结束后追加结算界面（lazer `Screens/Ranking`）：**展开状态的 ScorePanel** 静态终帧——顶部头像/用户名条、标题/作者、准确率环（背景环 + 渐变计量表 + D~SS 分级色环 + 达成档位徽章 + 大档位字母）、总分、星数胶囊/模式图标/Mod 徽章、难度名与作者、ACCURACY/COMBO/PP 与判定统计行（GREAT/OK/MEH/MISS 及 L TICK/SLIDER TAIL/BONUS 行），底部 #333 按钮栏。背景为谱面背景图的高斯模糊副本（lazer `ResultsScreen` 的 `BACKGROUND_BLUR` σ=10px@1080p）按 `Gray(0.5)` 压暗铺满，与 lazer 一致；谱面无背景图时为清屏色。不做入场动画（准确率环/计数器直接呈终值）；rank 按 `RankFromScore` 截断 + osu! miss 降级 + HD 银牌计算。默认 **4 秒**；带音频导出时音轨自动以静音补齐到结算屏结束。`--results off` 关闭。**`--results-only`** 则完全不渲染玩法、只输出结算屏（海报/预览模式，时长同样由 `--results` 控制；单图示例：`--results-only --png-dir out --fps 1 --results 1`） |
 | `--avatar <image>` | 结算屏头像图片（jpg/png）：居中裁方 + 预圆角（与占位框同为 20/80 圆角），画在头像框里；不传时沿用玩家首字母占位。等价 config 键 `"avatar"` |
 | `--config <file.json>` | JSON 配置文件：键与 CLI 长参数一一对应（snake_case），如 `{"avatar": "a.png", "out": "x.mp4", "results": 5, "results_only": true, "bg": true, "bg_opacity": 0.3, "skin": "dir", "size": "1920x1080", "fps": 60, "hd": "on", "hitsounds": true, "master_volume": 0.8, "ffmpeg_extra": ["-movflags", "+faststart"]}`。config 先应用，**显式 CLI 参数始终覆盖 config**（与出现顺序无关） |
 | `--limit <n>` | 最多渲染 n 帧（测试用） |
@@ -168,7 +168,7 @@ if renderer.pending_len() > 0 {
   osu-replay-judge v0.2.0；渲染端 200ms OutQuint 平滑追宽 + 受伤闪红）、**UR 条**（水平置于屏幕底部
   居中，按 lazer `BarHitErrorMeter` 源码移植：刻度为**加色混合**判定
   色竖线（100ms 弹入至 0.6 后 5s 淡出收缩，最多 50 个）、判定色窗口
-  引导线色轴（中心 Great 蓝向外 Ok 绿、Meh 黄，最外端渐隐；`--no-guides`
+  引导线色轴（中心 Great 蓝向外 Ok 绿、Meh 黄，最外端渐隐；`--guides off`
   可关闭，默认渲染）、Great 色中心圆标记、**EMA 均值小箭头**（指数
   移动平均 0.9/0.1，800ms OutQuint 滑动指向）、条上方实时 UR 数值；
   UR 事件集与 `ScoreProcessor.unstable_rate` 完全一致（`has_windows &&
