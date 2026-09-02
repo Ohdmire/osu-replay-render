@@ -1,6 +1,6 @@
 [package]
 name = "osu_replay_render"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2024"
 license = "MIT"
 
@@ -11,7 +11,7 @@ osu-parse = { git = "https://github.com/Ohdmire/osu-parse.git" }
 rosu-pp = { git = "https://github.com/Apeuriox/rosu-pp.git", branch = "pp-rework-202607" }
 # Beatmap storyboard layer (.osu Events + shared .osb) — same checkout as
 # the standalone renderer, library target only (no winit/zip on Android).
-osu-storyboard-render = { path = "../osu-storyboard-render", default-features = false }
+osu-storyboard-render = { git = "https://github.com/Ohdmire/osu-storyboard-render.git", branch = "main", default-features = false }
 wgpu = "24"
 raw-window-handle = "0.6"
 pollster = "0.4"
@@ -20,15 +20,7 @@ jpeg-decoder = "0.3"
 ab_glyph = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Local judge checkout ahead of the published git rev (health processor +
-# break periods); drop this once osu-replay-judge is pushed.
-[patch."https://github.com/Ohdmire/osu-replay-judge.git"]
-osu_replay_judge = { path = "../osu-replay-judge" }
 
-# Local rosu-pp checkout of the pp-rework-202607 branch (spares network
-# fetches; the git dependency above is what embedders resolve).
-[patch."https://github.com/Apeuriox/rosu-pp.git"]
-rosu-pp = { path = "../rosu-pp" }
 
 [profile.release]
 lto = "thin"

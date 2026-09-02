@@ -312,7 +312,18 @@ impl SurfaceRenderer {
             return false;
         }
         let mut encoder = self.renderer.encode_scene(list, clear);
-        let Ok(frame) = self.surface.get_current_texture() else { return false };
+        let frame = match self.surface.get_current_texture() {
+            Ok(frame) => frame,
+            // 嵌入式宿主(OPP 的原生子窗口等)在 WebView 缩放/移动/跨屏
+            // 时会短暂使交换链失效:静默丢帧会让画面冻结而音频照播 ——
+            // 强制重配,下一 tick 恢复渲染。
+            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                self.surface_size = (0, 0);
+                self.resize(w, h);
+                return false;
+            }
+            Err(_) => return false,
+        };
         let view = frame.texture.create_view(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

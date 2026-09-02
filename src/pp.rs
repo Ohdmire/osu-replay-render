@@ -135,27 +135,11 @@ pub fn calculate(map_path: &str, mods_bits: u32, classic: bool, engine: &Engine)
         rosu_pp::any::DifficultyAttributes::Osu(attrs) => attrs,
         _ => return None,
     };
-    // Difficulty-over-time graph: the aim skill's per-object strains
-    // (the section peaks lost their fixed time axis in the pp-rework).
-    // Entry j belongs to the (j+1)-th top-level object, so the times come
-    // from the judge's own object list when the counts line up.
+    // 难度-时间图需要逐物件 aim 序列;上游 pp-rework-202607 分支的
+    // OsuStrains 无该数据(section peaks 无固定时间轴)—— 暂留空,仅
+    // 保留 section 峰值(strain_aim)。
     let (strain_aim, strain_points) = match difficulty.clone().strains(&map) {
-        rosu_pp::any::Strains::Osu(s) => {
-            let n_obj = engine.objects().len();
-            let points = if s.aim_objects.len() + 1 == n_obj && s.speed.len() + 1 == n_obj {
-                s.aim_objects
-                    .iter()
-                    .zip(&s.speed)
-                    .enumerate()
-                    .filter_map(|(j, (&aim, &speed))| {
-                        engine.objects().get(j + 1).map(|o| (o.start_time, aim, speed))
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            (s.aim, points)
-        }
+        rosu_pp::any::Strains::Osu(s) => (s.aim, Vec::new()),
         _ => (Vec::new(), Vec::new()),
     };
     let max_pp = rosu_pp::osu::OsuPerformance::new(attrs.clone())
