@@ -221,11 +221,44 @@ pub struct StoryboardSlots {
 /// BREAKING (0.7.0): returns `(Atlas, Fonts)` — the extra Torus Light /
 /// Venera fonts back the results screen's score counter and rank letter.
 /// `avatar_image` (`--avatar` / config `avatar`) is packed as
+/// Cover-crop to the target aspect (w/h, centre crop). lazer's
+/// BackgroundScreen fills the screen aspect-preserving (framework
+/// `FillMode.Fill` = CSS cover): the beatmap background is pre-cropped
+/// to the render aspect at atlas build, so any full-screen draw of
+/// `Region::Background` [`BackgroundBlurred`] crops like lazer instead
+/// of stretching. No-op when the aspect already matches.
+pub fn cover_crop(img: Image, aspect: f32) -> Image {
+    if !aspect.is_finite() || aspect <= 0.0 {
+        return img;
+    }
+    let cur = img.width as f32 / img.height as f32;
+    let (w, h) = if (cur - aspect).abs() < 1e-3 {
+        return img;
+    } else if cur > aspect {
+        // Too wide: crop the width, keep every row.
+        (((img.height as f32 * aspect).round() as u32).clamp(1, img.width), img.height)
+    } else {
+        // Too tall: crop the height, keep every column.
+        (img.width, ((img.width as f32 / aspect).round() as u32).clamp(1, img.height))
+    };
+    let x0 = (img.width - w) / 2;
+    let y0 = (img.height - h) / 2;
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for row in y0..y0 + h {
+        let s = ((row * img.width + x0) * 4) as usize;
+        rgba.extend_from_slice(&img.rgba[s..s + (w * 4) as usize]);
+    }
+    Image { width: w, height: h, rgba }
+}
+
+/// Builds the texture atlas: skin sprites, fonts, counters, `--bg`
+/// (pre-cropped to `bg_aspect`, see [cover_crop]),
 /// `Region::Avatar`: cover-cropped square, pre-masked rounded corners.
 /// `storyboard` (`--storyboard`) reserves the full-frame storyboard
 /// composite slots (`Region::Storyboard` [+ `StoryboardForeground`]).
 pub fn build_atlas(
     bg_image: Option<Image>,
+    bg_aspect: Option<f32>,
     avatar_image: Option<Image>,
     skin: &mut dyn skin::SkinTextureSource,
     max_dim: u32,
@@ -239,6 +272,12 @@ pub fn build_atlas(
 
     let mut images: Vec<(Region, Image)> = Vec::new();
     if let Some(img) = bg_image {
+        // lazer covers (aspect-fill): crop to the render aspect up front so
+        // the full-screen draws in scene/results crop instead of stretch.
+        let img = match bg_aspect {
+            Some(a) => cover_crop(img, a),
+            None => img,
+        };
         // Results-screen copy: lazer's `ResultsScreen` blurs the beatmap
         // background with `BACKGROUND_BLUR = 10` (the framework blur
         // SIGMA in screen px; 10 px at 1080p = 7.11 virtual units) and

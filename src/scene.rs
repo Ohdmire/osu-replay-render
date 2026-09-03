@@ -760,9 +760,11 @@ impl SceneState {
 
         // 0. Beatmap background (`--bg`): full-screen behind everything at
         // the configured opacity (lazer's BackgroundScreen sprite fills the
-        // screen; alpha = 1 - DimLevel). Skipped when the storyboard
-        // replaces it (lazer `storyboardReplacesBackground`: the sb's own
-        // Background-layer copy draws instead, dimming the background to 1).
+        // screen cover-cropped — the atlas texture is pre-cropped to the
+        // render aspect at build; alpha = 1 - DimLevel). Skipped when the
+        // storyboard replaces it (lazer `storyboardReplacesBackground`:
+        // the sb's own Background-layer copy draws instead, dimming the
+        // background to 1).
         if let Some(op) = self.bg_opacity.filter(|_| !self.sb_replaces_bg) {
             let m = &self.mapper;
             list.image(

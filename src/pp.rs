@@ -49,14 +49,15 @@ pub struct PpData {
     /// `PerformanceBreakdownChart` (`GetAttributesForDisplay`).
     pub breakdown: PpBreakdown,
     pub breakdown_max: PpBreakdown,
-    /// Aim strain peaks per 400ms section (`Difficulty::strains`), the
-    /// classic difficulty-over-time graph feed.
-    pub strain_aim: Vec<f64>,
-    /// Time-mapped difficulty graph points `(time, aim, speed)`: the
-    /// per-object strains of the aim and speed skills against the
-    /// difficulty objects' times (one entry per object past the first).
-    /// Empty when the object counts don't line up.
-    pub strain_points: Vec<(f64, f64, f64)>,
+    /// 结算页 Difficulty Graph 的三条曲线,均为逐物件时间序列
+    /// `(物件 start_time, strain)`。speed/reading 是 `OsuStrains` 公开
+    /// 字段里自带的逐物件序列;aim 依赖本地 rosu-pp patch
+    /// (`Aim::into_object_difficulties`,条目数与 speed 一致,不一致
+    /// 时视为未 patch 而留空)。条目 j 属于第 j+1 个顶层物件(首个
+    /// 物件不产生条目)。单条为空时绘制端跳过。
+    pub strain_aim_pts: Vec<(f64, f64)>,
+    pub strain_speed_pts: Vec<(f64, f64)>,
+    pub strain_reading_pts: Vec<(f64, f64)>,
     /// `(time, pp)` after each finished top-level object, in order - the
     /// live counter timeline ([`pp_at`] binary-searches it).
     pub events: Vec<(f64, f64)>,
@@ -135,12 +136,30 @@ pub fn calculate(map_path: &str, mods_bits: u32, classic: bool, engine: &Engine)
         rosu_pp::any::DifficultyAttributes::Osu(attrs) => attrs,
         _ => return None,
     };
-    // 难度-时间图需要逐物件 aim 序列;上游 pp-rework-202607 分支的
-    // OsuStrains 无该数据(section peaks 无固定时间轴)—— 暂留空,仅
-    // 保留 section 峰值(strain_aim)。
-    let (strain_aim, strain_points) = match difficulty.clone().strains(&map) {
-        rosu_pp::any::Strains::Osu(s) => (s.aim, Vec::new()),
-        _ => (Vec::new(), Vec::new()),
+    // 难度-时间图:一次 strains() 全算完。speed/reading 逐物件(条目 j
+    // 属于第 j+1 个顶层物件),t 直接取谱面物件 start_time;aim 依赖
+    // 本地 rosu-patch(逐物件化),条目数与 speed 一致才用 —— 未 patch
+    // 时 aim 是按值降序、无时间戳的滚动峰值,画了就是错的数据,宁可
+    // 留空(flashlight 仍是滚动峰值,不用)。数量万一不齐就 zip 截断,
+    // 曲线缺角但不清空。
+    let (strain_aim_pts, strain_speed_pts, strain_reading_pts) = match difficulty.clone().strains(&map) {
+        rosu_pp::any::Strains::Osu(s) => {
+            let per_object = |values: &[f64]| {
+                values
+                    .iter()
+                    .zip(map.hit_objects.iter().skip(1))
+                    .map(|(&v, h)| (h.start_time, v))
+                    .collect()
+            };
+            // 仅当 aim 与 speed 条目数一致(=本地 patch 生效)才映射。
+            let aim = if s.aim.len() == s.speed.len() {
+                per_object(&s.aim)
+            } else {
+                Vec::new()
+            };
+            (aim, per_object(&s.speed), per_object(&s.reading))
+        }
+        _ => (Vec::new(), Vec::new(), Vec::new()),
     };
     let max_pp = rosu_pp::osu::OsuPerformance::new(attrs.clone())
         .lazer(!classic)
@@ -212,7 +231,7 @@ pub fn calculate(map_path: &str, mods_bits: u32, classic: bool, engine: &Engine)
     let pp = events.last().map(|&(_, pp)| pp).unwrap_or(0.0);
     let breakdown = last_attrs.as_ref().map(PpBreakdown::of).unwrap_or_default();
 
-    Some(PpData { pp, pp_max: max_pp, stars: attrs.stars, breakdown, breakdown_max, strain_aim, strain_points, events })
+    Some(PpData { pp, pp_max: max_pp, stars: attrs.stars, breakdown, breakdown_max, strain_aim_pts, strain_speed_pts, strain_reading_pts, events })
 }
 
 /// Live PP at time `t` (latest event at/before `t`; 0.0 before the first).

@@ -1282,7 +1282,12 @@ fn pack(images: &[(Region, Image)], width: u32) -> Atlas {
 
 impl Atlas {
     pub fn region_rect(&self, region: Region) -> Rect {
-        *self.rects.get(&region).expect("atlas region")
+        // 带上具体 Region:槽位是 build_atlas 构建期预留的,这里的
+        // panic 几乎总是"重建图集时漏带槽位"(如皮肤/背景热切换漏了
+        // 故事板合成槽位),缺失项的名字直接指向出错分支。
+        *self.rects.get(&region).unwrap_or_else(|| {
+            panic!("atlas region missing: {region:?} (slot not reserved at build time)")
+        })
     }
 
     pub fn ink(&self, region: Region) -> [f32; 4] {
