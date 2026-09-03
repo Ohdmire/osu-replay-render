@@ -1026,7 +1026,7 @@ checksum = "cc58d42f8f2308b4b241de147827af84179d0a318de250495c7c5e47cb701cd9"
 [[package]]
 name = "rosu-pp"
 version = "4.0.1"
-source = "git+https://github.com/Ohdmire/rosu-pp.git?branch=pp-rework-202607#70bf42d79cbcf9eaa351373ec93e609ba6b340ae"
+source = "git+https://github.com/Apeuriox/rosu-pp.git?branch=pp-rework-202607#6bd0e6a4e6e792e3493f4b2f8af48e224dc8b5d1"
 dependencies = [
  "divan",
  "rosu-map",
