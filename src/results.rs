@@ -1911,11 +1911,10 @@ fn draw_statistics(game: &GameData, assets: &Assets, m: &Mapper, list: &mut Draw
 
     // ------------------------------------------------------------------
     // Bottom row: Difficulty Graph - per-object rosu-pp strain curves
-    // over time from `Difficulty::strains` (aim in the star-rating
-    // colour - via the local rosu-pp patch that makes `OsuStrains::aim`
-    // per-object, empty without it; speed in lazer blue; reading in
-    // green), each normalised to its own peak, with a colour legend and
-    // a red x on the time axis at every miss time.
+    // over time from `Difficulty::strains` (aim per-object via the merged
+    // pp-rework-202607 branch), each normalised to its own peak, with a
+    // colour legend and a red x on the time axis at every miss time.
+    // Fixed colours: aim pink-purple, speed blue, reading green.
     // ------------------------------------------------------------------
     let aim_pts = &game.strain_aim_pts;
     let speed_pts = &game.strain_speed_pts;
@@ -1954,7 +1953,7 @@ fn draw_statistics(game: &GameData, assets: &Assets, m: &Mapper, list: &mut Draw
         let gw = d_size[0];
         let base_y = d_area[1] + top_pad + plot_h;
         let x_at = |t: f64| -> f32 { (((t - t0) / (last_end - t0)).clamp(0.0, 1.0) * gw as f64) as f32 };
-        let curve_colour = star_colour(game.stars);
+        let aim_colour = Colour::from_hex(0xE066FF);
         let speed_colour = Colour::from_hex(0x66CCFF);
         let reading_colour = Colour::from_hex(0x66FF66);
 
@@ -1971,18 +1970,18 @@ fn draw_statistics(game: &GameData, assets: &Assets, m: &Mapper, list: &mut Draw
             list.stroke_band(&line, 1.3 * s, 0.0, colour, colour, 1.0);
         };
         if !aim_pts.is_empty() {
-            draw_curve(aim_pts, curve_colour);
+            draw_curve(aim_pts, aim_colour);
         }
         draw_curve(speed_pts, speed_colour);
         draw_curve(reading_pts, reading_colour);
 
         // Legend: colour swatch + label per curve, stacked top-left
-        // inside the plot (aim only listed when the local rosu-pp patch
+        // inside the plot (aim only listed when the strain data
         // supplied it).
         let legend_x = gx0 + 8.0;
         let legend_font = 11.0;
         let legend_items: [(&str, Colour); 3] = [
-            ("AIM", curve_colour),
+            ("AIM", aim_colour),
             ("SPEED", speed_colour),
             ("READING", reading_colour),
         ];
