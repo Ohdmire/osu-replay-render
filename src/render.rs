@@ -113,26 +113,25 @@ fn fs_body_main(in: VsOut) -> @location(0) vec4<f32> {
         let position = clamp(1.0 - d / r, 0.0, 1.0);
         let SHADOW = 0.078125;  // 1 - 59/64
         let BORDER = 0.1875;
-        var col: vec4<f32>;
-        if (position <= BORDER) {
-            if (position <= SHADOW) {
-                col = vec4<f32>(0.0, 0.0, 0.0, 0.25 * (position / SHADOW) * in.color2.a);
-            } else {
-                col = in.color2;
-            }
-        } else {
-            let t = clamp((position - BORDER) / (1.0 - BORDER), 0.0, 1.0);
-            let inner = vec3<f32>(in.local.x, in.local.y, in.uv.z);
-            col = vec4<f32>(mix(in.color.rgb, inner, t), in.color.a);
-        }
+        // Analytic 0.75px feathers at both colour seams (shadow->border,
+        // border->gradient): the hard switches staircased along curved
+        // paths. Feather width converts from pixels via the body radius.
+        let px = 0.75 / r;
+        let ramp_a = 0.25 * clamp(position / SHADOW, 0.0, 1.0) * in.color2.a;
+        let shadow_col = vec4<f32>(0.0, 0.0, 0.0, ramp_a);
+        let w1 = smoothstep(SHADOW - px, SHADOW + px, position);
+        let t = clamp((position - BORDER) / (1.0 - BORDER), 0.0, 1.0);
+        let inner = vec3<f32>(in.local.x, in.local.y, in.uv.z);
+        let grad_col = vec4<f32>(mix(in.color.rgb, inner, t), in.color.a);
+        let w2 = smoothstep(BORDER - px, BORDER + px, position);
+        let col = mix(mix(shadow_col, in.color2, w1), grad_col, w2);
         let aa_a = aa(r - d) * col.a;
         return vec4<f32>(col.rgb * aa_a, aa_a);
     }
 
-    var col = in.color;
-    if (d > r - b) {
-        col = in.color2;
-    }
+    // Border/body seam: same-width analytic feather as the outer aa().
+    let seam = clamp((d - (r - b)) / max(min(0.75, b), 1e-3) + 0.5, 0.0, 1.0);
+    let col = mix(in.color, in.color2, seam);
     let alpha = aa(r - d) * col.a;
     return vec4<f32>(col.rgb * alpha, alpha);
 }
@@ -226,13 +225,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     } else if (mode == 8.0) {
         // Cap disc: body fill with a radial border band at the rim (slider
         // end caps; overlapping the band seamlessly since colours match).
+        // Border/body seam gets the same analytic 0.75px feather as the
+        // outer aa() - the hard switch staircased on curved caps.
         let d = length(in.local);
         let r = in.aux.y;
         let b = in.aux.z;
-        var col = in.color;
-        if (d > r - b) {
-            col = in.color2;
-        }
+        let seam = clamp((d - (r - b)) / max(min(0.75, b), 1e-3) + 0.5, 0.0, 1.0);
+        let col = mix(in.color, in.color2, seam);
         let a = aa(r - d) * col.a;
         c = vec4<f32>(col.rgb * a, a);
     } else if (mode == 11.0) {
