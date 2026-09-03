@@ -1495,7 +1495,7 @@ fn draw_statistics(game: &GameData, assets: &Assets, m: &Mapper, list: &mut Draw
     let y0 = panel_top;
     // Bottom row: the difficulty-over-time graph (rosu-pp strains) with
     // miss markers. Only when the strain data is available.
-    let has_strains = game.strain_points.len() > 1;
+    let has_strains = game.strain_speed_pts.len() > 1 || game.strain_reading_pts.len() > 1;
     let strain_content_h = if has_strains { 110.0 } else { 0.0 };
     // The graphs row takes whatever the breakdown and strain rows leave.
     let row2_content = ((panel_h - pb_content_h - strain_content_h) - 2.0 * chrome - if has_strains { chrome + gap } else { 0.0 } - gap)
@@ -1910,25 +1910,41 @@ fn draw_statistics(game: &GameData, assets: &Assets, m: &Mapper, list: &mut Draw
     }
 
     // ------------------------------------------------------------------
-    // Bottom row: Difficulty Graph - the rosu-pp strain curves over time
-    // (aim as the filled curve, speed as the thin overlay), with a red x
-    // on the curve at every miss time. The strain points are per-object
-    // (time, aim, speed) from the local rosu-pp fork.
+    // Bottom row: Difficulty Graph - per-object rosu-pp strain curves
+    // over time from `Difficulty::strains` (aim in the star-rating
+    // colour - via the local rosu-pp patch that makes `OsuStrains::aim`
+    // per-object, empty without it; speed in lazer blue; reading in
+    // green), each normalised to its own peak, with a colour legend and
+    // a red x on the time axis at every miss time.
     // ------------------------------------------------------------------
-    let pts = &game.strain_points;
-    if pts.len() > 1 {
+    let aim_pts = &game.strain_aim_pts;
+    let speed_pts = &game.strain_speed_pts;
+    let reading_pts = &game.strain_reading_pts;
+    if aim_pts.len() > 1 || speed_pts.len() > 1 || reading_pts.len() > 1 {
         let y3 = y2 + row2_content + chrome + gap;
         let (d_area, d_size) = stat_item_box(list, m, left, y3, content_w, strain_content_h, "Difficulty Graph", assets);
         // The time axis starts at the FIRST strain point: the map's intro
         // lead-in (no objects, no strain) is cut, and the curve begins at
         // the plot's left edge instead of wedging back to the origin.
-        let t0 = pts[0].0;
+        let t0 = aim_pts
+            .first()
+            .or(speed_pts.first())
+            .or(reading_pts.first())
+            .map(|&(t, _)| t)
+            .unwrap_or(0.0);
         let last_end = game
             .objects
             .last()
             .map(|o| o.end_time)
             .filter(|t| *t > t0)
-            .unwrap_or(pts.last().unwrap().0);
+            .unwrap_or_else(|| {
+                aim_pts
+                    .last()
+                    .or(speed_pts.last())
+                    .or(reading_pts.last())
+                    .map(|&(t, _)| t)
+                    .unwrap_or(t0 + 1.0)
+            });
         // Headroom above the curve + the strip below the axis where the
         // miss x-marks live.
         let top_pad = 12.0;
@@ -1937,17 +1953,66 @@ fn draw_statistics(game: &GameData, assets: &Assets, m: &Mapper, list: &mut Draw
         let gx0 = d_area[0];
         let gw = d_size[0];
         let base_y = d_area[1] + top_pad + plot_h;
-        let max_aim = pts.iter().map(|p| p.1).fold(0.0f64, f64::max).max(1e-9);
         let x_at = |t: f64| -> f32 { (((t - t0) / (last_end - t0)).clamp(0.0, 1.0) * gw as f64) as f32 };
         let curve_colour = star_colour(game.stars);
+        let speed_colour = Colour::from_hex(0x66CCFF);
+        let reading_colour = Colour::from_hex(0x66FF66);
 
-        // Aim skill: JUST the curve line - no filled area and no speed
-        // overlay, so nothing connects down to the origin/baseline.
-        let mut aim_pts: Vec<[f32; 2]> = Vec::with_capacity(pts.len());
-        for &(t, aim, _) in pts.iter() {
-            aim_pts.push([(gx0 + x_at(t)) * s, (base_y - (aim / max_aim) as f32 * plot_h) * s]);
+        // One curve line per skill, each normalised to its own peak: the
+        // skills' strain magnitudes are not comparable - the shapes (when
+        // difficulty spikes) are the point, the legend explains the
+        // colours.
+        let mut draw_curve = |pts: &[(f64, f64)], colour: Colour| {
+            let max_v = pts.iter().map(|p| p.1).fold(0.0f64, f64::max).max(1e-9);
+            let mut line: Vec<[f32; 2]> = Vec::with_capacity(pts.len());
+            for &(t, v) in pts.iter() {
+                line.push([(gx0 + x_at(t)) * s, (base_y - (v / max_v) as f32 * plot_h) * s]);
+            }
+            list.stroke_band(&line, 1.3 * s, 0.0, colour, colour, 1.0);
+        };
+        if !aim_pts.is_empty() {
+            draw_curve(aim_pts, curve_colour);
         }
-        list.stroke_band(&aim_pts, 1.3 * s, 0.0, curve_colour, curve_colour, 1.0);
+        draw_curve(speed_pts, speed_colour);
+        draw_curve(reading_pts, reading_colour);
+
+        // Legend: colour swatch + label per curve, stacked top-left
+        // inside the plot (aim only listed when the local rosu-pp patch
+        // supplied it).
+        let legend_x = gx0 + 8.0;
+        let legend_font = 11.0;
+        let legend_items: [(&str, Colour); 3] = [
+            ("AIM", curve_colour),
+            ("SPEED", speed_colour),
+            ("READING", reading_colour),
+        ];
+        for (i, (label, colour)) in legend_items
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 0 || !aim_pts.is_empty())
+        {
+            let ly = d_area[1] + top_pad + 9.0 + i as f32 * 14.0;
+            list.capsule(
+                [legend_x * s, ly * s],
+                [(legend_x + 12.0) * s, ly * s],
+                2.5 * s,
+                *colour,
+                Blend::Alpha,
+            );
+            let lw = ttf_measure(assets.semibold, label, legend_font, 0.0).0;
+            draw_ttf_text(
+                list,
+                assets.atlas,
+                assets.semibold,
+                false,
+                label,
+                [(legend_x + 16.0 + lw * 0.5) * s, ly * s],
+                legend_font * s,
+                *colour,
+                0.0,
+                Blend::Alpha,
+            );
+        }
 
         // Baseline.
         list.capsule(

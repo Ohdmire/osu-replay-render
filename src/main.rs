@@ -903,7 +903,14 @@ fn main() {
     // 8192 is the GLES/GL-compat floor for max_texture_dimension2d:
     // capping here keeps the atlas creatable on every backend (desktop
     // Vulkan/dGPU simply packs wider instead of taller).
-    let (atlas, fonts) = build_atlas(bg_image, avatar_image, &mut resolved_skin, 8192, storyboard_slots);
+    let (atlas, fonts) = build_atlas(
+        bg_image,
+        Some(opts.width as f32 / opts.height.max(1) as f32),
+        avatar_image,
+        &mut resolved_skin,
+        8192,
+        storyboard_slots,
+    );
     eprintln!("atlas: {}x{}", atlas.width, atlas.height);
 
     let mut renderer = Renderer::new(opts.width, opts.height, &atlas);

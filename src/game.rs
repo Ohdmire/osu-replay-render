@@ -376,12 +376,12 @@ pub struct GameData {
     /// PP component breakdowns (achieved, FC) for the results screen's
     /// `PerformanceBreakdownChart`. `None` when PP is unavailable.
     pub pp_breakdown: Option<(crate::pp::PpBreakdown, crate::pp::PpBreakdown)>,
-    /// Aim strain peaks per 400ms section (the results screen's
-    /// difficulty-over-time graph). Empty when PP is unavailable.
-    pub strain_aim: Vec<f64>,
-    /// Time-mapped difficulty graph points `(time, aim, speed)` for the
-    /// results screen's Difficulty Graph card.
-    pub strain_points: Vec<(f64, f64, f64)>,
+    /// 结算页 Difficulty Graph 三条曲线,均为逐物件时间序列
+    /// `(物件 start_time, strain)`:aim(依赖本地 rosu-pp patch)、
+    /// speed、reading。PP 不可用时为空;aim 在未 patch 环境下为空。
+    pub strain_aim_pts: Vec<(f64, f64)>,
+    pub strain_speed_pts: Vec<(f64, f64)>,
+    pub strain_reading_pts: Vec<(f64, f64)>,
     /// Circle hit events for the results statistics (`AccuracyHeatmap`:
     /// hits + misses; the `Timing Distribution` graph / `UnstableRate` /
     /// `AverageHitError` use the hits only).
@@ -461,8 +461,9 @@ pub fn load(map_path: &str, replay_path: &str) -> Result<GameData, String> {    
         data.pp_events = pp.events;
         data.stars = pp.stars;
         data.pp_breakdown = Some((pp.breakdown, pp.breakdown_max));
-        data.strain_aim = pp.strain_aim;
-        data.strain_points = pp.strain_points;
+        data.strain_aim_pts = pp.strain_aim_pts;
+        data.strain_speed_pts = pp.strain_speed_pts;
+        data.strain_reading_pts = pp.strain_reading_pts;
     }
     Ok(data)
 }
@@ -498,8 +499,9 @@ pub fn load_autoplay(map_path: &str) -> Result<GameData, String> {
         data.pp_events = pp.events;
         data.stars = pp.stars;
         data.pp_breakdown = Some((pp.breakdown, pp.breakdown_max));
-        data.strain_aim = pp.strain_aim;
-        data.strain_points = pp.strain_points;
+        data.strain_aim_pts = pp.strain_aim_pts;
+        data.strain_speed_pts = pp.strain_speed_pts;
+        data.strain_reading_pts = pp.strain_reading_pts;
     }
     Ok(data)
 }
@@ -917,8 +919,9 @@ fn build(
         pp: f64::NAN,
         pp_max: f64::NAN,
         pp_breakdown: None,
-        strain_aim: Vec::new(),
-        strain_points: Vec::new(),
+        strain_aim_pts: Vec::new(),
+        strain_speed_pts: Vec::new(),
+        strain_reading_pts: Vec::new(),
         results_hit_events,
         pp_events: Vec::new(),
         miss_times,

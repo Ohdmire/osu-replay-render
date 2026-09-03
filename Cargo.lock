@@ -818,7 +818,7 @@ dependencies = [
 
 [[package]]
 name = "osu_replay_render"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "ab_glyph",
  "jpeg-decoder",
@@ -1026,7 +1026,7 @@ checksum = "cc58d42f8f2308b4b241de147827af84179d0a318de250495c7c5e47cb701cd9"
 [[package]]
 name = "rosu-pp"
 version = "4.0.1"
-source = "git+https://github.com/Apeuriox/rosu-pp.git?branch=pp-rework-202607#9a073d29611ef936b581a08d3c5b288ef5427301"
+source = "git+https://github.com/Ohdmire/rosu-pp.git?branch=pp-rework-202607#70bf42d79cbcf9eaa351373ec93e609ba6b340ae"
 dependencies = [
  "divan",
  "rosu-map",
