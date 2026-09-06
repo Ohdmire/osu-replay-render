@@ -417,7 +417,10 @@ pub fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 
 impl Renderer {
     pub fn new(width: u32, height: u32, atlas: &Atlas) -> Renderer {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        // 与 surface.rs 同理:尊重 WGPU_BACKEND(default() 会无视环境变量)
+        let mut descriptor = wgpu::InstanceDescriptor::default();
+        descriptor.backends = wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all());
+        let instance = wgpu::Instance::new(&descriptor);
         let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,

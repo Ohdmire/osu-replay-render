@@ -177,14 +177,20 @@ pub fn parse_beatmap_bins(
     // 视频元素(lazer PrimaryVideo:第一个 Video)。桌面侧顺手 ffprobe
     // 尺寸/帧率/时长(Android 由 Kotlin MediaExtractor 上报)。
     let mut video = story.videos.first().and_then(|v| {
-        resolve_file(&root, &v.path).map(|path| VideoInfo {
-            path,
-            start_ms: v.start_time,
-            duration_ms: 0.0,
-            width: 0,
-            height: 0,
-            fps: 0.0,
-        })
+        match resolve_file(&root, &v.path) {
+            Some(path) => Some(VideoInfo {
+                path,
+                start_ms: v.start_time,
+                duration_ms: 0.0,
+                width: 0,
+                height: 0,
+                fps: 0.0,
+            }),
+            None => {
+                eprintln!("storyboard: 视频文件未找到: {} (map root: {:?})", v.path, root);
+                None
+            }
+        }
     });
     if let Some(v) = &mut video {
         #[cfg(not(target_os = "android"))]
@@ -301,6 +307,7 @@ impl ParsedStoryboard {
             source: None,
             finished: false,
             frame_pts: f64::NEG_INFINITY,
+            spawn_attempts: 0,
         });
         let replaces_bg = self.replaces_background;
         StoryboardLayer {
@@ -403,6 +410,8 @@ struct VideoState {
     finished: bool,
     /// 当前纹理里帧的 map 时间(ms);NEG_INFINITY = 尚无帧。
     frame_pts: f64,
+    /// ffmpeg 管道启动尝试数(首帧前被外部干掉时有限重试)。
+    spawn_attempts: u32,
 }
 
 /// The GPU half: offscreen composites + the library's sprite renderer,
@@ -475,6 +484,20 @@ impl StoryboardLayer {
 
     pub fn video_enabled(&self) -> bool {
         self.video_enabled
+    }
+
+    /// 重置视频解码状态(循环重播 / 倒退 seek 后由宿主调用):丢弃 ffmpeg
+    /// 管道与耗尽标记,清掉帧时间戳;下次 [`render`] 接近视频开始时会按
+    /// 当前时间 `-ss` 重新起播。不重置的话管道只能向前推帧,时间倒退后
+    /// 视频会冻在旧帧上。重试计数一并清零 —— 上一轮用完的重试额度不能
+    /// 带进新一轮(否则循环重播直接被判"已耗尽",视频消失)。
+    pub fn reset_video(&mut self) {
+        if let Some(v) = &mut self.video {
+            v.source = None;
+            v.finished = false;
+            v.frame_pts = f64::NEG_INFINITY;
+            v.spawn_attempts = 0;
+        }
     }
 
     /// Android 侧投递一帧解码视频(GL 读回)。缓冲应已为顶左行序
@@ -591,6 +614,11 @@ impl StoryboardLayer {
             if t as f64 + 1000.0 < v.info.start_ms as f64 {
                 return;
             }
+            if v.spawn_attempts >= 2 {
+                v.finished = true;
+                return;
+            }
+            v.spawn_attempts += 1;
             let info = v.info.clone();
             let ffmpeg = self.ffmpeg_bin.clone();
             v.source = VideoPipe::spawn(&info, t as f64, ffmpeg.as_deref());
@@ -603,6 +631,18 @@ impl StoryboardLayer {
         if let Some(pipe) = &mut v.source {
             while pipe.next_pts_ms <= t as f64 {
                 if !pipe.read_frame() {
+                    if v.frame_pts == f64::NEG_INFINITY {
+                        // 首帧未到管道即结束:解码进程被外部终止的典型症状
+                        // (安全软件首次放行前拦截 ffmpeg —— 表现为"第二次
+                        // 播放才出视频")。丢弃管道下一轮重试(有上限),
+                        // 不静默放弃。
+                        eprintln!(
+                            "storyboard: 视频管道首帧前结束({:?}),重试 {}/2",
+                            v.info.path, v.spawn_attempts
+                        );
+                        v.source = None;
+                        return;
+                    }
                     v.finished = true;
                     break;
                 }

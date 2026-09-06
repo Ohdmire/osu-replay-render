@@ -105,7 +105,13 @@ impl SurfaceRenderer {
     ) -> Result<SurfaceRenderer, String> {
         // 单一 Instance:surface 与 adapter 必须同源,跨实例的 surface id
         // 在 wgpu-core 里直接 panic("Surface does not exist")。
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        // backends 尊重 WGPU_BACKEND 环境变量(default() 是 Backends::all(),
+        // 会无视环境变量按内置顺序选 —— 宿主指定的 dx12 根本不生效,
+        // 实际跑在 Vulkan + 第三方 hook 层上)。
+        let mut descriptor = wgpu::InstanceDescriptor::default();
+        descriptor.backends =
+            wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all());
+        let instance = wgpu::Instance::new(&descriptor);
         let surface = unsafe {
             instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
                 raw_display_handle: raw_display,
@@ -121,6 +127,11 @@ impl SurfaceRenderer {
         .ok_or("没有支持该窗口的 GPU 适配器")?;
 
         let renderer = Renderer::from_adapter(adapter, width, height, atlas);
+        eprintln!(
+            "wgpu surface: backend={:?} adapter='{}'",
+            renderer.adapter().get_info().backend,
+            renderer.adapter().get_info().name
+        );
         let device = renderer.device().clone();
         let queue = renderer.queue().clone();
         let frame_aspect = width as f32 / height as f32;

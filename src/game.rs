@@ -434,7 +434,7 @@ fn with_lead_in(mut snapshots: Vec<FrameSnap>, rate: f64) -> Vec<FrameSnap> {
     snapshots
 }
 
-pub fn load(map_path: &str, replay_path: &str) -> Result<GameData, String> {    let content = std::fs::read_to_string(map_path).map_err(|e| format!("cannot read beatmap: {}", e))?;
+pub fn load(map_path: &str, replay_path: &str) -> Result<GameData, String> {    let content = std::fs::read_to_string(map_path).map_err(|e| format!("cannot read beatmap {map_path}: {e}"))?;
     let mut map = beatmap::decode(&content)?;
     let rep = replay::decode_file(replay_path, map.version)?;
 
@@ -473,7 +473,7 @@ pub fn load(map_path: &str, replay_path: &str) -> Result<GameData, String> {    
 /// file is needed. The engine then judges the generated frames like any
 /// other replay — every judgement/HP/combo/UR readout is real.
 pub fn load_autoplay(map_path: &str) -> Result<GameData, String> {
-    let content = std::fs::read_to_string(map_path).map_err(|e| format!("cannot read beatmap: {}", e))?;
+    let content = std::fs::read_to_string(map_path).map_err(|e| format!("cannot read beatmap {map_path}: {e}"))?;
     let mut map = beatmap::decode(&content)?;
 
     // Lazer autoplay scores: no rate/visibility mods, standardised scoring.
