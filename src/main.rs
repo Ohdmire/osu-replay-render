@@ -742,7 +742,7 @@ fn main() {
         }
         None => {
             eprintln!("loading {} (autoplay preview)", map_path);
-            game::load_autoplay(&map_path)
+            game::load_autoplay(&map_path, false, true)
         }
     };
     let mut game = match game {

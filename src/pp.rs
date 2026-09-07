@@ -122,9 +122,10 @@ fn fold(label: &str, result: HitResult, classic: bool, state: &mut rosu_pp::osu:
 
 /// PP for the replay the engine judged, plus the live timeline. `None`
 /// when rosu-pp cannot parse the map (rendering continues without the
-/// numbers).
-pub fn calculate(map_path: &str, mods_bits: u32, classic: bool, engine: &Engine) -> Option<PpData> {
-    let map = rosu_pp::Beatmap::from_path(map_path).ok()?;
+/// numbers). Takes the beatmap's bytes so zero-copy hosts (lazer content
+/// addressing) can feed it straight from their blob store.
+pub fn calculate(map_bytes: &[u8], mods_bits: u32, classic: bool, engine: &Engine) -> Option<PpData> {
+    let map = rosu_pp::Beatmap::from_bytes(map_bytes).ok()?;
     map.check_suspicion().ok()?;
 
     let difficulty = rosu_pp::Difficulty::new()

@@ -34,6 +34,10 @@ use osu_storyboard_render::render::texture::Assets as SbAssets;
 use std::io::Read;
 use std::path::PathBuf;
 
+/// 素材集(磁盘 / 内存 / 回调字节)。re-export 供零拷贝宿主构建
+/// [`SbAssets::resolver`] 入参而无需直接依赖 osu-storyboard-render。
+pub use osu_storyboard_render::render::texture::Assets;
+
 /// storyboard 贴图的 GPU 内存预算(解码后 RGBA 字节)。视频式逐帧动画的
 /// storyboard 可引用上千张独立贴图,超出预算按 LRU 淘汰,下次用到重传。
 #[cfg(not(target_os = "android"))]
@@ -172,11 +176,11 @@ pub fn parse_beatmap_bins(
 ) -> Option<ParsedStoryboard> {
     let loaded = osu_storyboard_render::loader::load_beatmap(map_path, true)?;
     let root = loaded.root.clone();
-    let mut story = loaded.story;
+    let story = loaded.story;
 
     // 视频元素(lazer PrimaryVideo:第一个 Video)。桌面侧顺手 ffprobe
     // 尺寸/帧率/时长(Android 由 Kotlin MediaExtractor 上报)。
-    let mut video = story.videos.first().and_then(|v| {
+    let video = story.videos.first().and_then(|v| {
         match resolve_file(&root, &v.path) {
             Some(path) => Some(VideoInfo {
                 path,
@@ -192,6 +196,61 @@ pub fn parse_beatmap_bins(
             }
         }
     });
+    finish_storyboard(story, video, beatmap_background, ffprobe, SbAssets::disk(&root))
+}
+
+/// 零拷贝宿主(osu!lazer 内容寻址库):谱面文本与素材路径由宿主回调
+/// 提供,渲染端不要求谱面目录真实存在、也不做任何复制。
+///
+/// - `osu_text` / `osb_text`:难度 `.osu` 与谱组共享 `.osb` 的内容;
+/// - `resolve_path`:storyboard 相对文件名 → 实际文件路径(视频解码用,
+///   大小写不敏感匹配由宿主负责);
+/// - `assets`:宿主构建的素材集(通常 [`SbAssets::resolver`] 字节回调)。
+pub fn parse_beatmap_sourced(
+    osu_text: &str,
+    osb_text: Option<&str>,
+    beatmap_background: Option<&str>,
+    resolve_path: &dyn Fn(&str) -> Option<PathBuf>,
+    ffprobe: Option<&std::path::Path>,
+    assets: SbAssets,
+) -> Option<ParsedStoryboard> {
+    let story = osu_storyboard_render::loader::load_from_texts(osu_text, osb_text, true)?;
+    let video = story.videos.first().and_then(|v| {
+        match resolve_file_name(resolve_path, &v.path) {
+            Some(path) => Some(VideoInfo {
+                path,
+                start_ms: v.start_time,
+                duration_ms: 0.0,
+                width: 0,
+                height: 0,
+                fps: 0.0,
+            }),
+            None => {
+                eprintln!("storyboard: 视频文件未解析到: {}", v.path);
+                None
+            }
+        }
+    });
+    finish_storyboard(story, video, beatmap_background, ffprobe, assets)
+}
+
+/// 视频文件名经宿主回调解析(原样;失败回退去掉目录部分再试)。
+fn resolve_file_name(resolve: &dyn Fn(&str) -> Option<PathBuf>, name: &str) -> Option<PathBuf> {
+    resolve(name).or_else(|| {
+        let norm = name.trim().trim_matches('"').replace('\\', "/");
+        norm.rsplit('/').next().and_then(|base| resolve(base))
+    })
+}
+
+/// 两个解析入口的共享装配:视频探测、接管型背景剔除、背景抑制判定、
+/// 时间轴编译与素材缓存预算。
+fn finish_storyboard(
+    mut story: osu_parse::storyboard::model::Storyboard,
+    mut video: Option<VideoInfo>,
+    beatmap_background: Option<&str>,
+    ffprobe: Option<&std::path::Path>,
+    mut assets: SbAssets,
+) -> Option<ParsedStoryboard> {
     if let Some(v) = &mut video {
         #[cfg(not(target_os = "android"))]
         probe_video(v, ffprobe);
@@ -255,8 +314,15 @@ pub fn parse_beatmap_bins(
     // 精灵已在上面剔除,剩下的元素为空且带视频 = 只有视频的故事板。
     let video_only = story.elements.is_empty() && !story.videos.is_empty();
     let compiled = CompiledStoryboard::compile(story);
-    let mut assets = SbAssets::disk(&root);
-    assets.set_cache_budget(CACHE_BUDGET);
+    // CPU 解码缓存预算:SB_CACHE_MB 环境变量覆盖(嵌入式/壁纸宿主可调低
+    // 换内存;缺省与独立渲染器一致)。视频式逐帧动画的 storyboard 可引用
+    // 上千张贴图,预算只是上限,用到才占。
+    let budget = std::env::var("SB_CACHE_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+        .unwrap_or(CACHE_BUDGET);
+    assets.set_cache_budget(budget);
     Some(ParsedStoryboard { compiled, assets, foreground, replaces_background, video, video_only })
 }
 

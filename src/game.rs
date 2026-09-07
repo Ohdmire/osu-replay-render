@@ -455,7 +455,7 @@ pub fn load(map_path: &str, replay_path: &str) -> Result<GameData, String> {    
     data.map_audio = map.general.audio_filename.clone();
     data.map_background = map.background.clone();
     data.sample_data = std::mem::take(&mut map.sample_data);
-    if let Some(pp) = crate::pp::calculate(map_path, rep.header.mods, classic, &engine) {
+    if let Some(pp) = crate::pp::calculate(content.as_bytes(), rep.header.mods, classic, &engine) {
         data.pp = pp.pp;
         data.pp_max = pp.pp_max;
         data.pp_events = pp.events;
@@ -472,9 +472,20 @@ pub fn load(map_path: &str, replay_path: &str) -> Result<GameData, String> {    
 /// of lazer's `OsuAutoGenerator` instead of a recorded .osr, so no replay
 /// file is needed. The engine then judges the generated frames like any
 /// other replay — every judgement/HP/combo/UR readout is real.
-pub fn load_autoplay(map_path: &str) -> Result<GameData, String> {
+/// `hidden` adds the HD mod's visuals (objects fade out before hit time;
+/// judgement is untouched — HD is visual only, so mods/PP stay no-mod).
+/// `with_pp`: skip the rosu-pp pass (stars/PP timeline) when the host won't
+/// display it (live wallpaper with HUD off) — saves load time.
+pub fn load_autoplay(map_path: &str, hidden: bool, with_pp: bool) -> Result<GameData, String> {
     let content = std::fs::read_to_string(map_path).map_err(|e| format!("cannot read beatmap {map_path}: {e}"))?;
-    let mut map = beatmap::decode(&content)?;
+    load_autoplay_content(&content, hidden, with_pp)
+}
+
+/// [`load_autoplay`] for zero-copy hosts (osu!lazer content-addressed
+/// storage): the beatmap text is supplied by the host, which reads it
+/// straight from its blob store — no real beatmap directory required.
+pub fn load_autoplay_content(osu_text: &str, hidden: bool, with_pp: bool) -> Result<GameData, String> {
+    let mut map = beatmap::decode(osu_text)?;
 
     // Lazer autoplay scores: no rate/visibility mods, standardised scoring.
     let mods = Mods::from_legacy(0, false)?;
@@ -493,15 +504,19 @@ pub fn load_autoplay(map_path: &str) -> Result<GameData, String> {
     data.map_audio = map.general.audio_filename.clone();
     data.map_background = map.background.clone();
     data.sample_data = std::mem::take(&mut map.sample_data);
-    if let Some(pp) = crate::pp::calculate(map_path, 0, classic, &engine) {
-        data.pp = pp.pp;
-        data.pp_max = pp.pp_max;
-        data.pp_events = pp.events;
-        data.stars = pp.stars;
-        data.pp_breakdown = Some((pp.breakdown, pp.breakdown_max));
-        data.strain_aim_pts = pp.strain_aim_pts;
-        data.strain_speed_pts = pp.strain_speed_pts;
-        data.strain_reading_pts = pp.strain_reading_pts;
+    // HD 视觉(纯装饰:不改判定/PP,播放器可选项)
+    data.hidden = hidden;
+    if with_pp {
+        if let Some(pp) = crate::pp::calculate(osu_text.as_bytes(), 0, classic, &engine) {
+            data.pp = pp.pp;
+            data.pp_max = pp.pp_max;
+            data.pp_events = pp.events;
+            data.stars = pp.stars;
+            data.pp_breakdown = Some((pp.breakdown, pp.breakdown_max));
+            data.strain_aim_pts = pp.strain_aim_pts;
+            data.strain_speed_pts = pp.strain_speed_pts;
+            data.strain_reading_pts = pp.strain_reading_pts;
+        }
     }
     Ok(data)
 }

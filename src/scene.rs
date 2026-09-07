@@ -853,10 +853,10 @@ impl SceneState {
                 // HD hides approach circles everywhere except the first
                 // adjustable object (`IncreaseFirstObjectVisibility`,
                 // default on; spinners never qualify as the first object).
-                if game.hidden && obj.index != game.hd_first_object {
+                if self.hidden && obj.index != game.hd_first_object {
                     continue;
                 }
-                draw_approach_circle(self.legacy.as_ref(), assets, list, &self.mapper, obj, t, game.hidden);
+                draw_approach_circle(self.legacy.as_ref(), assets, list, &self.mapper, obj, t, self.hidden);
             }
         }
 

@@ -1142,6 +1142,15 @@ pub struct Atlas {
     inks: HashMap<Region, [f32; 4]>,
 }
 
+impl Atlas {
+    /// Drop the CPU-side RGBA copy (a 4096² atlas is 64 MB). Safe once the
+    /// pixels are on the GPU (Renderer's initial upload) and the host won't
+    /// call `set_atlas` — region rect / ink queries are unaffected.
+    pub fn release_cpu_copy(&mut self) {
+        self.rgba = Vec::new();
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Rect {
     pub x0: f32,

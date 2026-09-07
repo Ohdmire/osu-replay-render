@@ -932,16 +932,22 @@ impl Renderer {
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT; // 256
         let padded_row = ((width * 4 + align - 1) / align) * align;
 
-        let readback_ring: Vec<wgpu::Buffer> = (0..3)
-            .map(|i| {
-                device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(&format!("readback {i}")),
-                    size: (padded_row * height) as u64,
-                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
+        // NO_READBACK(壁纸等无回读宿主):跳过 3×帧大小的 MAP_READ 暂存堆
+        //(2560×1440 下约 44MB 提交内存,壁纸端从不回读,纯浪费)。
+        let readback_ring: Vec<wgpu::Buffer> = if std::env::var_os("NO_READBACK").is_some() {
+            Vec::new()
+        } else {
+            (0..3)
+                .map(|i| {
+                    device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(&format!("readback {i}")),
+                        size: (padded_row * height) as u64,
+                        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    })
                 })
-            })
-            .collect();
+                .collect()
+        };
 
         Renderer {
             adapter,
@@ -1317,6 +1323,11 @@ impl Renderer {
     }
 
     fn submit_frame_with(&mut self, mut encoder: wgpu::CommandEncoder) {
+        // 无回读配置(NO_READBACK):跳过 texture→buffer 拷贝直接提交
+        if self.readback_ring.is_empty() {
+            self.queue.submit(Some(encoder.finish()));
+            return;
+        }
         let slot = self.readback_next;
         self.readback_next = (self.readback_next + 1) % self.readback_ring.len();
         encoder.copy_texture_to_buffer(

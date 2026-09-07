@@ -662,16 +662,22 @@ impl<'a> SampleResolver<'a> {
                 .and_then(|skin| lookup_candidates(sample.bank.as_str(), stripped).iter().find_map(|n| skin.get_sample(n)));
         }
         let clip = match resolved {
+            // 皮肤提供了该槽位 = 权威:解码失败(含 0 字节禁用占位)即静音,
+            // 不回退内置默认
             Some(path) => match decode_sample_file(&path) {
                 Ok(clip) => Some(Arc::new(clip)),
                 Err(e) => {
-                    eprintln!("hitsound warning: skin sample {} failed to decode ({}), falling back", path.display(), e);
+                    eprintln!(
+                        "hitsound: skin sample {} not decodable ({}), treated as disabled by the skin",
+                        path.display(),
+                        e
+                    );
                     None
                 }
             },
-            None => None,
-        }
-        .or_else(|| sample_clip(sample).map(Arc::new));
+            // 皮肤未提供该槽位:内置默认
+            None => sample_clip(sample).map(Arc::new),
+        };
         if clip.is_none() {
             eprintln!(
                 "hitsound warning: no sample for {}-{} in the skin or the default set, its hitsounds are silent",
@@ -714,19 +720,20 @@ pub fn resolve_sample_wav(bank: &str, name: &str, skin: &dyn crate::skin::Skin) 
         }
         let path = names.iter().find_map(|n| skin.get_sample(n));
         if let Some(path) = path {
+            // 皮肤提供了该采样槽位 = 权威。0 字节占位是皮肤作者**有意禁用**
+            // 该音效的惯用手法:读出/解码失败直接静音,绝不回退内置默认
+            //(调用方对空字节/None 都按缺失处理,天然静音)。
             let is_wav = path
                 .extension()
                 .and_then(|e| e.to_str())
                 .is_some_and(|e| e.eq_ignore_ascii_case("wav"));
             if is_wav {
-                if let Ok(bytes) = std::fs::read(&path) {
-                    return Some(bytes);
-                }
-            } else if let Some(clip) = ffmpeg_pcm(&path) {
-                return Some(encode_wav(&clip.data, false));
+                return std::fs::read(&path).ok();
             }
+            return ffmpeg_pcm(&path).map(|clip| encode_wav(&clip.data, false));
         }
     }
+    // 皮肤未提供该槽位(或非 legacy 皮肤):回退内置默认
     sample_bytes(bank, name).map(|b| b.to_vec())
 }
 
@@ -1316,6 +1323,59 @@ fn encode_wav(interleaved: &[f32], limit: bool) -> Vec<u8> {
 }
 
 #[cfg(test)]
+mod zero_byte_skin_tests {
+    use super::*;
+
+    /// 皮肤用 0 字节占位禁用某音效:resolve 不得回退内置默认
+    ///(0 字节 = Some(empty) 或 None,二者下游都静音)。
+    struct StubSkin {
+        conf: crate::skin::SkinConfiguration,
+        sample: std::path::PathBuf,
+    }
+    impl crate::skin::Skin for StubSkin {
+        fn name(&self) -> &str { "stub" }
+        fn configuration(&self) -> &crate::skin::SkinConfiguration { &self.conf }
+        fn is_legacy(&self) -> bool { true }
+        fn get_texture(&self, _: &str) -> Option<crate::skin::SkinTexture> { None }
+        fn get_config(&self, _: crate::skin::SkinLookup) -> Option<crate::skin::SkinValue> { None }
+        fn get_sample(&self, _: &str) -> Option<std::path::PathBuf> { Some(self.sample.clone()) }
+    }
+
+    #[test]
+    fn zero_byte_skin_sample_disables_instead_of_fallback() {
+        let dir = std::env::temp_dir().join(format!("orr_zero_sample_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("normal-hitnormal.wav");
+        std::fs::write(&wav, b"").unwrap(); // 0 字节占位
+        let skin = StubSkin { conf: Default::default(), sample: wav };
+        let resolved = resolve_sample_wav("normal", "hitnormal", &skin);
+        match resolved {
+            Some(bytes) => assert!(bytes.is_empty(), "0 字节占位应原样返回空字节,而不是内置默认"),
+            None => {} // 非 wav/读取失败路径:同样表示静音
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 皮肤完全没有该槽位:仍回退内置默认(ArgonPro 内嵌采样非空)。
+    struct MissingSkin { conf: crate::skin::SkinConfiguration }
+    impl crate::skin::Skin for MissingSkin {
+        fn name(&self) -> &str { "missing" }
+        fn configuration(&self) -> &crate::skin::SkinConfiguration { &self.conf }
+        fn is_legacy(&self) -> bool { true }
+        fn get_texture(&self, _: &str) -> Option<crate::skin::SkinTexture> { None }
+        fn get_config(&self, _: crate::skin::SkinLookup) -> Option<crate::skin::SkinValue> { None }
+        fn get_sample(&self, _: &str) -> Option<std::path::PathBuf> { None }
+    }
+
+    #[test]
+    fn missing_slot_still_falls_back_to_builtin() {
+        let skin = MissingSkin { conf: Default::default() };
+        let resolved = resolve_sample_wav("normal", "hitnormal", &skin);
+        assert!(resolved.is_some_and(|b| !b.is_empty()), "未提供槽位应回退内置非空采样");
+    }
+}
+
 mod tests {
     use super::*;
 
@@ -1438,7 +1498,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("loops.osu");
         std::fs::write(&path, map).unwrap();
-        let game = crate::game::load_autoplay(path.to_str().unwrap()).unwrap();
+        let game = crate::game::load_autoplay(path.to_str().unwrap(), false, false).unwrap();
 
         let events = collect_loop_events(&game, &osu_parse::samples::parse(map));
         let slide = events.iter().find(|e| e.name == "sliderslide").expect("sliderslide event");

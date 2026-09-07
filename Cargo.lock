@@ -789,7 +789,6 @@ dependencies = [
 [[package]]
 name = "osu-parse"
 version = "0.1.0"
-source = "git+https://github.com/Ohdmire/osu-parse.git#32eff487538c0b4e2c51c5c8e3dd0fdbb0d50824"
 dependencies = [
  "lzma-rs",
 ]
@@ -797,7 +796,6 @@ dependencies = [
 [[package]]
 name = "osu-storyboard-render"
 version = "0.1.1"
-source = "git+https://github.com/Ohdmire/osu-storyboard-render.git?branch=main#474557ffc421af30bf21d86c67ef2cb0a9b8e806"
 dependencies = [
  "anyhow",
  "bytemuck",
