@@ -354,18 +354,6 @@ impl ParsedStoryboard {
         width: u32,
         height: u32,
     ) -> StoryboardLayer {
-        let make_tex = |label: &str| {
-            device.create_texture(&wgpu::TextureDescriptor {
-                label: Some(label),
-                size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            })
-        };
         let mut sb = SbRenderer::new(device, queue);
         sb.set_gpu_budget(GPU_BUDGET);
         let video = self.video.map(|info| VideoState {
@@ -380,8 +368,7 @@ impl ParsedStoryboard {
             compiled: self.compiled,
             assets: self.assets,
             sb,
-            below: make_tex("storyboard below"),
-            above: self.foreground.then(|| make_tex("storyboard above")),
+            foreground: self.foreground,
             width,
             height,
             video,
@@ -403,6 +390,9 @@ struct VideoPipe {
     /// 下一帧的 map 时间(ms)。
     next_pts_ms: f64,
     step_ms: f64,
+    /// 管道起播时刻:-ss 落点是关键帧,可能在目标时刻前数秒(GOP),
+    /// 起播后的补帧期不算"落后重起",否则会反复重起在同一关键帧。
+    spawned_at: std::time::Instant,
 }
 
 #[cfg(not(target_os = "android"))]
@@ -439,7 +429,7 @@ impl VideoPipe {
         let frame = vec![0u8; (info.width * info.height * 4) as usize];
         let step_ms = if info.fps > 0.0 { 1000.0 / info.fps } else { 33.0 };
         let next_pts_ms = info.start_ms as f64 + seek_s * 1000.0;
-        Some(VideoPipe { child, stdout, frame, next_pts_ms, step_ms })
+        Some(VideoPipe { child, stdout, frame, next_pts_ms, step_ms, spawned_at: std::time::Instant::now() })
     }
 
     /// 读取一帧到 self.frame;EOF/错误返回 false。
@@ -480,14 +470,14 @@ struct VideoState {
     spawn_attempts: u32,
 }
 
-/// The GPU half: offscreen composites + the library's sprite renderer,
-/// all on the host renderer's device/queue.
+/// The GPU half: the library's sprite renderer, compositing directly
+/// into the host atlas slots, all on the host renderer's device/queue.
 pub struct StoryboardLayer {
     compiled: CompiledStoryboard,
     assets: SbAssets,
     sb: SbRenderer,
-    below: wgpu::Texture,
-    above: Option<wgpu::Texture>,
+    /// 是否预留了 Foreground/Overlay 上层槽位(Region::StoryboardForeground)。
+    foreground: bool,
     width: u32,
     height: u32,
     video: Option<VideoState>,
@@ -514,7 +504,7 @@ impl StoryboardLayer {
     }
 
     pub fn has_foreground(&self) -> bool {
-        self.above.is_some()
+        self.foreground
     }
 
     /// 背景抑制(lazer `storyboardReplacesBackground`)。
@@ -627,19 +617,23 @@ impl StoryboardLayer {
                 below_draws.insert(0, d);
             }
         }
-        let view = self.below.create_view(&Default::default());
-        self.sb.render(
-            &view,
+        // 直接渲进图集槽位(REPLACE 四边形区域清屏 + viewport 映射),
+        // 省掉独立 below/above 纹理与每帧 copy_into_atlas
+        let rect = atlas.region_rect(Region::Storyboard);
+        let (x, y) = (rect.x0 as u32, rect.y0 as u32);
+        let (w, h) = ((rect.x1 - rect.x0) as u32, (rect.y1 - rect.y0) as u32);
+        self.sb.render_subrect(
+            out.atlas_view(),
             wgpu::TextureFormat::Rgba8Unorm,
             self.width,
             self.height,
             self.view_widescreen(),
             &below_draws,
             [0.0, 0.0, 0.0, 0.0],
+            Some((x, y, w, h)),
         );
-        out.copy_into_atlas(&self.below, atlas, Region::Storyboard);
 
-        if let Some(above) = &self.above {
+        if self.foreground {
             let above_draws = if self.elements_enabled {
                 build_draws_filtered(
                     &mut self.sb,
@@ -652,22 +646,30 @@ impl StoryboardLayer {
             } else {
                 Vec::new()
             };
-            let view = above.create_view(&Default::default());
-            self.sb.render(
-                &view,
+            let rect = atlas.region_rect(Region::StoryboardForeground);
+            let (x, y) = (rect.x0 as u32, rect.y0 as u32);
+            let (w, h) = ((rect.x1 - rect.x0) as u32, (rect.y1 - rect.y0) as u32);
+            self.sb.render_subrect(
+                out.atlas_view(),
                 wgpu::TextureFormat::Rgba8Unorm,
                 self.width,
                 self.height,
                 self.view_widescreen(),
                 &above_draws,
                 [0.0, 0.0, 0.0, 0.0],
+                Some((x, y, w, h)),
             );
-            out.copy_into_atlas(above, atlas, Region::StoryboardForeground);
         }
     }
 
-    /// 推进桌面视频解码器到时刻 t(顺序读取所有 pts ≤ t 的帧,最后一帧
-    /// 落纹理;渲染时间单调递增,与管道节奏天然同步)。
+    /// 视频落后当前渲染时刻超过此值(ms)时,丢弃管道并按当前时间 `-ss`
+    /// 重起(关键帧快 seek)。否则大前跳 seek 后的顺序补帧会长时间阻塞
+    /// 事件循环——BGM 在 kira 音频线程先行,恢复时时钟硬对齐把整段
+    /// 打击音效跳过;解码慢于实时的视频更是每拍都卡(音效持续偏移)。
+    const RESPAWN_BEHIND_MS: f64 = 1500.0;
+
+    /// 推进桌面视频解码器到时刻 t(读帧直到追上或达单拍上限;渲染时间
+    /// 单调递增,与管道节奏天然同步)。
     #[cfg(not(target_os = "android"))]
     fn pump_video(&mut self, t: f32) {
         let (w, h) = match &self.video {
@@ -692,10 +694,29 @@ impl StoryboardLayer {
                 v.finished = true;
                 return;
             }
+            // spawn 当拍不读帧:ffmpeg -ss 起播到首帧输出的阻塞留给下一拍
+            return;
         }
+        // 大幅落后(大前跳 seek / 解码跟不上实时):丢弃管道,下一拍按
+        // 当前时间 -ss 重起,不顺序补帧。主动重起不占失败重试额度。
+        // 起播宽限:-ss 落点的关键帧可能在目标前数秒(GOP),补帧期
+        // (4 帧/拍,远快于实时)不算落后,否则会反复重起同一关键帧。
+        if let Some(pipe) = &v.source {
+            if t as f64 - pipe.next_pts_ms > Self::RESPAWN_BEHIND_MS
+                && pipe.spawned_at.elapsed() > std::time::Duration::from_secs(5)
+            {
+                v.source = None;
+                v.spawn_attempts = 0;
+                return;
+            }
+        }
+        // 单拍顺序读取上限:把本拍阻塞限制在几帧时间内,事件循环
+        // (时钟积分 + 打击音效)得以按拍推进,欠账由后续拍补齐。
+        const PUMP_MAX_FRAMES: u32 = 4;
         let mut updated = false;
         if let Some(pipe) = &mut v.source {
-            while pipe.next_pts_ms <= t as f64 {
+            let mut frames = 0u32;
+            while pipe.next_pts_ms <= t as f64 && frames < PUMP_MAX_FRAMES {
                 if !pipe.read_frame() {
                     if v.frame_pts == f64::NEG_INFINITY {
                         // 首帧未到管道即结束:解码进程被外部终止的典型症状
@@ -715,6 +736,7 @@ impl StoryboardLayer {
                 v.frame_pts = pipe.next_pts_ms;
                 pipe.next_pts_ms += pipe.step_ms;
                 updated = true;
+                frames += 1;
             }
         }
         if updated {

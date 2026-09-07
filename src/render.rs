@@ -374,8 +374,12 @@ pub struct Renderer {
     atlas_bind: wgpu::BindGroup,
     atlas_layout: wgpu::BindGroupLayout,
     atlas_sampler: wgpu::Sampler,
-    /// The live atlas GPU texture (kept for `copy_into_atlas`).
+    /// The live atlas GPU texture (kept for the `atlas_view` accessor —
+    /// the storyboard layer renders its composite directly into the
+    /// atlas slots each frame).
     atlas_tex: wgpu::Texture,
+    /// Cached view of [`atlas_tex`]: storyboard composite render target.
+    atlas_view: wgpu::TextureView,
     screen_bind: wgpu::BindGroup,
     body_tex: wgpu::Texture,
     body_bind: wgpu::BindGroup,
@@ -468,7 +472,10 @@ impl Renderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            // RENDER_ATTACHMENT:storyboard 合成层每帧直接渲进图集槽位
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
         self.queue.write_texture(
@@ -495,34 +502,15 @@ impl Renderer {
             ],
             label: Some("atlas bind"),
         });
+        self.atlas_view = view;
         self.atlas_tex = atlas_tex;
     }
 
-    /// GPU 侧把一张 Rgba8Unorm 纹理拷进图集的某个区域槽位(storyboard
-    /// 合成层每帧刷新用)。`src` 的尺寸必须与区域一致;同一队列内
-    /// 顺序在后续场景提交之前。
-    pub fn copy_into_atlas(&self, src: &wgpu::Texture, atlas: &Atlas, region: crate::draw::Region) {
-        let rect = atlas.region_rect(region);
-        let (x, y) = (rect.x0 as u32, rect.y0 as u32);
-        let size = wgpu::Extent3d {
-            width: (rect.x1 - rect.x0) as u32,
-            height: (rect.y1 - rect.y0) as u32,
-            depth_or_array_layers: 1,
-        };
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("atlas slot copy"),
-        });
-        encoder.copy_texture_to_texture(
-            src.as_image_copy(),
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.atlas_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x, y, z: 0 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            size,
-        );
-        self.queue.submit(Some(encoder.finish()));
+    /// The live atlas GPU view: the storyboard composite render target
+    /// (regions `Region::Storyboard` / `StoryboardForeground` are drawn
+    /// into directly each frame).
+    pub fn atlas_view(&self) -> &wgpu::TextureView {
+        &self.atlas_view
     }
 
     pub fn target_view(&self) -> wgpu::TextureView {
@@ -677,7 +665,10 @@ impl Renderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            // RENDER_ATTACHMENT:storyboard 合成层每帧直接渲进图集槽位
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
         queue.write_texture(
@@ -965,6 +956,7 @@ impl Renderer {
             atlas_layout,
             atlas_sampler: sampler,
             atlas_tex,
+            atlas_view,
             screen_bind,
             target,
             msaa,
@@ -996,8 +988,33 @@ impl Renderer {
     pub fn encode_scene(&mut self, list: &DrawList, clear: [f64; 4]) -> wgpu::CommandEncoder {
         let vbytes = list.vertices.len() * std::mem::size_of::<Vertex>();
         let ibytes = list.indices.len() * 4;
-        assert!(vbytes as u64 <= self.vbo.size(), "vertex buffer overflow: {}", vbytes);
-        assert!(ibytes as u64 <= self.ibo.size(), "index buffer overflow: {}", ibytes);
+        // 场景顶点/索引缓冲按需增长(替代旧的 assert 崩溃)。常规谱面
+        // 远用不满初始 4/8 MiB;会爆的是 Aspire 类坏图 —— Flashbacklog [V]
+        // 带离屏 4 万像素级的物件,引导点(follow points)沿物件连接
+        // 每 32px 一个、数量无上限,单帧涌入 ~2 万 quad,旧实现直接
+        // panic、壁纸进程整体消失。扩容按 next_power_of_two,仅在新
+        // 需求超出当前容量时发生(普通曲目零开销);不做缩容 —— 换图
+        // 后偶发的小帧不值得释放重分配。COPY_SRC 保留给回读路径。
+        if vbytes as u64 > self.vbo.size() {
+            self.vbo = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("vbo(grown)"),
+                size: (vbytes as u64).next_power_of_two(),
+                usage: wgpu::BufferUsages::VERTEX
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+        }
+        if ibytes as u64 > self.ibo.size() {
+            self.ibo = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ibo(grown)"),
+                size: (ibytes as u64).next_power_of_two(),
+                usage: wgpu::BufferUsages::INDEX
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+        }
 
         let use_msaa = sample_count() > 1;
 
@@ -1067,8 +1084,24 @@ impl Renderer {
         }
         let pre_vbytes = prepass_verts.len() * std::mem::size_of::<Vertex>();
         let pre_ibytes = prepass_indices.len() * 4;
-        assert!(pre_vbytes as u64 <= self.body_vbo.size(), "body vertex buffer overflow: {}", pre_vbytes);
-        assert!(pre_ibytes as u64 <= self.body_ibo.size(), "body index buffer overflow: {}", pre_ibytes);
+        // 滑条预通道缓冲同样按需增长(见上方主 vbo/ibo 的注释;
+        // 初始 16/8 MiB ≈ 149k 段,坏图/超密滑条组超出时扩容而非崩溃)。
+        if pre_vbytes as u64 > self.body_vbo.size() {
+            self.body_vbo = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("body vbo(grown)"),
+                size: (pre_vbytes as u64).next_power_of_two(),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if pre_ibytes as u64 > self.body_ibo.size() {
+            self.body_ibo = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("body ibo(grown)"),
+                size: (pre_ibytes as u64).next_power_of_two(),
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
 
         // ---- Scene geometry (body composites prepended) ------------------
         let mut all_verts = body_quads.clone();

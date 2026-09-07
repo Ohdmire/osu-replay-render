@@ -941,9 +941,10 @@ fn main() {
         None
     };
     state.storyboard_fg = sb_layer.as_ref().is_some_and(|l| l.elements_enabled() && l.has_foreground());
-    // 背景规则:故事板/视频任一开启 → 背景图强制关闭(`--bg` 随之无效):
-    // 层自己铺满背景;两者全关时 `--bg` 正常生效。
-    state.sb_replaces_bg = sb_active;
+    // 背景规则(lazer `Storyboard.ReplacesBackground`):仅当故事板
+    // Background 层存在引用谱面背景文件的元素时才隐藏背景图;
+    // Crack Traxxxx 一类"仅 Foreground 小效果"的谱面背景保持可见。
+    state.sb_replaces_bg = sb_layer.as_ref().is_some_and(|l| l.replaces_background());
     state.has_bg = has_bg;
     state.has_avatar = opts.avatar.is_some();
     state.cursor_size = opts.cursor_size;

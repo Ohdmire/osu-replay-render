@@ -604,11 +604,11 @@ pub struct SceneState {
     /// (`Region::StoryboardForeground`); drawn above the playfield,
     /// under the HUD.
     pub storyboard_fg: bool,
-    /// The storyboard is active: the beatmap background image must NOT
-    /// draw — the storyboard (and its video) provides the backdrop.
-    /// (This renderer's rule; lazer's narrower `ReplacesBackground` only
-    /// hides it when the storyboard's Background layer re-declares the
-    /// background file.)
+    /// lazer `Storyboard.ReplacesBackground`: the beatmap background
+    /// image is hidden ONLY when the storyboard's Background layer
+    /// re-declares the background file itself. Storyboards that merely
+    /// add effects (e.g. Crack Traxxxx's foreground-only glow) keep the
+    /// background visible behind them.
     pub sb_replaces_bg: bool,
     /// A custom avatar image exists in the atlas (`--avatar` / config
     /// `avatar`); the results screen draws it instead of the initial.
@@ -761,27 +761,36 @@ impl SceneState {
         // 0. Beatmap background (`--bg`): full-screen behind everything at
         // the configured opacity (lazer's BackgroundScreen sprite fills the
         // screen cover-cropped — the atlas texture is pre-cropped to the
-        // render aspect at build; alpha = 1 - DimLevel). Skipped when the
-        // storyboard replaces it (lazer `storyboardReplacesBackground`:
-        // the sb's own Background-layer copy draws instead, dimming the
-        // background to 1).
-        if let Some(op) = self.bg_opacity.filter(|_| !self.sb_replaces_bg) {
+        // render aspect at build; alpha = 1 - DimLevel). When the storyboard
+        // replaces it, lazer keeps the sprite but tints it Gray(0) — a pure
+        // black backdrop — rather than removing it (DimmableBackground
+        // forces DimLevel 1), so we draw the region tinted black.
+        if let Some(op) = self.bg_opacity {
             let m = &self.mapper;
+            let colour = if self.sb_replaces_bg {
+                // lazer:替换背景时背景图染 Gray(0) = 纯黑垫底
+                Colour::BLACK.opacity(1.0)
+            } else {
+                // lazer DimLevel:图像灰度染色 rgb×(1-dim),不是 alpha
+                // 淡出(淡出会透出清屏色)
+                Colour { r: op, g: op, b: op, a: 1.0 }
+            };
             list.image(
                 assets.atlas,
                 crate::draw::Region::Background,
                 [m.screen_w * 0.5, m.screen_h * 0.5],
                 [m.screen_w, m.screen_h],
                 0.0,
-                Colour::WHITE.opacity(op),
+                colour,
                 Blend::Alpha,
             );
         }
 
         // 0.5 Storyboard below-layers (Background/Fail/Pass composite,
         // `--storyboard`): over the background image, under everything
-        // else. osu! dims the storyboard together with the background
-        // (DimLevel), hence the same opacity slot.
+        // else. lazer `DimmableStoryboard` dims the storyboard with the
+        // SAME DimLevel as the background — as a gray colour tint
+        // (rgb × (1-dim), alpha unchanged), not an alpha fade.
         if let Some(op) = self.storyboard {
             let m = &self.mapper;
             list.image(
@@ -790,7 +799,7 @@ impl SceneState {
                 [m.screen_w * 0.5, m.screen_h * 0.5],
                 [m.screen_w, m.screen_h],
                 0.0,
-                Colour::WHITE.opacity(op),
+                Colour { r: op, g: op, b: op, a: 1.0 },
                 Blend::Alpha,
             );
         }
@@ -865,17 +874,19 @@ impl SceneState {
         draw_cursor(self.legacy.as_ref(), assets, list, cursor_screen, self.cursor_expand as f32, self.cursor_size, self.mapper.virt, t);
 
         // 7.5 Storyboard above-layers (Foreground/Overlay composite):
-        // over the playfield like osu!, under the HUD, undimmed (lazer's
-        // DimLevel only affects the background stack).
+        // over the playfield like osu!, under the HUD. lazer 的
+        // DimmableStoryboard 把整棵 DrawableStoryboard(含 Foreground/
+        // Overlay 层)一起染色,因此与 below 同一 DimLevel。
         if self.storyboard_fg {
             let m = &self.mapper;
+            let dim = self.storyboard.unwrap_or(1.0);
             list.image(
                 assets.atlas,
                 crate::draw::Region::StoryboardForeground,
                 [m.screen_w * 0.5, m.screen_h * 0.5],
                 [m.screen_w, m.screen_h],
                 0.0,
-                Colour::WHITE,
+                Colour { r: dim, g: dim, b: dim, a: 1.0 },
                 Blend::Alpha,
             );
         }
