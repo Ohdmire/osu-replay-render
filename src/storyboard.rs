@@ -27,7 +27,8 @@ use crate::draw::{Atlas, Region};
 use osu_storyboard_render::osb::model::Layer;
 use osu_storyboard_render::osb::timeline::{CompiledStoryboard, FailState};
 use osu_storyboard_render::render::renderer::{
-    build_draws_filtered, Draw, GpuInstance, Renderer as SbRenderer,
+    build_draws_filtered, prefetch_textures as sb_prefetch_textures, Draw, GpuInstance,
+    Renderer as SbRenderer,
 };
 use osu_storyboard_render::render::texture::Assets as SbAssets;
 #[cfg(not(target_os = "android"))]
@@ -39,7 +40,9 @@ use std::path::PathBuf;
 pub use osu_storyboard_render::render::texture::Assets;
 
 /// storyboard 贴图的 GPU 内存预算(解码后 RGBA 字节)。视频式逐帧动画的
-/// storyboard 可引用上千张独立贴图,超出预算按 LRU 淘汰,下次用到重传。
+/// storyboard 可引用上千张独立贴图,超出预算按 LRU 淘汰,下次用到重传;
+/// 被淘汰贴图集中回归的一帧会整批重新上线,预算越大越不容易触发,
+/// 可用 `SB_GPU_MB` 环境变量(MB,0 = 不限)按机器显存放大换流畅。
 #[cfg(not(target_os = "android"))]
 const GPU_BUDGET: usize = 512 << 20;
 #[cfg(target_os = "android")]
@@ -360,7 +363,14 @@ impl ParsedStoryboard {
         height: u32,
     ) -> StoryboardLayer {
         let mut sb = SbRenderer::new(device, queue);
-        sb.set_gpu_budget(GPU_BUDGET);
+        // GPU 预算环境覆盖(SB_GPU_MB,MB;0 = 不限):淘汰触发的整批
+        // 重上线是"卡一下再顺畅"的来源,显存富余的宿主应放大预算。
+        let gpu_budget = std::env::var("SB_GPU_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|mb| if mb == 0 { usize::MAX } else { mb.saturating_mul(1024 * 1024) })
+            .unwrap_or(GPU_BUDGET);
+        sb.set_gpu_budget(gpu_budget);
         let video = self.video.map(|info| VideoState {
             info,
             source: None,
@@ -551,6 +561,14 @@ impl StoryboardLayer {
     /// 也不画视频。
     pub fn set_video_enabled(&mut self, on: bool) {
         self.video_enabled = on;
+    }
+
+    /// 预取 storyboard 贴图(按元素起播时刻排序,动画展开全部帧),直到
+    /// GPU 预算或 `deadline`。宿主在起播前调用:帧动画式 SB 单拍激活
+    /// 数百张新贴图,惰性加载会让那一帧同步解码整批——首播卡一下、回看
+    /// 不卡的根因;预取后首播与回看一致。返回本次上传的张数。
+    pub fn prefetch_textures(&mut self, deadline: Option<std::time::Instant>) -> usize {
+        sb_prefetch_textures(&mut self.sb, &mut self.assets, &self.compiled, deadline)
     }
 
     pub fn video_enabled(&self) -> bool {
