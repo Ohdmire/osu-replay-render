@@ -632,6 +632,9 @@ pub struct SceneState {
     /// Hidden mod active (from `GameData::hidden`); pub so a host can
     /// force HD visuals live on top of the replay's own mods.
     pub hidden: bool,
+    /// 只渲染背景 + storyboard(音频/判定照常):跳过 note/滑条/转盘/
+    /// 跟随点/判定动画/光标等全部 gameplay 元素(壁纸"纯画面"模式)。
+    pub gameplay_hidden: bool,
     /// Results-screen cutoff: at times >= this the frame draws the (static,
     /// expanded) lazer results screen instead of gameplay. `None` = never.
     pub results_at: Option<f64>,
@@ -668,6 +671,7 @@ impl SceneState {
             slider_anims: (0..game.objects.len()).map(|_| SliderAnim::new()).collect(),
             spinner_anims: (0..game.objects.len()).map(|_| SpinnerAnim::new()).collect(),
             hud: hud::HudState::new(),
+            gameplay_hidden: false,
             hidden: game.hidden,
             results_at: None,
             results_fade_frames: 0,
@@ -791,17 +795,24 @@ impl SceneState {
         // else. lazer `DimmableStoryboard` dims the storyboard with the
         // SAME DimLevel as the background — as a gray colour tint
         // (rgb × (1-dim), alpha unchanged), not an alpha fade.
-        if let Some(op) = self.storyboard {
+        if self.storyboard.is_some() {
             let m = &self.mapper;
+            // 暗度已在精灵绘制时逐实例预乘进槽位内容(见 StoryboardLayer::set_dim),
+            // 这里原样合成;若再乘一次,叠加类精灵在槽内饱和的白色会把色调钳成灰。
             list.image(
                 assets.atlas,
                 crate::draw::Region::Storyboard,
                 [m.screen_w * 0.5, m.screen_h * 0.5],
                 [m.screen_w, m.screen_h],
                 0.0,
-                Colour { r: op, g: op, b: op, a: 1.0 },
+                Colour { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
                 Blend::Alpha,
             );
+        }
+
+        // 0.9 纯画面模式:只画背景 + storyboard,跳过全部 gameplay 元素。
+        if self.gameplay_hidden {
+            return;
         }
 
         // 1. Spinners.
@@ -871,7 +882,9 @@ impl SceneState {
 
         // 7. Cursor + trail.
         self.draw_trail(list, assets);
-        draw_cursor(self.legacy.as_ref(), assets, list, cursor_screen, self.cursor_expand as f32, self.cursor_size, self.mapper.virt, t);
+        if !self.gameplay_hidden {
+            draw_cursor(self.legacy.as_ref(), assets, list, cursor_screen, self.cursor_expand as f32, self.cursor_size, self.mapper.virt, t);
+        }
 
         // 7.5 Storyboard above-layers (Foreground/Overlay composite):
         // over the playfield like osu!, under the HUD. lazer 的
@@ -879,14 +892,13 @@ impl SceneState {
         // Overlay 层)一起染色,因此与 below 同一 DimLevel。
         if self.storyboard_fg {
             let m = &self.mapper;
-            let dim = self.storyboard.unwrap_or(1.0);
             list.image(
                 assets.atlas,
                 crate::draw::Region::StoryboardForeground,
                 [m.screen_w * 0.5, m.screen_h * 0.5],
                 [m.screen_w, m.screen_h],
                 0.0,
-                Colour { r: dim, g: dim, b: dim, a: 1.0 },
+                Colour { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
                 Blend::Alpha,
             );
         }

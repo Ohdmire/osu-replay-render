@@ -74,6 +74,9 @@ pub struct ParsedStoryboard {
     foreground: bool,
     replaces_background: bool,
     video: Option<VideoInfo>,
+    /// SB 声音采样(lazer StoryboardSampleInfo:时刻 + 路径 + 音量),
+    /// 宿主按播放头跨过触发(tutorial 的语音讲解即此)。
+    pub samples: Vec<osu_parse::storyboard::model::Sample>,
     /// lazer `DrawableStoryboard` 的宽屏判定特例:故事板只有视频元素时
     /// 即使谱面 `WidescreenStoryboard: 0` 也按 16:9 容器布局(老图常见,
     /// 视频独占故事板)。视口若按 4:3 处理,视频会被放得更大、裁掉更多,
@@ -125,12 +128,22 @@ fn probe_video(info: &mut VideoInfo, ffprobe: Option<&std::path::Path>) {
         info.height = h;
     }
     if let Some(rate) = parts.next() {
-        info.fps = match rate.split_once('/') {
+        let parse_rate = |r: &str| match r.split_once('/') {
             Some((a, b)) if b.parse::<f64>().map_or(false, |b| b > 0.0) => {
                 a.parse::<f64>().unwrap_or(0.0) / b.parse::<f64>().unwrap_or(1.0)
             }
-            _ => rate.parse().unwrap_or(0.0),
+            _ => r.parse().unwrap_or(0.0),
         };
+        let mut fps = parse_rate(rate);
+        // avg_frame_rate 可能为假(无 nb_frames 的容器按 1000fps 报,如
+        // MEMORIA 的 fz.flv):按它推进时间戳(1ms/帧)会令视频"追不上"
+        // 渲染时钟,respawn 循环 -ss 跳到当前时刻 = 视觉上的快进播完。
+        // ≥240fps 或 0 时回退 r_frame_rate(基础流帧率),再不可信给 25。
+        if !(1.0..=240.0).contains(&fps) {
+            let base = run("stream=r_frame_rate").and_then(|v| v.lines().next().map(str::to_string));
+            fps = base.as_deref().map(parse_rate).filter(|v| (1.0..=240.0).contains(v)).unwrap_or(25.0);
+        }
+        info.fps = fps;
     }
     // 显示矩阵旋转(手机拍摄视频):ffmpeg rawvideo 输出的帧已按元数据
     // 转置,而 stream width/height 是编码方向尺寸 —— ±90°/±270° 时必须
@@ -266,34 +279,15 @@ fn finish_storyboard(
         }
     }
 
-    // 接管型背景裸精灵剔除(移植层规则):编辑器把谱面背景写进 .osb 时
-    // 生成的是无命令、Background 层、引用背景文件本身的常驻精灵
-    // (compile 视作 start=0/end=∞/alpha=1 永久铺底)。宿主开故事板时
-    // 已按 sb_replaces_bg 隐藏自己的背景层,再保留它就成了"故事板下面
-    // 还垫一层背景"。剔除条件与下方 ReplacesBackground 的判定同源
-    // (引用同一背景文件),仅收紧到"完全无命令"——带命令的用法是
-    // 真实故事板内容,保留。
-    if let Some(bg) = beatmap_background {
-        let bg = osu_storyboard_render::render::texture::normalize_path(bg).to_lowercase();
-        story.elements.retain(|e| {
-            let s = e.sprite();
-            !(s.layer == Layer::Background
-                && s.commands.is_empty()
-                && s.loops.is_empty()
-                && s.triggers.is_empty()
-                && osu_storyboard_render::render::texture::normalize_path(&s.path).to_lowercase()
-                    == bg)
-        });
-        // 剔除后连一个元素都没有(且没有视频) = 这个"故事板"只是接管
-        // 背景,宿主按无故事板处理(自己的背景层照常画)。
-        if story.elements.is_empty() && story.videos.is_empty() {
-            return None;
-        }
-    }
-
     // 背景抑制(lazer `Storyboard.ReplacesBackground`):Background 层存在
     // 引用谱面背景文件的元素。旧版背景行已被 loader 剔除(lazer 的解码器
     // 同样不把它算作 storyboard 元素),因此这里比较的是 .osb/手写精灵。
+    //
+    // 注意:不得先剔除"裸背景副本"(无命令、Background 层、引用背景文件
+    // 的精灵,如 world.execute(me);)再判定——判定必须基于完整元素表,
+    // 否则 replaces_background 恒 false,宿主错误地画出自己的背景。
+    // 该精灵按 lazer 语义保留:由故事板自己绘制这张背景(随故事板暗度
+    // 衰减),宿主背景层因 replaces_background=true 隐藏,不存在双重绘制。
     let replaces_background = beatmap_background
         .map(|bg| {
             let bg = osu_storyboard_render::render::texture::normalize_path(bg).to_lowercase();
@@ -306,13 +300,16 @@ fn finish_storyboard(
         })
         .unwrap_or(false);
 
+    // 上槽 = Overlay 层代理(lazer Player.createOverlayComponents 只把
+    // OverlayLayerContainer 代理到物件上方);Foreground 在下槽。
     let foreground = story
         .elements
         .iter()
-        .any(|e| matches!(e.sprite().layer, Layer::Foreground | Layer::Overlay));
+        .any(|e| matches!(e.sprite().layer, Layer::Overlay));
     // lazer onlyHasVideoElements:背景行已被 loader 剔除、接管型背景裸
     // 精灵已在上面剔除,剩下的元素为空且带视频 = 只有视频的故事板。
     let video_only = story.elements.is_empty() && !story.videos.is_empty();
+    let compiled_samples = story.samples.clone();
     let compiled = CompiledStoryboard::compile(story);
     // CPU 解码缓存预算:SB_CACHE_MB 环境变量覆盖(嵌入式/壁纸宿主可调低
     // 换内存;缺省与独立渲染器一致)。视频式逐帧动画的 storyboard 可引用
@@ -323,7 +320,15 @@ fn finish_storyboard(
         .map(|mb| mb.saturating_mul(1024 * 1024))
         .unwrap_or(CACHE_BUDGET);
     assets.set_cache_budget(budget);
-    Some(ParsedStoryboard { compiled, assets, foreground, replaces_background, video, video_only })
+    Some(ParsedStoryboard {
+            samples: compiled_samples,
+            compiled,
+            assets,
+            foreground,
+            replaces_background,
+            video,
+            video_only,
+        })
 }
 
 impl ParsedStoryboard {
@@ -366,6 +371,7 @@ impl ParsedStoryboard {
         let replaces_bg = self.replaces_background;
         StoryboardLayer {
             compiled: self.compiled,
+            dim: 1.0,
             assets: self.assets,
             sb,
             foreground: self.foreground,
@@ -474,6 +480,10 @@ struct VideoState {
 /// into the host atlas slots, all on the host renderer's device/queue.
 pub struct StoryboardLayer {
     compiled: CompiledStoryboard,
+    /// 故事板暗度(lazer DimLevel 的 RGB 预乘):在精灵绘制时逐实例乘入,
+    /// 而非合成槽位时整体乘——中间纹理会被叠加类精灵饱和钳制,先乘暗度
+    /// 才能保住色调(lazer 同样乘在 Drawable 颜色上直绘帧缓冲)。
+    dim: f32,
     assets: SbAssets,
     sb: SbRenderer,
     /// 是否预留了 Foreground/Overlay 上层槽位(Region::StoryboardForeground)。
@@ -520,6 +530,11 @@ impl StoryboardLayer {
     /// 元素层开关(`--storyboard`):off 时本层只承载视频。
     pub fn set_elements_enabled(&mut self, on: bool) {
         self.elements_enabled = on;
+    }
+
+    /// 故事板暗度(= 背景亮度;精灵绘制时 RGB 预乘)。
+    pub fn set_dim(&mut self, dim: f32) {
+        self.dim = dim.clamp(0.0, 1.0);
     }
 
     pub fn elements_enabled(&self) -> bool {
@@ -593,6 +608,7 @@ impl StoryboardLayer {
         atlas: &Atlas,
         ext_frame: Option<&(u32, u32, Vec<u8>)>,
     ) {
+        let dim = self.dim;
         if let Some((w, h, rgba)) = ext_frame {
             self.write_video_frame(*w, *h, rgba);
         }
@@ -601,13 +617,16 @@ impl StoryboardLayer {
         }
 
         let mut below_draws = if self.elements_enabled {
+            // lazer Player.cs:整棵故事板(含 Foreground)都在 underlay,
+            // 画在 playfield 后面;只有 Overlay 层代理到物件上方
             build_draws_filtered(
                 &mut self.sb,
                 &mut self.assets,
                 &self.compiled,
                 t,
                 FailState::Pass,
-                |layer| !matches!(layer, Layer::Foreground | Layer::Overlay),
+                dim,
+                |layer| !matches!(layer, Layer::Overlay),
             )
         } else {
             Vec::new()
@@ -641,7 +660,8 @@ impl StoryboardLayer {
                     &self.compiled,
                     t,
                     FailState::Pass,
-                    |layer| matches!(layer, Layer::Foreground | Layer::Overlay),
+                    dim,
+                    |layer| matches!(layer, Layer::Overlay),
                 )
             } else {
                 Vec::new()
@@ -782,12 +802,14 @@ impl StoryboardLayer {
         Some(Draw {
             texture: VIDEO_KEY.to_string(),
             additive: false,
+            // 视频随故事板一起吃暗度(lazer 视频层在 dimContent 内)
+            dim: self.dim,
             instance: GpuInstance {
                 pos: [320.0, 240.0],
                 size,
                 anchor: [0.5, 0.5],
                 rotation: 0.0,
-                color: [1.0, 1.0, 1.0, alpha],
+                color: [1.0 * self.dim, 1.0 * self.dim, 1.0 * self.dim, alpha],
                 flip: [0.0, 0.0],
                 _pad: [0.0; 3],
             },

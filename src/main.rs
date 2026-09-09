@@ -799,39 +799,12 @@ fn main() {
         None => None,
     };
 
-    // Resolve the beatmap background: the `[Events]` background image,
-    // decoded into the atlas (raw + pre-blurred copy). Gameplay draws it
-    // full-screen at `--bg-opacity` when `--bg` is on (default
-    // 1 - DimLevel 0.7, matching lazer); the results screen always draws
-    // the blurred copy (lazer `ResultsScreen`).
-    let bg_image: Option<Image> = match game.map_background.clone() {
-        Some(name) => {
-            let p = map_dir.join(&name);
-            match decode_image_file(&p) {
-                Ok(img) => {
-                    eprintln!("background: {} ({}x{})", p.display(), img.width, img.height);
-                    Some(img)
-                }
-                Err(e) => {
-                    eprintln!("warning: {} - rendering without background", e);
-                    None
-                }
-            }
-        }
-        None => {
-            if opts.bg {
-                eprintln!("warning: beatmap has no background image - rendering without background");
-            }
-            None
-        }
-    };
-
-    let has_bg = bg_image.is_some();
-
     // Storyboard (`--storyboard`) / storyboard video (`--video`): parse
     // before the atlas when either is on so the composite slots can be
     // reserved; the GPU layer attaches after the renderer and the two
     // halves are toggled independently (elements vs video layer).
+    // 解析必须先于背景解码:背景接管(ReplacesBackground)判定决定背景图
+    // 是否还要加载(被接管的谱面由故事板自己绘制那张背景,如 execute me)。
     let sb_parsed = if opts.storyboard || opts.video {
         let parsed = osu_replay_render::storyboard::parse_beatmap(
             std::path::Path::new(&map_path),
@@ -860,6 +833,42 @@ fn main() {
     } else {
         None
     };
+    let sb_replaces = sb_parsed.as_ref().is_some_and(|p| p.replaces_background());
+
+    // Resolve the beatmap background: the `[Events]` background image,
+    // decoded into the atlas (raw + pre-blurred copy). Gameplay draws it
+    // full-screen at `--bg-opacity` when `--bg` is on (default
+    // 1 - DimLevel 0.7, matching lazer); the results screen always draws
+    // the blurred copy (lazer `ResultsScreen`). 背景被故事板接管时不解码
+    // 不上传——由故事板自己绘制那张背景(随故事板暗度衰减)。
+    let bg_image: Option<Image> = if sb_replaces {
+        eprintln!("background: skipped (replaced by the storyboard)");
+        None
+    } else {
+        match game.map_background.clone() {
+            Some(name) => {
+                let p = map_dir.join(&name);
+                match decode_image_file(&p) {
+                    Ok(img) => {
+                        eprintln!("background: {} ({}x{})", p.display(), img.width, img.height);
+                        Some(img)
+                    }
+                    Err(e) => {
+                        eprintln!("warning: {} - rendering without background", e);
+                        None
+                    }
+                }
+            }
+            None => {
+                if opts.bg {
+                    eprintln!("warning: beatmap has no background image - rendering without background");
+                }
+                None
+            }
+        }
+    };
+
+    let has_bg = bg_image.is_some();
     // Composite slot size: the output resolution, capped at 1080p so huge
     // renders don't balloon the atlas (the scene upsamples linearly).
     let sb_slot = (
@@ -935,11 +944,12 @@ fn main() {
     // 任一层(元素/视频)激活即画故事板合成槽位;亮度跟随背景(--bg off
     // 时全亮 1.0)。
     let sb_active = sb_layer.as_ref().is_some_and(|l| l.elements_enabled() || l.video_enabled());
-    state.storyboard = if sb_active {
-        Some(if has_bg && opts.bg { opts.bg_opacity } else { 1.0 })
-    } else {
-        None
-    };
+    let sb_dim = if opts.bg { opts.bg_opacity } else { 1.0 };
+    state.storyboard = if sb_active { Some(sb_dim) } else { None };
+    // 暗度预乘进精灵绘制(槽位合成不再乘,见 StoryboardLayer::set_dim)
+    if let Some(sb) = &mut sb_layer {
+        sb.set_dim(sb_dim);
+    }
     state.storyboard_fg = sb_layer.as_ref().is_some_and(|l| l.elements_enabled() && l.has_foreground());
     // 背景规则(lazer `Storyboard.ReplacesBackground`):仅当故事板
     // Background 层存在引用谱面背景文件的元素时才隐藏背景图;
