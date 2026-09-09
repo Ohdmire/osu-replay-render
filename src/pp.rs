@@ -189,12 +189,26 @@ pub fn calculate(map_bytes: &[u8], mods_bits: u32, classic: bool, engine: &Engin
 
     let mut events: Vec<(f64, f64)> = Vec::new();
     let mut next_obj = 0usize;
+    let mut advanced = 0usize;
     let mut max_combo = 0i32;
     // Keep the pair timeline monotonic (`pp_at` binary-searches it): late
     // judgements carry earlier object times, same as `score_events`.
     let mut last_t = f64::NEG_INFINITY;
     // The last gradual result (the score's own performance attributes).
     let mut last_attrs: Option<rosu_pp::osu::OsuPerformanceAttributes> = None;
+
+    // Per-object advance is quadratic: every `next()` re-aggregates the
+    // full strain history (clones + sorts in `DifficultyValues::eval`),
+    // so N objects cost O(N^2 log N) - invisible on normal maps but tens
+    // of seconds to minutes on Aspire-density ones (Flashbacklog [V],
+    // tens of thousands of objects). Advance in adaptive blocks instead:
+    // judgements stay folded per object, the calculator consumes `block`
+    // objects per `nth()` and only evaluates once per block, capping the
+    // timeline at ~MAX_PP_POINTS samples. Small maps keep block=1 (the
+    // exact per-object behaviour); the HUD queries one value per frame,
+    // so 1024 points are visually lossless on any map length.
+    const MAX_PP_POINTS: usize = 1024;
+    let block = n_objects.div_ceil(MAX_PP_POINTS).max(1);
 
     for e in &engine.timeline {
         if e.label == "smax" || e.label.starts_with("stick") {
@@ -207,14 +221,20 @@ pub fn calculate(map_bytes: &[u8], mods_bits: u32, classic: bool, engine: &Engin
             *slot = slot.saturating_sub(1);
         }
 
-        // Advance every object that has fully judged, in order.
+        // Advance the cursor over every object that has fully judged, in
+        // order, then hand the judged span to the calculator in blocks
+        // (`nth` is zero-indexed: take-1 consumes `take` objects).
         while next_obj < n_objects && remaining[next_obj] == 0 {
-            if let Some(attrs) = gradual.next(state.clone()) {
+            next_obj += 1;
+        }
+        while advanced < next_obj {
+            let take = (next_obj - advanced).min(block);
+            if let Some(attrs) = gradual.nth(state.clone(), take - 1) {
                 last_t = last_t.max(e.time);
                 events.push((last_t, attrs.pp));
                 last_attrs = Some(attrs);
             }
-            next_obj += 1;
+            advanced += take;
         }
     }
 
