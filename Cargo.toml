@@ -1,6 +1,6 @@
 [package]
 name = "osu_replay_render"
-version = "0.10.2"
+version = "0.11.0"
 edition = "2024"
 license = "MIT"
 
@@ -20,15 +20,6 @@ jpeg-decoder = "0.3"
 ab_glyph = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-# 本地 sibling checkout 接管同 URL 的 git 依赖(judge / storyboard-render
-# 内部的 osu-parse 也统一到这一份,类型不分裂)。
-[patch."https://github.com/Ohdmire/osu-parse.git"]
-osu-parse = { path = "../osu-parse" }
-
-[patch."https://github.com/Ohdmire/osu-storyboard-render.git"]
-osu-storyboard-render = { path = "../osu-storyboard-render" }
-
 
 [profile.release]
 lto = "thin"
