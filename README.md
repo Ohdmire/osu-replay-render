@@ -46,7 +46,6 @@ osu_replay_render <beatmap.osu> [replay.osr] [options]
 | `--video <on\|off>` | 渲染谱面**故事板视频**（`Video,offset,"file"` 元素，lazer Video 层：Background 之下、居中 cover 铺满、起始 500ms 淡入/结尾 500ms 淡出），默认 **off**；裸 `--video` 等价 `on`；config 键 `"video"`。与 `--storyboard` 相互独立：只开视频不画故事板精灵。桌面端经 **ffmpeg rawvideo（RGBA）管道**逐帧解码、按渲染时刻帧对齐上纹理 |
 | `--results <secs>` | 玩法结束后追加结算界面（lazer `Screens/Ranking`）：**展开状态的 ScorePanel** 静态终帧——顶部头像/用户名条、标题/作者、准确率环（背景环 + 渐变计量表 + D~SS 分级色环 + 达成档位徽章 + 大档位字母）、总分、星数胶囊/模式图标/Mod 徽章、难度名与作者、ACCURACY/COMBO/PP 与判定统计行（GREAT/OK/MEH/MISS 及 L TICK/SLIDER TAIL/BONUS 行），底部 #333 按钮栏。背景为谱面背景图的高斯模糊副本（lazer `ResultsScreen` 的 `BACKGROUND_BLUR` σ=10px@1080p）按 `Gray(0.5)` 压暗铺满，与 lazer 一致；谱面无背景图时为清屏色。不做入场动画（准确率环/计数器直接呈终值）；rank 按 `RankFromScore` 截断 + osu! miss 降级 + HD 银牌计算。默认 **4 秒**；带音频导出时音轨自动以静音补齐到结算屏结束。`--results off` 关闭。**`--results-only`** 则完全不渲染玩法、只输出结算屏（海报/预览模式，时长同样由 `--results` 控制；单图示例：`--results-only --png-dir out --fps 1 --results 1`） |
 | `--avatar <image>` | 结算屏头像图片（jpg/png）：居中裁方 + 预圆角（与占位框同为 20/80 圆角），画在头像框里；不传时沿用玩家首字母占位。等价 config 键 `"avatar"` |
-| `--fonts <dir>` | 从目录外部导入文字字体（逐权重匹配 `<Family>-<Role>.(otf|ttf)`，Role ∈ Bold/SemiBold/Light/Regular，Family 依次尝试 Exo 2/Exo2/Exo 2，不区分大小写；OTF 优先）。缺失的权重回退内嵌 Exo 2。**默认不传 = 内嵌 Exo 2**；`--fonts assets/fonts` 即恢复 lazer 原版 Exo 2 观感。等价 config 键 `"fonts_dir"`；库嵌入方用 `FontBundle::from_dir` + `build_atlas_with_fonts`。对比图见 `docs/font-compare.png`（结算）、`docs/combo-digit-compare.png`（打击圈 combo 数字）、`docs/hud-compare.png`（HUD：Argon 数字贴图不受字体影响，PP 标签/键位/UR 条为 TTF） |
 | `--config <file.json>` | JSON 配置文件：键与 CLI 长参数一一对应（snake_case），如 `{"avatar": "a.png", "out": "x.mp4", "results": 5, "results_only": true, "bg": true, "bg_opacity": 0.3, "skin": "dir", "size": "1920x1080", "fps": 60, "hd": "on", "hitsounds": true, "master_volume": 0.8, "ffmpeg_extra": ["-movflags", "+faststart"]}`。config 先应用，**显式 CLI 参数始终覆盖 config**（与出现顺序无关） |
 | `--limit <n>` | 最多渲染 n 帧（测试用） |
 
@@ -110,7 +109,7 @@ if renderer.pending_len() > 0 {
 ## 已实现（Argon）
 
 - **圆**：四层渐变圆身（外填充/外渐变/内渐变/内填充）、白描边、combo
-  数字（Exo 2 Bold）、approach circle、命中动画复刻
+  数字（Exo 2 Bold，替代 lazer 的 Exo 2）、approach circle、命中动画复刻
   `ArgonMainCirclePiece.updateStateTransforms`：填充层 150ms OutQuint
   隐藏、数字 75ms 消失、外渐变延迟 12.5ms 变白（80ms）后线性淡出
   （150ms）、描边弹性收缩至 0.8×（400ms OutElasticHalf）+ 800ms 颜色
@@ -162,8 +161,8 @@ if renderer.pending_len() > 0 {
   `TimeFadeIn×2`）；折返箭头不受影响（Argon 的 repeat `CirclePiece` 为
   `Empty()`）。HD 不改变任何判定（判定端仅用于分数系数 ×1.04），mods 位来自
   回放文件自动启用。
-- **HUD**：楔形块、分数/准确率/连击计数器（argon-counter 官方纹理
-  数字 + 线框背景 + ink 对齐度量）、数字滚动（250ms）、连击弹出/miss
+- **HUD**：楔形块、分数/准确率/连击计数器（由内嵌 Exo 2 运行时生成的
+  计数贴图 + ink 对齐度量，替代 argon-counter 官方 sprite，无线框底）、数字滚动（250ms）、连击弹出/miss
   变红、血条（judge 判定引擎的 lazer `HealthProcessor` 移植：DR 相关扣
   血表、combo 尾加成、break 段无 drain、满血模拟解 drain rate —— 见
   osu-replay-judge v0.2.0；渲染端 200ms OutQuint 平滑追宽 + 受伤闪红）、**UR 条**（水平置于屏幕底部
@@ -175,7 +174,7 @@ if renderer.pending_len() > 0 {
   UR 事件集与 `ScoreProcessor.unstable_rate` 完全一致（`has_windows &&
   is_hit`，offset/rate），Welford 增量累计）、**PP 计数器**
   （`ArgonPerformancePointsCounter`：ACC 正下方、整数 + 蓝色 "PP" 标签
-  （Exo 2 Bold 12, Blue0）+ 线框背景，250ms 滚动；数据来自
+  （Exo 2 Bold 12, Blue0），250ms 滚动；数据来自
   `rosu-pp` 的 `OsuGradualPerformance` 逐物件推进——judge 判定时间轴
   逐事件折入累计 `OsuScoreState`，每个顶层物件判完推进一次，即
   「每次判定后的实时 PP」，与 lazer 游戏内计数器每 `NewJudgement`
@@ -227,16 +226,17 @@ if renderer.pending_len() > 0 {
 
 `assets/`(全部经 `include_bytes!` 内嵌进二进制,**运行时不依赖 CWD**,
 可直接被其他程序作为库调用):
-- `fonts/Exo2-*.ttf` — **默认文字字体**（Exo 2，SIL OFL 1.1，见 `OFL-Exo2.txt`）；
-  与 lazer 用的 Exo 2 按权重一一对应（OS/2 `usWeightClass` 实测：Light 300 /
-  Regular 400 / SemiBold 600 / Bold 700），所有字号/字距参数按原 Exo 2 权重调校、
-  直接沿用；ab_glyph 启动时按 24/48/96 三档 em 栅格化进图集。
-  Exo 2 本体为商业字体、不再内嵌——把 `Exo 2-*.otf` 放入任意目录并用
-  `--fonts <dir>`（或库 API `FontBundle::from_dir`）外部导入即可恢复原观感
-  （按 `<Family>-<Role>.(otf|ttf)` 逐权重匹配，缺失的权重回退内嵌 Exo 2）。
-  本仓库 `assets/fonts/` 自带全套 Exo 2 otf，`--fonts assets/fonts` 即生效。
-- `counter/argon-counter-*.png` — lazer 官方 HUD 计数器纹理数字
-  （来自 [osu-resources](https://github.com/ppy/osu-resources)，MIT/CC-BY-NC 4.0）。
+- `fonts/Exo2-*.ttf` — **文字字体（唯一、内嵌、不可切换）**：Exo 2，
+  SIL OFL 1.1（见 `OFL-Exo2.txt`）。与 lazer 所用 Exo 2 按权重一一对应
+  （OS/2 `usWeightClass` 实测：Light 300 / Regular 400 / SemiBold 600 /
+  Bold 700），所有字号/字距参数按原 Exo 2 权重调校、直接沿用；ab_glyph
+  启动时按 24/48/96 三档 em 栅格化进图集。商业字体 Exo 2 不内嵌、也无
+  外部导入机制。
+- HUD 计数器数字**贴图**（分数/准确率/combo/PP 数值）**没有 PNG 资产**——
+  启动时由 `draw::counter_digit_images` 从内嵌 Exo 2 SemiBold 直接光栅化
+  （240×240 盒、数字墨高 178 的 CounterDraw 排版规格），替代 osu-resources
+  的 `argon-counter-*`（CC-BY-NC 非商业许可）sprite；argonic 线框底不再
+  绘制。
 - `cursor/cursortrail.png` — 官方光标轨迹点。
 - `cursor/cursor-smoke.png` — 官方烟迹粒子（64×64，来自 osu-resources；
   烟迹渲染实现后直接可用）。

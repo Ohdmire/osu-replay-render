@@ -1,5 +1,5 @@
-//! Argon HUD: wedge pieces, score/accuracy/combo counters (argon-counter
-//! texture digits with wireframes), health bar, and rolling counter logic.
+//! Argon HUD: wedge pieces, score/accuracy/combo counters (runtime-
+//! generated texture digits), health bar, and rolling counter logic.
 //!
 //! When a user legacy skin is active (`--skin <dir>`), the four main HUD
 //! pieces switch to the skin's own textures, ported from lazer's
@@ -66,7 +66,7 @@ struct CounterDraw<'a> {
 }
 
 /// Argon counter digit metrics, in texture pixels (all textures are
-/// TEX_BOX tall; digits and wireframes share the 240-wide slot box).
+/// TEX_BOX tall).
 const TEX_BOX: f32 = 240.0;
 const DIGIT_INK: f32 = 178.0;
 /// `ArgonCounterSpriteText.Spacing = (-2, 0)`.
@@ -415,13 +415,9 @@ impl HudState {
             let cy = m.virt([0.0, 50.0 + COUNTER_BOX * 0.5])[1];
             // `FormatCount` renders through `formatString` ("000000"
             // standardised / "00000000" classic): zero-padded to the digit
-            // count, which also feeds the wireframe template
-            // (`updateWireframe`: max of the required digits and the
-            // displayed value's own digit count).
+            // count.
             let digits = if self.classic_score { 8 } else { 6 };
             let score_text = format!("{:0width$}", self.score.display.round() as i64, width = digits);
-            let wire_digits = score_text.len();
-            draw_wireframe_run(list, assets.atlas, right, cy, wire_digits, cd.digit_h, m.virt);
             cd.draw_right(list, &score_text, right, cy, 1.0, Colour::WHITE, Blend::Alpha);
         }
 
@@ -489,8 +485,6 @@ impl HudState {
                 (m.screen_w - 20.0 * v, m.virt([0.0, 20.0 + COUNTER_BOX + 10.0])[1])
             };
             let text = format!("{}", self.pp.display.round() as i64);
-            // No wireframe background behind the PP digits (user
-            // preference - unlike the score counter).
             cd.draw_right(list, &text, right, top + cd.k() * TEX_BOX * 0.5, 1.0, Colour::WHITE, Blend::Alpha);
 
             // "PP" label (Exo 2 Bold 12, Blue0), 2.5 left of the digits,
@@ -987,37 +981,6 @@ impl HudState {
             Some((a, from, to)) => value_at(t, a, a + 800.0, from, to, Easing::OutQuint),
             None => 0.0,
         }
-    }
-}
-
-/// The wireframe segments behind the score digits, laid out with the same
-/// texture-slot widths as the digits themselves (the wireframe texture
-/// shares the digits' 240-unit box, so slots line up exactly). `digit_h`
-/// is the ink height in screen px of the counter being decorated.
-fn draw_wireframe_run(
-    list: &mut DrawList,
-    atlas: &crate::draw::Atlas,
-    right: f32,
-    cy: f32,
-    digits: usize,
-    digit_h: f32,
-    virt: f32,
-) {
-    let cd = CounterDraw { atlas, digit_h };
-    let top_y = cy - cd.k() * TEX_BOX * 0.5;
-    let slot = cd.slot_w('5', 1.0);
-    let mut pen = right - slot * digits as f32;
-    for _ in 0..digits {
-        pen += cd.place_top(
-            list,
-            Region::CounterWireframes,
-            pen,
-            top_y,
-            1.0,
-            Colour::WHITE.opacity(0.25),
-            Blend::Alpha,
-            true,
-        );
     }
 }
 

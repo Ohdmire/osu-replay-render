@@ -972,6 +972,58 @@ impl TtfFont {
     }
 }
 
+/// Renders the HUD counter digit textures straight from a font at startup:
+/// every glyph lives on a 240×240 box with the digit ink height scaled to
+/// 178 px and vertically centred (the TEX_BOX/DIGIT_INK metrics the
+/// `CounterDraw` layout in hud.rs assumes), '.'/'%'/'x' sharing the
+/// digits' baseline. Order: '0'..='9', '.', '%', 'x'. This replaces the
+/// CC-BY-NC `argon-counter-*` sprites from osu-resources with glyphs from
+/// the embedded OFL font itself.
+pub fn counter_digit_images(font_bytes: &[u8]) -> Vec<Image> {
+    const BOX: u32 = 240;
+    const INK: f32 = 178.0;
+    // Digits sit centred in the box, so their baseline lands at 209.
+    const BASELINE: f32 = (BOX as f32 - INK) / 2.0 + INK;
+
+    let font = ab_glyph::FontArc::try_from_vec(font_bytes.to_vec()).expect("load counter font");
+
+    // Outline size scales linearly with px size: pick the size whose '0'
+    // is exactly INK tall.
+    let gid0 = font.glyph_id('0');
+    let ink_at = |s: f32| -> f32 {
+        let b = font.outline_glyph(gid0.with_scale(ab_glyph::PxScale::from(s))).expect("'0' outline").px_bounds();
+        b.max.y - b.min.y
+    };
+    let scale = ab_glyph::PxScale::from(100.0 * INK / ink_at(100.0));
+    let scaled = font.as_scaled(scale);
+
+    let mut render = |c: char| -> Image {
+        let gid = font.glyph_id(c);
+        let outlined = font.outline_glyph(gid.with_scale(scale)).expect("glyph outline");
+        let bounds = outlined.px_bounds();
+        let w = (bounds.max.x - bounds.min.x).ceil().max(1.0) as u32;
+        let h = (bounds.max.y - bounds.min.y).ceil().max(1.0) as u32;
+        let mut rgba = vec![0u8; (BOX * BOX * 4) as usize];
+        // Ink centred on the glyph's advance box; tight-raster top-left in
+        // box coords (bounds.min.y is negative above the baseline).
+        let x_off = ((BOX as f32 - scaled.h_advance(gid)) / 2.0 + bounds.min.x).round() as i64;
+        let y_off = (BASELINE + bounds.min.y).round() as i64;
+        outlined.draw(|x, y, v| {
+            let (px, py) = (x_off + x as i64, y_off + y as i64);
+            if px >= 0 && px < BOX as i64 && py >= 0 && py < BOX as i64 {
+                let idx = ((py as u32 * BOX + px as u32) * 4) as usize;
+                rgba[idx] = 255;
+                rgba[idx + 1] = 255;
+                rgba[idx + 2] = 255;
+                rgba[idx + 3] = rgba[idx + 3].max((v.clamp(0.0, 1.0) * 255.0) as u8);
+            }
+        });
+        Image { width: BOX, height: BOX, rgba }
+    };
+
+    ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.', '%', 'x'].iter().map(|&c| render(c)).collect()
+}
+
 /// Draws a string with a TTF font, centred at `center`.
 /// Measures a string with the same glyph classes `draw_ttf_text` rasterises
 /// at: `(advance width, ink top, ink bottom)` in scaled pixels. The ink
@@ -1102,7 +1154,6 @@ pub enum Region {
     CounterDot,
     CounterPercent,
     CounterX,
-    CounterWireframes,
     CursorTrail,
     RepeatEdge,
     ApproachCircle,

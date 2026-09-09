@@ -49,11 +49,8 @@
 //!                          single preview image, e.g. --results-only
 //!                          --png-dir out --fps 1 --results 1)
 //!   --limit <n>            Render at most n frames (testing)
-//!   --fonts <dir>          Import text fonts per weight role from <dir>
-//!                          (`Exo 2-*.otf` restores the original family;
-//!                          default: embedded Exo 2)
 
-use osu_replay_render::{build_atlas, build_atlas_with_fonts, decode_image_file, draw, draw::Image, game, hitsound, render::Renderer, scene, skin, FontBundle};
+use osu_replay_render::{build_atlas, decode_image_file, draw, draw::Image, game, hitsound, render::Renderer, scene, skin};
 
 use scene::{Assets, SceneState};
 use std::io::Write;
@@ -165,11 +162,6 @@ struct Options {
     /// Custom results-screen avatar image (`--avatar <image>` / config
     /// `avatar`): cover-cropped square with rounded corners.
     avatar: Option<String>,
-    /// Directory to import text fonts from (`--fonts <dir>` / config
-    /// `fonts_dir`): per weight role `<Family>-<Role>.(otf|ttf)` — e.g.
-    /// the repo's `assets/fonts/` re-imports the original Exo 2. Roles
-    /// without a match keep the embedded Exo 2 default.
-    fonts_dir: Option<String>,
 }
 
 /// `--config <file.json>`: every key mirrors the matching CLI flag
@@ -210,7 +202,6 @@ struct ConfigJson {
     results: Option<f64>,
     results_only: Option<bool>,
     avatar: Option<String>,
-    fonts_dir: Option<String>,
     ffmpeg_extra: Option<Vec<String>>,
 }
 
@@ -321,7 +312,6 @@ fn apply_config(opts: &mut Options, c: ConfigJson) -> Result<(), String> {
         }
     }
     if c.avatar.is_some() { opts.avatar = c.avatar; }
-    if c.fonts_dir.is_some() { opts.fonts_dir = c.fonts_dir; }
     if let Some(v) = c.ffmpeg_extra { opts.ffmpeg_extra = v; }
     Ok(())
 }
@@ -333,7 +323,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
     let autoplay = args.iter().any(|a| a == "--autoplay");
     let min_args = if autoplay { 2 } else { 3 };
     if args.len() < min_args {
-        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--hud on|off] [--hd auto|on|off] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro|dir] [--argon-hud] [--guides on|off] [--pp on|off] [--audio [file.mp3]] [--audio-offset ms] [--bg on|off] [--bg-opacity 0..1] [--storyboard on|off] [--video on|off] [--cursor-size 0.1..=2] [--hitsounds] [--skin-colours] [--results secs|off] [--results-only] [--avatar image] [--fonts dir] [--config file.json] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
+        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--hud on|off] [--hd auto|on|off] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro|dir] [--argon-hud] [--guides on|off] [--pp on|off] [--audio [file.mp3]] [--audio-offset ms] [--bg on|off] [--bg-opacity 0..1] [--storyboard on|off] [--video on|off] [--cursor-size 0.1..=2] [--hitsounds] [--skin-colours] [--results secs|off] [--results-only] [--avatar image] [--config file.json] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
     }
     let map_path = args[1].clone();
     let replay_path = if autoplay { None } else { Some(args[2].clone()) };
@@ -374,7 +364,6 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
         results: 4.0,
         results_only: false,
         avatar: None,
-        fonts_dir: None,
     };
     // `--config <file.json>` pre-pass: the JSON provides base values;
     // explicit CLI flags win over it regardless of order. Relative
@@ -581,10 +570,6 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
             "--avatar" => {
                 i += 1;
                 opts.avatar = Some(args.get(i).cloned().ok_or("--avatar needs an image path")?);
-            }
-            "--fonts" => {
-                i += 1;
-                opts.fonts_dir = Some(args.get(i).cloned().ok_or("--fonts needs a directory")?);
             }
             "--config" => {
                 // Consumed by the pre-pass; skip its value here.
@@ -927,22 +912,7 @@ fn main() {
     // 8192 is the GLES/GL-compat floor for max_texture_dimension2d:
     // capping here keeps the atlas creatable on every backend (desktop
     // Vulkan/dGPU simply packs wider instead of taller).
-    // Text fonts: the embedded Exo 2 by default; `--fonts <dir>` imports
-    // e.g. the original Exo 2 per weight role (falls back per role).
-    let font_bundle = match &opts.fonts_dir {
-        Some(dir) => {
-            let (bundle, imported) = FontBundle::from_dir(std::path::Path::new(dir));
-            if imported.is_empty() {
-                eprintln!("fonts: no <Family>-<Role>.(otf|ttf) found in {dir} — using embedded Exo 2");
-            } else {
-                eprintln!("fonts: imported {imported:?} from {dir}");
-            }
-            bundle
-        }
-        None => FontBundle::exo2(),
-    };
-    let (atlas, fonts) = build_atlas_with_fonts(
-        font_bundle,
+    let (atlas, fonts) = build_atlas(
         bg_image,
         Some(opts.width as f32 / opts.height.max(1) as f32),
         avatar_image,

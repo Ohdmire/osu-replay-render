@@ -28,96 +28,24 @@ pub use raw_window_handle;
 use draw::{Atlas, Image, Region, TtfFont};
 use skin::SkinTexture;
 
-/// Exo 2 (SIL OFL 1.1, see assets/fonts/OFL-Exo2.txt): the default text
-/// family. Weight-for-weight match with the four Exo 2 weights the UI
-/// parameters were tuned against (both families measured via OS/2
-/// `usWeightClass`: Light 300, Regular 400, SemiBold 600, Bold 700), so
-/// every size/spacing constant keeps its original meaning. Exo 2 itself
-/// is commercial and no longer embedded — drop the `.otf` files into a
-/// directory and load them at runtime via [`FontBundle::from_dir`].
+/// Exo 2 (SIL OFL 1.1, see assets/fonts/OFL-Exo2.txt): the text family,
+/// embedded and final — there is deliberately no font-switching mechanism.
+/// Weight-for-weight match with the four Exo 2 weights the UI parameters
+/// were tuned against (both families measured via OS/2 `usWeightClass`:
+/// Light 300, Regular 400, SemiBold 600, Bold 700), so every size/spacing
+/// constant keeps its original meaning. The commercial Exo 2 is neither
+/// embedded nor loaded at runtime.
 const EXO2_BOLD_FONT: &[u8] = include_bytes!("../assets/fonts/Exo2-Bold.ttf");
 const EXO2_SEMIBOLD_FONT: &[u8] = include_bytes!("../assets/fonts/Exo2-SemiBold.ttf");
 /// Light: the expanded panel's score counter (`TotalScoreCounter`,
-/// Exo 2 60 Light fixedWidth).
+/// Exo 2 60 Light fixedWidth in the lazer reference being replicated).
 const EXO2_LIGHT_FONT: &[u8] = include_bytes!("../assets/fonts/Exo2-Light.ttf");
 /// Regular: the judgement/statistic counter values
-/// (`StatisticCounter`, Exo 2 20 fixedWidth).
+/// (`StatisticCounter`, Exo 2 20 fixedWidth in the lazer reference).
 const EXO2_REGULAR_FONT: &[u8] = include_bytes!("../assets/fonts/Exo2-Regular.ttf");
 /// Venera: the rank letter's typeface (`RankText`, OsuFont.Numeric Bold;
 /// the official ppy distribution is Venera 500 from osu-web).
 const VENERA_FONT: &[u8] = include_bytes!("../assets/fonts/Venera-500.otf");
-
-/// The four text weights by role — Bold / SemiBold / Light / Regular, the
-/// roles every HUD/results size and spacing constant references. Defaults
-/// to the embedded Exo 2 ([`FontBundle::exo2`]); the original Exo 2 (or
-/// any family cut to the same weight roles) can be imported from a
-/// directory at runtime via [`FontBundle::from_dir`].
-#[derive(Clone)]
-pub struct FontBundle {
-    /// Exo 2 Bold role (emphasis, combo digits, judgement words).
-    pub bold: Vec<u8>,
-    /// Exo 2 SemiBold role (labels, counters).
-    pub semibold: Vec<u8>,
-    /// Exo 2 Light role (score counter, Exo 2 60 Light).
-    pub light: Vec<u8>,
-    /// Exo 2 Regular role (statistic counter values).
-    pub regular: Vec<u8>,
-}
-
-impl FontBundle {
-    /// The embedded default family (Exo 2, OFL-licensed).
-    pub fn exo2() -> FontBundle {
-        FontBundle {
-            bold: EXO2_BOLD_FONT.to_vec(),
-            semibold: EXO2_SEMIBOLD_FONT.to_vec(),
-            light: EXO2_LIGHT_FONT.to_vec(),
-            regular: EXO2_REGULAR_FONT.to_vec(),
-        }
-    }
-
-    /// Imports a family from `dir`: per weight role, looks for
-    /// `<Family>-<Role>.(otf|ttf)` (`Bold` / `SemiBold` / `Light` /
-    /// `Regular`; families `Exo 2` / `Exo2` / `Exo 2`; case-insensitive,
-    /// OTF preferred over TTF). Roles without a match keep the embedded
-    /// Exo 2 file. Returns the bundle plus the roles actually imported.
-    /// This is how the original Exo 2 is applied: pass
-    /// `assets/fonts/` (or any directory holding `Exo 2-*.otf`).
-    pub fn from_dir(dir: &std::path::Path) -> (FontBundle, Vec<&'static str>) {
-        let files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-            .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
-            .unwrap_or_default();
-        let load = |role: &str| -> Option<Vec<u8>> {
-            for family in ["Exo 2", "Exo2", "Exo 2"] {
-                for ext in ["otf", "ttf"] {
-                    let want = format!("{family}-{role}.{ext}");
-                    if let Some(path) = files.iter().find(|p| {
-                        p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.eq_ignore_ascii_case(&want))
-                    }) {
-                        if let Ok(bytes) = std::fs::read(path) {
-                            return Some(bytes);
-                        }
-                    }
-                }
-            }
-            None
-        };
-
-        let mut bundle = FontBundle::exo2();
-        let mut imported = Vec::new();
-        for (role, slot) in [
-            ("Bold", &mut bundle.bold),
-            ("SemiBold", &mut bundle.semibold),
-            ("Light", &mut bundle.light),
-            ("Regular", &mut bundle.regular),
-        ] {
-            if let Some(bytes) = load(role) {
-                *slot = bytes;
-                imported.push(role);
-            }
-        }
-        (bundle, imported)
-    }
-}
 
 /// Glyph-region weights (`Region::Glyph::weight`).
 pub const WEIGHT_SEMIBOLD: u8 = 0;
@@ -180,20 +108,6 @@ const MOD_ICON_PNGS: [&[u8]; 14] = [
 const MOD_ICON_BG_PNG: &[u8] = include_bytes!("../assets/modicons/mod-icon.png");
 const REPEAT_EDGE_PNG: &[u8] = include_bytes!("../assets/cursor/repeat-edge-piece.png");
 const APPROACH_CIRCLE_PNG: &[u8] = include_bytes!("../assets/cursor/approachcircle.png");
-
-const COUNTER_DIGITS: [&[u8]; 10] = [
-    include_bytes!("../assets/counter/argon-counter-0.png"),
-    include_bytes!("../assets/counter/argon-counter-1.png"),
-    include_bytes!("../assets/counter/argon-counter-2.png"),
-    include_bytes!("../assets/counter/argon-counter-3.png"),
-    include_bytes!("../assets/counter/argon-counter-4.png"),
-    include_bytes!("../assets/counter/argon-counter-5.png"),
-    include_bytes!("../assets/counter/argon-counter-6.png"),
-    include_bytes!("../assets/counter/argon-counter-7.png"),
-    include_bytes!("../assets/counter/argon-counter-8.png"),
-    include_bytes!("../assets/counter/argon-counter-9.png"),
-];
-const COUNTER_DOT_PNG: &[u8] = include_bytes!("../assets/counter/argon-counter-dot.png");
 
 /// Lazer `ResultsScreen.BACKGROUND_BLUR` (blur sigma) expressed in
 /// virtual 1024x768 canvas units: 10 screen px at 1080p is
@@ -274,9 +188,6 @@ pub fn rounded_avatar(img: &Image, corner_ratio: f32) -> Image {
     }
     Image { width: side as u32, height: side as u32, rgba }
 }
-const COUNTER_PERCENT_PNG: &[u8] = include_bytes!("../assets/counter/argon-counter-percentage.png");
-const COUNTER_X_PNG: &[u8] = include_bytes!("../assets/counter/argon-counter-x.png");
-const COUNTER_WIREFRAMES_PNG: &[u8] = include_bytes!("../assets/counter/argon-counter-wireframes.png");
 
 /// Atlas slots reserved for the storyboard composites (`--storyboard`):
 /// two full-frame regions the storyboard layer renders into GPU-side
@@ -343,26 +254,11 @@ pub fn build_atlas(
     max_dim: u32,
     storyboard: Option<StoryboardSlots>,
 ) -> (Atlas, Fonts) {
-    build_atlas_with_fonts(FontBundle::exo2(), bg_image, bg_aspect, avatar_image, skin, max_dim, storyboard)
-}
-
-/// [`build_atlas`] with an explicit text [`FontBundle`] — pass
-/// `FontBundle::from_dir(..)`'s bundle to render with the original Exo 2
-/// (or any imported family) instead of the embedded Exo 2 default.
-pub fn build_atlas_with_fonts(
-    fonts: FontBundle,
-    bg_image: Option<Image>,
-    bg_aspect: Option<f32>,
-    avatar_image: Option<Image>,
-    skin: &mut dyn skin::SkinTextureSource,
-    max_dim: u32,
-    storyboard: Option<StoryboardSlots>,
-) -> (Atlas, Fonts) {
-    let (mut bold, mut bold_images) = TtfFont::rasterize(&fonts.bold, WEIGHT_BOLD);
-    let (mut semibold, mut semibold_images) = TtfFont::rasterize(&fonts.semibold, WEIGHT_SEMIBOLD);
-    let (mut light, mut light_images) = TtfFont::rasterize(&fonts.light, WEIGHT_LIGHT);
+    let (mut bold, mut bold_images) = TtfFont::rasterize(EXO2_BOLD_FONT, WEIGHT_BOLD);
+    let (mut semibold, mut semibold_images) = TtfFont::rasterize(EXO2_SEMIBOLD_FONT, WEIGHT_SEMIBOLD);
+    let (mut light, mut light_images) = TtfFont::rasterize(EXO2_LIGHT_FONT, WEIGHT_LIGHT);
     let (mut venera, mut venera_images) = TtfFont::rasterize(VENERA_FONT, WEIGHT_VENERA);
-    let (mut regular, mut regular_images) = TtfFont::rasterize(&fonts.regular, WEIGHT_REGULAR);
+    let (mut regular, mut regular_images) = TtfFont::rasterize(EXO2_REGULAR_FONT, WEIGHT_REGULAR);
 
     let mut images: Vec<(Region, Image)> = Vec::new();
     if let Some(img) = bg_image {
@@ -400,18 +296,17 @@ pub fn build_atlas_with_fonts(
     images.append(&mut venera_images);
     images.append(&mut regular_images);
 
-    for (d, png) in COUNTER_DIGITS.iter().enumerate() {
-        let (w, h, rgba) = decode_png_bytes(png).expect("embedded png");
-        images.push((Region::CounterDigit(b'0' + d as u8), Image { width: w, height: h, rgba }));
-    }
-    for (png, region) in [
-        (COUNTER_DOT_PNG, Region::CounterDot),
-        (COUNTER_PERCENT_PNG, Region::CounterPercent),
-        (COUNTER_X_PNG, Region::CounterX),
-        (COUNTER_WIREFRAMES_PNG, Region::CounterWireframes),
-    ] {
-        let (w, h, rgba) = decode_png_bytes(png).expect("embedded png");
-        images.push((region, Image { width: w, height: h, rgba }));
+    // HUD counter digits: rendered from the same embedded Exo 2 SemiBold
+    // the UI text uses (CounterDraw's 240-box/178-ink layout metrics),
+    // not from any PNG asset.
+    for (n, img) in draw::counter_digit_images(EXO2_SEMIBOLD_FONT).into_iter().enumerate() {
+        let region = match n {
+            0..=9 => Region::CounterDigit(b'0' + n as u8),
+            10 => Region::CounterDot,
+            11 => Region::CounterPercent,
+            _ => Region::CounterX,
+        };
+        images.push((region, img));
     }
     {
         let (w, h, rgba) = decode_png_bytes(CURSOR_TRAIL_PNG).expect("embedded png");
@@ -471,7 +366,7 @@ pub fn build_atlas_with_fonts(
     };
     skin.assign_regions(&skin_regions);
     if std::env::var("ATLAS_DEBUG").is_ok() {
-        for r in [Region::CounterDigit(b'5'), Region::Glyph { weight: WEIGHT_BOLD, c: 'G', em: 24 }, Region::Glyph { weight: WEIGHT_BOLD, c: 'G', em: 96 }, Region::Glyph { weight: WEIGHT_SEMIBOLD, c: '5', em: 48 }, Region::CounterWireframes] {
+        for r in [Region::CounterDigit(b'5'), Region::Glyph { weight: WEIGHT_BOLD, c: 'G', em: 24 }, Region::Glyph { weight: WEIGHT_BOLD, c: 'G', em: 96 }, Region::Glyph { weight: WEIGHT_SEMIBOLD, c: '5', em: 48 }] {
             let rect = atlas.region_rect(r);
             let ink = atlas.ink(r);
             eprintln!("ATLAS {:?}: rect=({:.0},{:.0},{:.0},{:.0}) ink=({:.0},{:.0},{:.0},{:.0})", r, rect.x0, rect.y0, rect.x1, rect.y1, ink[0], ink[1], ink[2], ink[3]);
