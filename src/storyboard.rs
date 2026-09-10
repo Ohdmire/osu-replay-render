@@ -114,11 +114,17 @@ fn resolve_file(dir: &std::path::Path, name: &str) -> Option<PathBuf> {
 fn probe_video(info: &mut VideoInfo, ffprobe: Option<&std::path::Path>) {
     let bin = ffprobe.unwrap_or_else(|| std::path::Path::new("ffprobe"));
     let run = |entries: &str| -> Option<String> {
-        let out = std::process::Command::new(bin)
-            .args(["-v", "error", "-select_streams", "v:0", "-show_entries", entries, "-of", "csv=p=0"])
-            .arg(&info.path)
-            .output()
-            .ok()?;
+        let mut cmd = std::process::Command::new(bin);
+        cmd.args(["-v", "error", "-select_streams", "v:0", "-show_entries", entries, "-of", "csv=p=0"])
+            .arg(&info.path);
+        // 后台宿主(壁纸)不起控制台窗口;其余平台/场景无副作用
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let out = cmd.output().ok()?;
         if !out.status.success() {
             return None;
         }
@@ -429,6 +435,13 @@ impl VideoPipe {
             .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
+        // 后台宿主(壁纸)不起控制台窗口;其余平台/场景无副作用
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(error) => {
