@@ -1167,12 +1167,15 @@ impl SceneState {
         // Tracking transitions.
         let slider_ended = t >= obj.end_time;
         if tracking && !anim.was_tracking {
-            // OnSliderPress.
+            // OnSliderPress. `FollowCircle.load` schedules the press at
+            // `max(Time.Current, StartTime)`: an early head hit pops the
+            // circle exactly at the slider start, not at the press frame.
+            let press_t = t.max(obj.start_time);
             if anim.follow_alpha.abs() < 1e-3 {
                 anim.follow_scale = 1.0;
             }
-            anim.follow_anim = Some((t, t + 300.0, anim.follow_scale, FOLLOW_AREA as f64, Easing::OutQuint));
-            anim.follow_alpha_anim = Some((t, t + 300.0, anim.follow_alpha, 1.0, Easing::OutQuint));
+            anim.follow_anim = Some((press_t, press_t + 300.0, anim.follow_scale, FOLLOW_AREA as f64, Easing::OutQuint));
+            anim.follow_alpha_anim = Some((press_t, press_t + 300.0, anim.follow_alpha, 1.0, Easing::OutQuint));
         } else if !tracking && anim.was_tracking {
             if slider_ended {
                 // OnSliderEnd.
@@ -1197,12 +1200,17 @@ impl SceneState {
                 // `FadeTo(0)`: a re-track after a mid-slider break resets
                 // the half-finished 4x break transform instead of
                 // animating down from it (which showed the ring rushing
-                // in oversized and shrinking to size).
+                // in oversized and shrinking to size). The pop runs at
+                // `max(Time.Current, StartTime)` (FollowCircle.load) so an
+                // early head hit pops at the slider start; `remaining`
+                // stays measured from the press frame, matching lazer's
+                // `HitStateUpdateTime - Time.Current` at bindable-fire.
+                let press_t = t.max(obj.start_time);
                 anim.fc_scale = 1.0;
                 anim.fc_alpha = 0.0;
                 anim.fc_tail_done = false;
-                anim.fc_scale_anim = Some((t, t + remaining.min(180.0), 1.0, 2.0, Easing::Out));
-                anim.fc_alpha_anim = Some((t, t + remaining.min(60.0), 0.0, 1.0, Easing::Linear));
+                anim.fc_scale_anim = Some((press_t, press_t + remaining.min(180.0), 1.0, 2.0, Easing::Out));
+                anim.fc_alpha_anim = Some((press_t, press_t + remaining.min(60.0), 0.0, 1.0, Easing::Linear));
             }
             // The exit fires at the slider end, and the slider's OWN result
             // picks the animation (`FollowCircle.updateStateTransforms` in
@@ -1498,14 +1506,19 @@ impl SceneState {
 
         // --- Ball + follow circle --------------------------------------------------------
         if t >= obj.start_time && !(body_judged && t > bt + 240.0) {
-            // ArgonSliderBall: FadeInFromZero(200, OutQuint) at the slider
-            // start; at the end it intentionally piles an EXTRA
-            // FadeOut(duration / 4 = 50ms, OutQuint) on top of the whole
-            // slider's 240ms fade - the ball vanishes much faster than the
-            // body ("intentionally pile on an extra FadeOut to make it
-            // happen much faster").
-            let mut ball_alpha =
-                value_at(t, obj.start_time, obj.start_time + 200.0, 0.0, 1.0, Easing::OutQuint) * alpha;
+            // Ball fade-in at the slider start: ArgonSliderBall does
+            // FadeInFromZero(200, OutQuint); LegacySliderBall (and
+            // DefaultSliderBall) use a bare `FadeIn()` - no duration,
+            // INSTANT full alpha. At the end ArgonSliderBall intentionally
+            // piles an EXTRA FadeOut(duration / 4 = 50ms, OutQuint) on top
+            // of the whole slider's 240ms fade - the ball vanishes much
+            // faster than the body ("intentionally pile on an extra
+            // FadeOut to make it happen much faster").
+            let mut ball_alpha = (if legacy.is_some() {
+                1.0
+            } else {
+                value_at(t, obj.start_time, obj.start_time + 200.0, 0.0, 1.0, Easing::OutQuint)
+            }) * alpha;
             if body_judged {
                 // The end fade: ArgonSliderBall/DefaultSliderBall pile an
                 // extra FadeOut(duration/4 = 50ms, OutQuint); the legacy
