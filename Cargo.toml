@@ -1,6 +1,6 @@
 [package]
 name = "osu_replay_render"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 license = "MIT"
 
@@ -20,6 +20,9 @@ jpeg-decoder = "0.3"
 ab_glyph = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 进程内音频解码(皮肤采样 mp3/ogg/flac → PCM,替代外部 ffmpeg;宿主
+# Aria 经 resolve_sample_wav 复用,与其 kira 侧 symphonia 同版本统一)
+symphonia = { version = "0.5", features = ["mp3", "ogg", "vorbis", "flac", "wav", "pcm"] }
 
 [profile.release]
 lto = "thin"

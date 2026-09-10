@@ -1178,7 +1178,7 @@ fn main() {
         // reached depth 2. Until then the GPU renders ahead while the CPU
         // keeps building the next frame; reading immediately after submit
         // would serialize CPU and GPU again.
-        renderer.render_deferred(&list, [0.055, 0.055, 0.075, 1.0]);
+        renderer.render_deferred(&list, osu_replay_render::CLEAR);
         let tc = std::time::Instant::now();
         if renderer.pending_len() >= 2 {
             let mut buf = output.take_buf((renderer.padded_row as usize) * opts.height as usize);

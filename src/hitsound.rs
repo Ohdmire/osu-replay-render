@@ -709,7 +709,8 @@ fn lookup_candidates(bank: &str, name: &str) -> Vec<String> {
 /// Bytes-level resolution for live-playback hosts that own their audio
 /// engine (decode the returned WAV themselves): the user skin's file
 /// first under the same mix policy (skin WAVs pass through untouched,
-/// mp3/ogg re-encode through ffmpeg), else the embedded ArgonPro entry.
+/// mp3/ogg decode in-process via symphonia), else the embedded ArgonPro
+/// entry.
 pub fn resolve_sample_wav(bank: &str, name: &str, skin: &dyn crate::skin::Skin) -> Option<Vec<u8>> {
     if skin.is_legacy() {
         let mut names = lookup_candidates(bank, name);
@@ -730,7 +731,7 @@ pub fn resolve_sample_wav(bank: &str, name: &str, skin: &dyn crate::skin::Skin) 
             if is_wav {
                 return std::fs::read(&path).ok();
             }
-            return ffmpeg_pcm(&path).map(|clip| encode_wav(&clip.data, false));
+            return decode_wav_44k(&path);
         }
     }
     // 皮肤未提供该槽位(或非 legacy 皮肤):回退内置默认
@@ -738,8 +739,7 @@ pub fn resolve_sample_wav(bank: &str, name: &str, skin: &dyn crate::skin::Skin) 
 }
 
 /// Decode a skin sample file: WAV in-process ([`decode_wav`]); anything
-/// else (mp3/ogg/...) through the local ffmpeg binary the export path
-/// already encodes with.
+/// else (mp3/ogg/flac/…) in-process via symphonia — no external binary.
 fn decode_sample_file(path: &Path) -> Result<Clip, String> {
     let is_wav = path
         .extension()
@@ -749,27 +749,110 @@ fn decode_sample_file(path: &Path) -> Result<Clip, String> {
         let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
         return decode_wav(&bytes).ok_or_else(|| "not a decodable RIFF/PCM wav".to_string());
     }
-    ffmpeg_pcm(path).ok_or_else(|| "ffmpeg decode failed".to_string())
+    decode_pcm_stereo44k(path).ok_or_else(|| "symphonia decode failed".to_string())
 }
 
-/// `ffmpeg -i <file> -map a:0 -f s16le -ar 44100 -ac 2 pipe:1` — PCM16
-/// on stdout, converted to the interleaved f32 clip format.
-fn ffmpeg_pcm(path: &Path) -> Option<Clip> {
-    let out = std::process::Command::new("ffmpeg")
-        .args(["-v", "error", "-i"])
-        .arg(path)
-        .args(["-map", "a:0", "-f", "s16le", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", "pipe:1"])
-        .output()
+/// 进程内解码任意支持的压缩音频(mp3/ogg/vorbis/flac/…)→ 交错立体声
+/// f32 @44.1k(`Clip` 口径,替代原 `ffmpeg -f s16le -ar 44100 -ac 2`
+/// 子进程)。重采样为线性 —— 打击音效是短样本,质量足够;失败返回
+/// None(调用方按缺失静音,不回退)。
+fn decode_pcm_stereo44k(path: &Path) -> Option<Clip> {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+    use symphonia::core::errors::Error as SymError;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+
+    let file = std::fs::File::open(path).ok()?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let mut format = symphonia::default::get_probe()
+        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .ok()?
+        .format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)?;
+    let track_id = track.id;
+    let src_rate = track.codec_params.sample_rate.unwrap_or(SAMPLE_RATE);
+    let channels = track
+        .codec_params
+        .channels
+        .map(|c| c.count())
+        .unwrap_or(2)
+        .max(1);
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
         .ok()?;
-    if !out.status.success() || out.stdout.is_empty() {
+
+    let mut raw: Vec<f32> = Vec::new();
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(_) => break, // EOF / 不可恢复的容器错误
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        let decoded = match decoder.decode(&packet) {
+            Ok(d) => d,
+            // 坏包跳过继续(截断文件尾巴常见),其余错误终止
+            Err(SymError::DecodeError(_)) => continue,
+            Err(_) => break,
+        };
+        let spec = *decoded.spec();
+        let mut buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+        buf.copy_interleaved_ref(decoded);
+        raw.extend_from_slice(buf.samples());
+    }
+    if raw.is_empty() {
         return None;
     }
-    let data = out
-        .stdout
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
-        .collect();
+    let data = to_stereo_44k(&raw, channels, src_rate);
     Some(Clip { data })
+}
+
+/// 任意声道布局 → 立体声,再线性重采样到 44.1k。
+fn to_stereo_44k(interleaved: &[f32], channels: usize, src_rate: u32) -> Vec<f32> {
+    let stereo: Vec<f32> = match channels {
+        1 => interleaved.iter().flat_map(|s| [*s, *s]).collect(),
+        2 => interleaved.to_vec(),
+        // >2 声道取前两声道(打击音效不会有环绕混音语义)
+        _ => interleaved
+            .chunks_exact(channels)
+            .flat_map(|c| [c[0], c[1]])
+            .collect(),
+    };
+    if src_rate == SAMPLE_RATE || stereo.len() < 2 {
+        return stereo;
+    }
+    let in_frames = stereo.len() / 2;
+    let out_frames = ((in_frames as f64) * (SAMPLE_RATE as f64 / src_rate as f64)).floor() as usize;
+    let mut out = Vec::with_capacity(out_frames * 2);
+    for i in 0..out_frames {
+        let pos = i as f64 * (src_rate as f64 / SAMPLE_RATE as f64);
+        let i0 = (pos.floor() as usize).min(in_frames - 1);
+        let i1 = (i0 + 1).min(in_frames - 1);
+        let t = pos - i0 as f64;
+        for ch in 0..2 {
+            let a = stereo[i0 * 2 + ch] as f64;
+            let b = stereo[i1 * 2 + ch] as f64;
+            out.push((a + (b - a) * t) as f32);
+        }
+    }
+    out
+}
+
+/// 进程内解码任意支持的音频 → 44.1k 立体声 wav(PCM16)字节。直播放
+/// 宿主(kira `StaticSoundData::from_cursor`)直接吃;失败返回 None。
+pub fn decode_wav_44k(path: &Path) -> Option<Vec<u8>> {
+    decode_pcm_stereo44k(path).map(|clip| encode_wav(&clip.data, false))
 }
 
 // ---------------------------------------------------------------------------

@@ -54,6 +54,10 @@ pub const WEIGHT_LIGHT: u8 = 2;
 pub const WEIGHT_VENERA: u8 = 3;
 pub const WEIGHT_REGULAR: u8 = 4;
 
+/// 场景清屏色:纯黑。壁纸与视频导出的统一底色 —— 暗场(无背景图/背景
+/// 未覆盖/收尾空帧)必须是不带色调的真黑,宿主不要再各自硬编码偏灰值。
+pub const CLEAR: [f64; 4] = [0.0, 0.0, 0.0, 1.0];
+
 /// The four text fonts packed into the atlas (Exo 2 family + Venera for
 /// the rank letter).
 #[derive(Clone)]
