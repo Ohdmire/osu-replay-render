@@ -443,6 +443,24 @@ impl Renderer {
         &self.adapter
     }
 
+    /// The adapter's 2D texture dimension limit, clamped to 16384 (a
+    /// fully-used 16384² RGBA atlas would be 1 GiB of VRAM). Call before
+    /// `build_atlas` so huge skins pack at native sprite size; devices that
+    /// only reach 8192 (GLES-compat floor) keep the uniform downscale
+    /// fallback inside `build_atlas`.
+    pub fn probe_max_texture_dimension_2d() -> u32 {
+        let mut descriptor = wgpu::InstanceDescriptor::default();
+        descriptor.backends = wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all());
+        let instance = wgpu::Instance::new(&descriptor);
+        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("no suitable GPU adapter");
+        adapter.limits().max_texture_dimension_2d.min(16384)
+    }
+
     /// 诊断用一行 GPU/后端描述:后端、适配器名、vendor/device ID 与
     /// 驱动版本(日志记录用)。
     pub fn gpu_info(&self) -> String {
@@ -523,11 +541,18 @@ impl Renderer {
         height: u32,
         atlas: &Atlas,
     ) -> Renderer {
+        // The atlas may be packed past `Limits::default()`'s 8192 2D-texture
+        // cap (see `probe_max_texture_dimension_2d`); requesting up to the
+        // adapter's own limit is always supported.
+        let required_limits = wgpu::Limits {
+            max_texture_dimension_2d: adapter.limits().max_texture_dimension_2d.min(16384),
+            ..wgpu::Limits::default()
+        };
         let (device, queue) = block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("renderer"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits,
                 memory_hints: wgpu::MemoryHints::Performance,
             },
             None,

@@ -909,18 +909,22 @@ fn main() {
         None => None,
     };
 
-    // 8192 is the GLES/GL-compat floor for max_texture_dimension2d:
-    // capping here keeps the atlas creatable on every backend (desktop
-    // Vulkan/dGPU simply packs wider instead of taller).
+    // Pack at the adapter's native 2D-texture dimension (16384+ on desktop
+    // GPUs; `Limits::default()` would otherwise cap the atlas at the
+    // GLES-compat floor of 8192 and push big skins into the uniform
+    // downscale path, which shrinks every sprite's on-screen size - lazer
+    // never downscales sub-8192 sprites). Devices limited to 8192 fall
+    // back to that downscale inside build_atlas.
+    let atlas_max_dim = Renderer::probe_max_texture_dimension_2d();
     let (atlas, fonts) = build_atlas(
         bg_image,
         Some(opts.width as f32 / opts.height.max(1) as f32),
         avatar_image,
         &mut resolved_skin,
-        8192,
+        atlas_max_dim,
         storyboard_slots,
     );
-    eprintln!("atlas: {}x{}", atlas.width, atlas.height);
+    eprintln!("atlas: {}x{} (max_dim {atlas_max_dim})", atlas.width, atlas.height);
 
     let mut renderer = Renderer::new(opts.width, opts.height, &atlas);
     // Storyboard GPU layer on the renderer's device; below-layers dim with
