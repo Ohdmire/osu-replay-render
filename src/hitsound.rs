@@ -1581,7 +1581,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("loops.osu");
         std::fs::write(&path, map).unwrap();
-        let game = crate::game::load_autoplay(path.to_str().unwrap(), false, false).unwrap();
+        let game = crate::game::load_autoplay(path.to_str().unwrap(), 0, false, false).unwrap();
 
         let events = collect_loop_events(&game, &osu_parse::samples::parse(map));
         let slide = events.iter().find(|e| e.name == "sliderslide").expect("sliderslide event");

@@ -472,42 +472,60 @@ pub fn load(map_path: &str, replay_path: &str) -> Result<GameData, String> {    
 /// of lazer's `OsuAutoGenerator` instead of a recorded .osr, so no replay
 /// file is needed. The engine then judges the generated frames like any
 /// other replay — every judgement/HP/combo/UR readout is real.
-/// `hidden` adds the HD mod's visuals (objects fade out before hit time;
-/// judgement is untouched — HD is visual only, so mods/PP stay no-mod).
+/// `mods_bits`: legacy mod bits selected by the host (only HD/HR/EZ/DT/HT/
+/// NC are honoured — the rest is masked away). HR/EZ re-tune CS/AR/OD/HP
+/// and HR mirrors objects; DT/NC/HT set the gameplay rate (snapshot
+/// cadence, hit windows, HUD mod display, PP/stars all follow); HD adds
+/// its visuals on top of the host's own `hidden` flag.
+/// `hidden`: host-side HD visual switch (same effect as the HD bit).
 /// `with_pp`: skip the rosu-pp pass (stars/PP timeline) when the host won't
 /// display it (live wallpaper with HUD off) — saves load time.
-pub fn load_autoplay(map_path: &str, hidden: bool, with_pp: bool) -> Result<GameData, String> {
+pub fn load_autoplay(map_path: &str, mods_bits: u32, hidden: bool, with_pp: bool) -> Result<GameData, String> {
     let content = std::fs::read_to_string(map_path).map_err(|e| format!("cannot read beatmap {map_path}: {e}"))?;
-    load_autoplay_content(&content, hidden, with_pp)
+    load_autoplay_content(&content, mods_bits, hidden, with_pp)
 }
+
+/// Bits kept from `mods_bits` — everything the wallpaper host can select.
+/// AUTO/RX/AP/SO are rejected by `Mods::from_legacy` and must not arrive.
+const AUTOPLAY_MODS_MASK: u32 = osu_replay_judge::mods::legacy_bits::HIDDEN
+    | osu_replay_judge::mods::legacy_bits::HARDROCK
+    | osu_replay_judge::mods::legacy_bits::EASY
+    | osu_replay_judge::mods::legacy_bits::DOUBLETIME
+    | osu_replay_judge::mods::legacy_bits::HALFTIME
+    | osu_replay_judge::mods::legacy_bits::NIGHTCORE;
 
 /// [`load_autoplay`] for zero-copy hosts (osu!lazer content-addressed
 /// storage): the beatmap text is supplied by the host, which reads it
 /// straight from its blob store — no real beatmap directory required.
-pub fn load_autoplay_content(osu_text: &str, hidden: bool, with_pp: bool) -> Result<GameData, String> {
+pub fn load_autoplay_content(osu_text: &str, mods_bits: u32, hidden: bool, with_pp: bool) -> Result<GameData, String> {
     let mut map = beatmap::decode(osu_text)?;
 
-    // Lazer autoplay scores: no rate/visibility mods, standardised scoring.
-    let mods = Mods::from_legacy(0, false)?;
+    // Lazer autoplay scores: standardised scoring. Difficulty mods and rate
+    // come from the host's selection; everything downstream (generator AR,
+    // engine windows, snapshot cadence, mod display, PP) follows `mods`
+    // exactly as it does for a recorded replay.
+    let mods = Mods::from_legacy(mods_bits & AUTOPLAY_MODS_MASK, false)?;
     let classic = false;
-    let difficulty = process::apply_difficulty_mods(map.difficulty, false, false);
-    let processed = process::process(&map, difficulty, classic, false);
+    let difficulty = process::apply_difficulty_mods(map.difficulty, mods.hard_rock, mods.easy);
+    let processed = process::process(&map, difficulty, classic, mods.hard_rock);
 
+    // The generator works entirely in gameplay-clock ms (object times and
+    // preempt are map-time values), so rate mods need no adjustments here.
     let frames = crate::autoplay::AutoGenerator::new(&processed.objects, difficulty.ar as f64).generate();
 
     let mut engine = Engine::new(processed, &mods);
     engine.run(&frames);
 
-    let mut data = build(mods, classic, map.combo_colours, MapMeta::from_metadata(&map.metadata), &engine)?;
+    let mut data = build(mods.clone(), classic, map.combo_colours, MapMeta::from_metadata(&map.metadata), &engine)?;
     // lazer's autoplay attribution.
     data.player = "osu!".to_string();
     data.map_audio = map.general.audio_filename.clone();
     data.map_background = map.background.clone();
     data.sample_data = std::mem::take(&mut map.sample_data);
-    // HD 视觉(纯装饰:不改判定/PP,播放器可选项)
-    data.hidden = hidden;
+    // HD 视觉(纯装饰:不改判定/PP;mod 位与宿主开关取或)
+    data.hidden = hidden || mods.hidden;
     if with_pp {
-        if let Some(pp) = crate::pp::calculate(osu_text.as_bytes(), 0, classic, &engine) {
+        if let Some(pp) = crate::pp::calculate(osu_text.as_bytes(), mods_bits & AUTOPLAY_MODS_MASK, classic, &engine) {
             data.pp = pp.pp;
             data.pp_max = pp.pp_max;
             data.pp_events = pp.events;
