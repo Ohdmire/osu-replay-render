@@ -265,7 +265,10 @@ pub struct HudState {
     /// `AccuracyHeatmap` as a gameplay HUD element): accumulates every
     /// circle judgement up to the current time — green dots inside the
     /// inner circle (position offset relative to the approach
-    /// direction), red x-marks outside (misses). Default off.
+    /// direction), red x-marks outside (misses). Default off. lazer has
+    /// no gameplay position for it (it only exists as a results-screen
+    /// `StatisticItem`), so it hangs BELOW THE PP COUNTER in the
+    /// top-right column.
     pub offset_heatmap: bool,
     /// Whether the UR bar's window guide lines (colour axis) render
     /// (only visible when `ur_bar` is on).
@@ -828,9 +831,11 @@ impl HudState {
     /// moving-average chevron arrow (EMA 0.9/0.1, 800ms OutQuint slides).
     /// Live `AccuracyHeatmap` overlay: the results-screen port drawn as a
     /// gameplay HUD element, fed incrementally (events judged at or before
-    /// `t`). Sits at the bottom centre just above the UR bar; autoplay
-    /// feeds perfect-centre hits so the dots cluster in the middle — the
-    /// overlay earns its keep on real replays.
+    /// `t`). Position: below the PP counter in the top-right column (right
+    /// edge on the counters' 20-unit margin) — lazer defines no gameplay
+    /// position (results `StatisticItem` only). Autoplay feeds
+    /// perfect-centre hits so the dots cluster in the middle — the overlay
+    /// earns its keep on real replays.
     fn draw_offset_heatmap(&mut self, game: &GameData, assets: &Assets, list: &mut DrawList, m: &Mapper, t: f64) {
         let events: Vec<crate::game::ResultsHitEvent> = game
             .results_hit_events
@@ -841,7 +846,24 @@ impl HudState {
         if events.is_empty() {
             return;
         }
-        crate::results::draw_accuracy_heatmap(list, m, assets, [512.0, 588.0], 150.0, &events, false);
+        // The top-right column's current bottom: the accuracy counter
+        // (legacy: below the score run; argon: 20+30), plus the PP
+        // counter's 10-unit gap and 0.8-scale digit boxes (24) when shown.
+        let legacy_acc = !self.argon_hud
+            && assets.skin.is_legacy()
+            && self.legacy.as_ref().is_some_and(|l| l.score.is_some());
+        let mut bottom = if legacy_acc {
+            self.l_score_h + 9.0 + self.l_acc_h
+        } else {
+            20.0 + COUNTER_BOX
+        };
+        if self.pp_display && !game.pp_events.is_empty() {
+            bottom += 10.0 + COUNTER_BOX * 0.8;
+        }
+        let side = 150.0;
+        let cx = m.screen_w / m.virt - 20.0 - side * 0.5;
+        let cy = bottom + 12.0 + side * 0.5;
+        crate::results::draw_accuracy_heatmap(list, m, assets, [cx, cy], side, &events, false);
     }
 
     fn draw_ur_bar(&mut self, game: &GameData, assets: &Assets, list: &mut DrawList, m: &Mapper, t: f64) {
