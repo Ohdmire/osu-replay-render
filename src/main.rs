@@ -59,6 +59,8 @@
 //!                          single preview image, e.g. --results-only
 //!                          --png-dir out --fps 1 --results 1)
 //!   --limit <n>            Render at most n frames (testing)
+//!   --cursor [on|off]      Cursor rendering (default on; off = no cursor
+//!                          and no trail at all)
 
 use osu_replay_render::{build_atlas, decode_image_file, draw, draw::Image, game, hitsound, render::Renderer, scene, skin};
 
@@ -175,6 +177,9 @@ struct Options {
     /// default on = lazer): during breaks the background dim lightens
     /// by 0.3, easing over 800ms OutQuint (lazer `LightenDuringBreaks`).
     break_lighten: bool,
+    /// Cursor rendering (`--cursor [on|off]`, default on): off draws no
+    /// cursor and no trail at all.
+    show_cursor: bool,
     /// Seconds of the (static, expanded) results screen appended after
     /// gameplay (`--results <secs|off>`; default 4, `off` = 0).
     results: f64,
@@ -224,6 +229,7 @@ struct ConfigJson {
     hit_anim: Option<bool>,
     offset_heatmap: Option<bool>,
     break_lighten: Option<bool>,
+    show_cursor: Option<bool>,
     results: Option<f64>,
     results_only: Option<bool>,
     avatar: Option<String>,
@@ -329,6 +335,10 @@ fn apply_config(opts: &mut Options, c: ConfigJson) -> Result<(), String> {
     if let Some(v) = c.master_volume { opts.master_volume = v; }
     if let Some(true) = c.skin_colours { opts.skin_colours = true; }
     if let Some(true) = c.argon_hud { opts.argon_hud = true; }
+    if let Some(v) = c.hit_anim { opts.hit_anim = v; }
+    if let Some(v) = c.offset_heatmap { opts.offset_heatmap = v; }
+    if let Some(v) = c.break_lighten { opts.break_lighten = v; }
+    if let Some(v) = c.show_cursor { opts.show_cursor = v; }
     if let Some(v) = c.results { opts.results = v; }
     if let Some(true) = c.results_only {
         opts.results_only = true;
@@ -389,6 +399,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
         hit_anim: true,
         offset_heatmap: false,
         break_lighten: true,
+        show_cursor: true,
         results: 4.0,
         results_only: false,
         avatar: None,
@@ -585,6 +596,9 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
             }
             "--break-lighten" => {
                 opts.break_lighten = parse_on_off(&args, &mut i, "break-lighten")?;
+            }
+            "--cursor" => {
+                opts.show_cursor = parse_on_off(&args, &mut i, "cursor")?;
             }
             "--results" => {
                 i += 1;
@@ -1002,6 +1016,7 @@ fn main() {
     state.has_bg = has_bg;
     state.has_avatar = opts.avatar.is_some();
     state.cursor_size = opts.cursor_size;
+    state.show_cursor = opts.show_cursor;
     if opts.classic_score {
         state.hud.use_classic_score();
     }

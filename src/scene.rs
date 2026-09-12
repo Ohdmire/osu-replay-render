@@ -663,6 +663,11 @@ pub struct SceneState {
     /// 部件变大时间距不再继续变密)。皮肤层面没有尺寸配置(skin.ini 只有
     /// CursorExpand/CursorRotate/CursorCentre 三个布尔),故默认值内置于此。
     pub cursor_size: f32,
+    /// Cursor rendering toggle (default on). Off = no cursor AND no
+    /// trail - including trail point accumulation, so re-enabling
+    /// mid-session doesn't dump the accumulated trail. Hosts (e.g. the
+    /// wallpaper) use this for a clean, cursor-less look.
+    pub show_cursor: bool,
     cursor_expand: f64,
     cursor_anim: Option<(f64, f64, f64, f64, Easing)>,
     was_pressed: bool,
@@ -725,6 +730,7 @@ impl SceneState {
             has_avatar: false,
             follow_points: true,
             cursor_size: 1.0,
+            show_cursor: true,
             cursor_expand: 1.0,
             cursor_anim: None,
             was_pressed: false,
@@ -822,7 +828,9 @@ impl SceneState {
 
         // Cursor trail.
         let cursor_screen = self.mapper.pf([snap.cursor.x, snap.cursor.y]);
-        self.update_trail(cursor_screen, t);
+        if self.show_cursor {
+            self.update_trail(cursor_screen, t);
+        }
 
         // Tracking lookup for this frame.
         let tracking: Vec<bool> = {
@@ -964,9 +972,11 @@ impl SceneState {
         }
 
         // 7. Cursor + trail.
-        self.draw_trail(list, assets);
-        if !self.gameplay_hidden {
-            draw_cursor(self.legacy.as_ref(), assets, list, cursor_screen, self.cursor_expand as f32, self.cursor_size, self.mapper.virt, t);
+        if self.show_cursor {
+            self.draw_trail(list, assets);
+            if !self.gameplay_hidden {
+                draw_cursor(self.legacy.as_ref(), assets, list, cursor_screen, self.cursor_expand as f32, self.cursor_size, self.mapper.virt, t);
+            }
         }
 
         // 7.5 Storyboard above-layers (Foreground/Overlay composite):
