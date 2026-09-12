@@ -743,6 +743,16 @@ impl SceneState {
         }
     }
 
+    /// Hot-swap hook for hosts that replace the skin WITHOUT rebuilding
+    /// the render session (new atlas uploaded via `Renderer::set_atlas`,
+    /// new `Assets` built around it): drops the lazily-built legacy
+    /// sprite/HUD caches so the next frame re-resolves every skin piece
+    /// against the new atlas. Judgement/animation state is untouched.
+    pub fn invalidate_skin_cache(&mut self) {
+        self.legacy = None;
+        self.hud.invalidate_skin_cache();
+    }
+
     pub fn build_frame(
         &mut self,
         game: &GameData,

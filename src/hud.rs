@@ -347,6 +347,13 @@ impl HudState {
         }
     }
 
+    /// Hot-swap hook (see `SceneState::invalidate_skin_cache`): drop the
+    /// resolved legacy HUD pieces; they re-resolve against the new
+    /// skin/atlas on the next frame.
+    pub fn invalidate_skin_cache(&mut self) {
+        self.legacy = None;
+    }
+
     pub fn use_classic_score(&mut self) {
         self.classic_score = true;
     }
