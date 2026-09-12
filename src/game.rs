@@ -1056,3 +1056,44 @@ pub fn apply_skin_combo_colours(game: &mut GameData, skin: &crate::skin::Resolve
         obj.colour = palette[(obj.combo_colour_index as usize) % palette.len()];
     }
 }
+
+
+#[cfg(test)]
+mod ur_check_tests {
+    use super::*;
+
+    /// autoplay 会话的 UR 事件表必须非空( HUD 的 UR 条依赖它);
+    /// 偏移全 0(SS 自动)但事件本身存在。
+    #[test]
+    fn ur_events_autoplay() {
+        let map = "osu file format v14
+                   
+[General]
+Mode: 0
+                   
+[Difficulty]
+HPDrainRate:5
+CircleSize:4
+OverallDifficulty:8
+ApproachRate:8
+SliderMultiplier:1.8
+SliderTickRate:1
+                   
+[TimingPoints]
+500,400,4,2,0,45,1,0
+                   
+[HitObjects]
+                   100,100,1000,1,0,0:0:0:0:0
+                   200,100,1200,1,0,0:0:0:0:0
+                   256,192,2000,12,0,3500,0:0:0:0:0
+";
+        let dir = std::env::temp_dir().join(format!("orr_ur_check_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ur.osu");
+        std::fs::write(&path, map).unwrap();
+        let game = load_autoplay(path.to_str().unwrap(), 0, false, false).unwrap();
+        eprintln!("[ur-check] ur_events = {}", game.ur_events.len());
+        assert!(!game.ur_events.is_empty(), "autoplay UR 事件表为空 —— HUD UR 条不会绘制");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

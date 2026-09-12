@@ -601,7 +601,11 @@ impl HudState {
             let first = game.objects.first().map(|o| o.start_time).unwrap_or(0.0);
             let last = game.objects.last().map(|o| o.end_time).unwrap_or(0.0);
             let (progress, is_intro) = if t < first {
-                let intro_start = 0.0f64.max(first - 2000.0);
+                // `SongProgress.Update` 的 intro 段是 [GameplayClock.StartTime,
+                // first]:StartTime = min(0, first - 2000)(`DrawableRuleset.
+                // GameplayStartTime` 的 2s lead-in 再被 `findEarliestStartTime`
+                // 钳到 0)——倒计时弧从播放起点整段渐落,而不是最后 2s 才转完。
+                let intro_start = (first - 2000.0).min(0.0);
                 (((t - intro_start) / (first - intro_start)).clamp(0.0, 1.0), true)
             } else if last > first {
                 (((t.min(last) - first) / (last - first)).clamp(0.0, 1.0), false)
@@ -1483,45 +1487,62 @@ impl LegacyCombo {
         }
     }
 
+    /// Score-event edge (lazer `updateCount`): transition logic only —
+    /// the time-based transforms advance in [`LegacyCombo::tick`], which
+    /// must run every frame.
     fn update(&mut self, current: i32, t: f64) {
-        if current != self.prev {
-            if current == 0 && self.prev > 0 {
-                // onCountRolling: proportional roll to 0
-                // (`difference * 20ms`, linear `TransformTo`). The text
-                // stays opaque (Show() per rolled step) until the roll
-                // lands on 0, which starts the 100ms fade.
-                self.roll = Some((t, self.displayed, 0.0, (self.displayed * 20.0).max(1.0)));
-                self.pending_step = None;
-                self.big_pop = None;
-                self.small_pop = None;
-                self.alpha = 1.0;
-                self.zero_fade = None;
-            } else if current == self.prev + 1 {
-                // updateCount's non-rolling path first completes any running
-                // roll and snaps `DisplayedCount = prev` (FinishTransforms);
-                // without the snap a mid-roll displayed value would keep
-                // counting up from the pre-break combo. Then: the pending +1
-                // is invalidated, the big additive pop-out shows the NEW
-                // value now, and the displayed value steps up 160ms later.
-                self.displayed = self.prev as f64;
-                self.pending_step = Some(t + 160.0);
-                self.big_pop = Some((t, current));
-                self.roll = None;
-                self.alpha = 1.0;
-                self.zero_fade = None;
-            } else {
-                // onCountChange: jump (slider tails); instant show/hide.
-                self.displayed = current as f64;
-                self.pending_step = None;
-                self.roll = None;
-                self.big_pop = None;
-                self.small_pop = None;
-                self.alpha = if current > 0 { 1.0 } else { 0.0 };
-                self.zero_fade = None;
-            }
-            self.prev = current;
+        if current == self.prev {
+            return;
         }
+        if current == 0 && self.prev > 0 {
+            // onCountRolling: proportional roll to 0
+            // (`difference * 20ms`, linear `TransformTo`). The text
+            // stays opaque (Show() per rolled step) until the roll
+            // lands on 0, which starts the 100ms fade.
+            self.roll = Some((t, self.displayed, 0.0, (self.displayed * 20.0).max(1.0)));
+            self.pending_step = None;
+            self.big_pop = None;
+            self.small_pop = None;
+            self.alpha = 1.0;
+            self.zero_fade = None;
+        } else if current == self.prev + 1 {
+            // updateCount's non-rolling path first completes any running
+            // roll and snaps `DisplayedCount = prev` (FinishTransforms).
+            // That assignment goes through the setter: when the displayed
+            // value is exactly one behind it lands on the INCREMENT path —
+            // text becomes `prev` with a small pop. Dense streams (<160ms
+            // gaps) never let the scheduled +1 land (each new increment
+            // invalidates it); lazer catches up HERE.
+            if self.displayed + 1.0 == self.prev as f64 {
+                self.small_pop = Some(t);
+            }
+            self.displayed = self.prev as f64;
+            // The re-scheduled +1 (`big_pop_out_duration - 140` = 160ms):
+            // fires in `tick` 160ms later, newest-wins.
+            self.pending_step = Some(t + 160.0);
+            self.big_pop = Some((t, current));
+            self.roll = None;
+            self.alpha = 1.0;
+            self.zero_fade = None;
+        } else {
+            // onCountChange: jump (slider tails); instant show/hide.
+            self.displayed = current as f64;
+            self.pending_step = None;
+            self.roll = None;
+            self.big_pop = None;
+            self.small_pop = None;
+            self.alpha = if current > 0 { 1.0 } else { 0.0 };
+            self.zero_fade = None;
+        }
+        self.prev = current;
+    }
 
+    /// Per-frame time advancement. lazer's Scheduler task and transforms
+    /// run on the frame clock, NOT on value changes — without this the
+    /// delayed +1 never lands inside dense streams (each new event
+    /// overwrites it) and the break roll-down / fade only step at hit
+    /// cadence.
+    fn tick(&mut self, t: f64) {
         // `scheduledPopOutSmall`: the delayed +1 (fires the small pulse
         // via `onDisplayedCountIncrement`).
         if let Some(s) = self.pending_step {
@@ -1670,6 +1691,9 @@ impl HudState {
     /// fires behind every increment; the displayed value pulses
     /// (`transformPopOutSmall`) and steps up 160ms later.
     fn draw_legacy_combo(&mut self, assets: &Assets, list: &mut DrawList, m: &Mapper, t: f64) {
+        // Time-based state (delayed +1 / roll-down / fade) advances on the
+        // frame clock — see `LegacyCombo::tick`.
+        self.l_combo.tick(t);
         let combo = &self.l_combo;
         let (big_pop, small_scale, alpha, displayed, roll_active) =
             (combo.big_pop, combo.small_scale(t) as f32, combo.alpha as f32, combo.displayed.round() as i64, combo.roll.is_some());
@@ -1974,5 +1998,57 @@ impl HudState {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LegacyCombo;
+
+    /// 密集流(<160ms 间隔)里 scheduled +1 永远被下一次增量作废;lazer 在
+    /// `DisplayedCount = prev` 的 setter 增量路径追平 —— 每次命中后文字
+    /// (经 tick)必须显示上一命中值并以 small pop 脉冲,而不是卡死不动。
+    #[test]
+    fn legacy_combo_dense_stream_catches_up() {
+        let mut c = LegacyCombo::new();
+        // 0 → 1(首击):displayed 仍 0,等 160ms 后的 +1。
+        c.update(1, 100.0);
+        c.tick(150.0);
+        assert_eq!(c.displayed, 0.0, "160ms 内 displayed 不动");
+        c.tick(261.0);
+        assert_eq!(c.displayed, 1.0, "160ms 后 scheduled +1 落地");
+        assert_eq!(c.small_pop, Some(260.0), "+1 落地同时打 small pop");
+
+        // 稀疏流(间隔 > 160ms):scheduled +1 在事件 160ms 后落地。
+        c.update(2, 300.0);
+        assert_eq!(c.displayed, 1.0, "事件时刻 displayed=prev");
+        c.tick(350.0);
+        assert_eq!(c.displayed, 1.0, "160ms 内 displayed 不动");
+        c.tick(461.0);
+        assert_eq!(c.displayed, 2.0, "160ms 后 scheduled +1 落地");
+        assert_eq!(c.small_pop, Some(460.0), "+1 落地同时打 small pop");
+
+        // 密集流:间隔 100ms < 160ms,scheduled +1 被作废,靠 setter 追平。
+        c.update(3, 500.0);
+        assert_eq!(c.displayed, 2.0);
+        assert_eq!(c.small_pop, Some(460.0), "displayed 未落后时无追平 pop");
+        c.update(4, 600.0);
+        assert_eq!(c.displayed, 3.0);
+        assert_eq!(c.small_pop, Some(600.0), "密集流在事件时刻追平 small pop");
+        c.tick(650.0);
+        assert_eq!(c.displayed, 3.0, "作废的 scheduled +1 不得迟到的双跳");
+        c.update(5, 700.0);
+        c.tick(720.0);
+        assert_eq!(c.displayed, 4.0);
+
+        // break:滚回 0 按帧推进(20ms/单位线性),落地后 100ms 淡出。
+        c.update(0, 1000.0);
+        for t in (1000..1180).step_by(4) {
+            c.tick(t as f64);
+        }
+        assert_eq!(c.displayed, 0.0, "滚回落地为 0");
+        assert!(c.alpha > 0.0 && c.alpha < 1.0, "落地后 100ms 淡出进行中");
+        c.tick(1600.0);
+        assert_eq!(c.alpha, 0.0, "淡出完成");
     }
 }
