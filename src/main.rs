@@ -42,6 +42,9 @@
 //!   --offset-heatmap       Live hit-offset heatmap overlay (default
 //!                          off): the results screen's AccuracyHeatmap
 //!                          accumulating over gameplay
+//!   --break-lighten        Lighten the background dim by 0.3 during
+//!                          breaks (800ms eased; lazer
+//!                          LightenDuringBreaks). Default off
 //!   --hd [auto|on|off]     Hidden visual override (default auto: follow the
 //!                          replay's own mods)
 //!   --bg [on|off]          Beatmap background image (default on)
@@ -167,6 +170,10 @@ struct Options {
     /// off): the results screen's `AccuracyHeatmap` accumulating over
     /// gameplay at the bottom centre.
     offset_heatmap: bool,
+    /// Break-time background lightening (`--break-lighten`, default
+    /// off): during breaks the background dim lightens by 0.3, easing
+    /// over 800ms OutQuint (lazer `LightenDuringBreaks`).
+    break_lighten: bool,
     /// Seconds of the (static, expanded) results screen appended after
     /// gameplay (`--results <secs|off>`; default 4, `off` = 0).
     results: f64,
@@ -215,6 +222,7 @@ struct ConfigJson {
     argon_hud: Option<bool>,
     hit_anim: Option<bool>,
     offset_heatmap: Option<bool>,
+    break_lighten: Option<bool>,
     results: Option<f64>,
     results_only: Option<bool>,
     avatar: Option<String>,
@@ -379,6 +387,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
         argon_hud: false,
         hit_anim: true,
         offset_heatmap: false,
+        break_lighten: false,
         results: 4.0,
         results_only: false,
         avatar: None,
@@ -572,6 +581,9 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
             }
             "--offset-heatmap" => {
                 opts.offset_heatmap = parse_on_off(&args, &mut i, "offset-heatmap")?;
+            }
+            "--break-lighten" => {
+                opts.break_lighten = parse_on_off(&args, &mut i, "break-lighten")?;
             }
             "--results" => {
                 i += 1;
@@ -970,6 +982,7 @@ fn main() {
     state.hud.argon_hud = opts.argon_hud;
     state.hit_animations = opts.hit_anim;
     state.hud.offset_heatmap = opts.offset_heatmap;
+    state.break_lighten = opts.break_lighten;
     state.bg_opacity = if has_bg && opts.bg { Some(opts.bg_opacity) } else { None };
     // 任一层(元素/视频)激活即画故事板合成槽位;亮度跟随背景(--bg off
     // 时全亮 1.0)。

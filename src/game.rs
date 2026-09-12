@@ -322,6 +322,10 @@ pub struct GameData {
     /// `LegacyBeatmapSkin` lookup hits, so the user skin's combo colours
     /// are never reached).
     pub has_beatmap_colours: bool,
+    /// `[Events]` break periods `(start, end)` in gameplay-clock ms —
+    /// the break-time source for the scene's break background
+    /// lightening (lazer `BreakTracker`).
+    pub breaks: Vec<(f64, f64)>,
     pub rate: f64,
     /// Nightcore mod (rate 1.5 like DT, but the export keeps the game's
     /// pitch-up on the BGM — nightcore without the pitch isn't nightcore).
@@ -443,11 +447,13 @@ pub fn load(map_path: &str, replay_path: &str) -> Result<GameData, String> {    
     let mods = Mods::from_legacy(rep.header.mods, classic)?;
     let difficulty = process::apply_difficulty_mods(map.difficulty, mods.hard_rock, mods.easy);
     let processed = process::process(&map, difficulty, classic, mods.hard_rock);
+    let breaks = processed.breaks.clone();
 
     let mut engine = Engine::new(processed, &mods);
     engine.run(&rep.frames);
 
     let mut data = build(mods, classic, map.combo_colours, MapMeta::from_metadata(&map.metadata), &engine)?;
+    data.breaks = breaks;
     data.player = rep.header.player_name.clone();
     data.played_at_ticks = Some(rep.header.timestamp);
     // Beatmap extras for the assembly stage (audio/background/hitsounds):
@@ -512,11 +518,13 @@ pub fn load_autoplay_content(osu_text: &str, mods_bits: u32, hidden: bool, with_
     // The generator works entirely in gameplay-clock ms (object times and
     // preempt are map-time values), so rate mods need no adjustments here.
     let frames = crate::autoplay::AutoGenerator::new(&processed.objects, difficulty.ar as f64).generate();
+    let breaks = processed.breaks.clone();
 
     let mut engine = Engine::new(processed, &mods);
     engine.run(&frames);
 
     let mut data = build(mods.clone(), classic, map.combo_colours, MapMeta::from_metadata(&map.metadata), &engine)?;
+    data.breaks = breaks;
     // lazer's autoplay attribution.
     data.player = "osu!".to_string();
     data.map_audio = map.general.audio_filename.clone();
@@ -902,6 +910,7 @@ fn build(
         snapshots: with_lead_in(engine.snapshots.clone(), mods.rate),
         combo_colours,
         has_beatmap_colours: !map_colours.is_empty(),
+        breaks: Vec::new(),
         rate: mods.rate,
         nightcore: mods.nightcore,
         classic,

@@ -83,6 +83,47 @@ fn hd_fade_in(obj: &ObjView) -> f64 {
     }
 }
 
+/// The break-time background lightening at `t` (0..=0.3), lazer
+/// `UserDimContainer` port: `BREAK_LIGHTEN_AMOUNT = 0.3`, the dim change
+/// easing over `BACKGROUND_FADE_DURATION = 800ms` OutQuint. Break times
+/// per `BreakTracker`: the beatmap's effective breaks (duration >=
+/// `MIN_BREAK_DURATION` 650ms) clipped to `[start, end - BREAK_FADE_DURATION
+/// 325ms)`, plus the lead-in before `first - 2000` and everything after
+/// the last object's end (`HasCompleted`). The value eases between edges;
+/// the newest edge at or before `t` wins (edges alternate lighten/normal,
+/// so the ease always runs from the opposite value).
+fn break_lighten_at(breaks: &[(f64, f64)], first_start: Option<f64>, last_end: Option<f64>, t: f64) -> f32 {
+    const BREAK_FADE: f64 = 325.0;
+    const MIN_BREAK: f64 = 650.0;
+    const FADE: f64 = 800.0;
+    // (edge time, lightened target); the lead-in starts lightened
+    // (`isBreakTime` initial value is true).
+    let mut edges: Vec<(f64, bool)> = vec![(f64::NEG_INFINITY, true)];
+    if let Some(f) = first_start {
+        edges.push((f - 2000.0, false)); // gameplay start
+    }
+    for &(start, end) in breaks {
+        if end - start < MIN_BREAK {
+            continue;
+        }
+        edges.push((start, true));
+        edges.push((end - BREAK_FADE, false));
+    }
+    if let Some(l) = last_end {
+        edges.push((l, true)); // HasCompleted
+    }
+    edges.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut cur = edges[0];
+    for &e in &edges {
+        if e.0 <= t {
+            cur = e;
+        }
+    }
+    let x = ((t - cur.0) / FADE).clamp(0.0, 1.0);
+    let eased = Easing::OutQuint.apply(x) as f32;
+    0.3 * if cur.1 { eased } else { 1.0 - eased }
+}
+
 /// `getFadeOutParameters` default (circle) case: linear fade to zero over
 /// `preempt * 0.3`, starting `fade_in` after the lifetime start — the object
 /// is fully invisible for the last 30% of its preempt. `fade_in` is the
@@ -639,6 +680,17 @@ pub struct SceneState {
     /// 1.4x pop; argon: 640ms piece fade), and the legacy number's quick
     /// fade hack is bypassed so it rides the whole-piece fade.
     pub hit_animations: bool,
+    /// Break-time background lightening (lazer `LightenDuringBreaks` +
+    /// `UserDimContainer`): during breaks the background image's dim
+    /// level lightens by 0.3 (`BREAK_LIGHTEN_AMOUNT`), easing the
+    /// entry/exit edges over 800ms OutQuint. Break detection per
+    /// `BreakTracker`: the beatmap's effective breaks (>= 650ms) as
+    /// [start, end - 325ms), plus the lead-in (t < first - 2000) and
+    /// post-completion periods. Default OFF (the wallpaper's autoplay
+    /// renders unattended; hosts opt in). NOTE: only the background
+    /// IMAGE lightens — the storyboard composite's dim is premultiplied
+    /// host-side and stays put.
+    pub break_lighten: bool,
     /// 只渲染背景 + storyboard(音频/判定照常):跳过 note/滑条/转盘/
     /// 跟随点/判定动画/光标等全部 gameplay 元素(壁纸"纯画面"模式)。
     pub gameplay_hidden: bool,
@@ -681,6 +733,7 @@ impl SceneState {
             gameplay_hidden: false,
             hidden: game.hidden,
             hit_animations: true,
+            break_lighten: false,
             results_at: None,
             results_fade_frames: 0,
             results_fadein_frames: 0,
@@ -784,7 +837,15 @@ impl SceneState {
                 Colour::BLACK.opacity(1.0)
             } else {
                 // lazer DimLevel:图像灰度染色 rgb×(1-dim),不是 alpha
-                // 淡出(淡出会透出清屏色)
+                // 淡出(淡出会透出清屏色)。休息段(dim - 0.3)在此处
+                // 生效,见 [`SceneState::break_lighten_at`]。
+                let op = if self.break_lighten {
+                    let first = game.objects.first().map(|o| o.start_time);
+                    let last = game.objects.last().map(|o| o.end_time);
+                    (op - break_lighten_at(&game.breaks, first, last, t)).max(0.0)
+                } else {
+                    op
+                };
                 Colour { r: op, g: op, b: op, a: 1.0 }
             };
             list.image(
@@ -2877,6 +2938,30 @@ fn repeat_anchor(obj: &ObjView, p0: f64, p1: f64, at_end: bool, frozen: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// break_lighten_at:前奏常亮 → gameplay 起点淡回 → break 淡入 →
+    /// break 尾(end-325)淡出 → 曲末再淡入;边沿 800ms OutQuint。
+    #[test]
+    fn break_lighten_edges() {
+        // 晚开的谱面:两物件 10000..10100 / 15000..15100,
+        // break [11000, 13000)(≥650 生效)。
+        let breaks = [(11000.0, 13000.0)];
+        let (first, last) = (Some(10000.0), Some(15100.0));
+        let at = |t: f64| break_lighten_at(&breaks, first, last, t);
+        // 前奏(< first-2000 = 8000)全亮。
+        assert_eq!(at(0.0), 0.3);
+        // gameplay 起点 8000 开始 800ms 淡回;10000 早已完成 → 0。
+        assert_eq!(at(10000.0), 0.0);
+        // break 内部(11000 + 800 缓动结束)全亮。
+        assert!((at(12000.0) - 0.3).abs() < 1e-6);
+        // 尾沿 12675(= 13000-325)后 800ms 渐落;14000 已落回 0。
+        assert!((at(14000.0)).abs() < 1e-6);
+        // 曲末 15100 之后重新淡入到 0.3。
+        assert!((at(17000.0) - 0.3).abs() < 1e-6);
+        // 短于 650ms 的 break 无效,不产生任何边沿。
+        let short = [(11000.0, 11500.0)];
+        assert_eq!(break_lighten_at(&short, first, last, 11200.0), 0.0);
+    }
 
     /// L-shaped path: head (0,0) -> corner (100,0) -> end (100,100), slider
     /// positioned at (100,100) in playfield coords.
