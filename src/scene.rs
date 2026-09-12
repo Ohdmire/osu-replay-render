@@ -687,8 +687,9 @@ pub struct SceneState {
     /// edges over 800ms OutQuint. Break detection per
     /// `BreakTracker`: the beatmap's effective breaks (>= 650ms) as
     /// [start, end - 325ms), plus the lead-in (t < first - 2000) and
-    /// post-completion periods. Default OFF (the wallpaper's autoplay
-    /// renders unattended; hosts opt in). NOTE: only the background
+    /// post-completion periods. Default ON (lazer parity:
+    /// `SetDefault(OsuSetting.LightenDuringBreaks, true)`). NOTE: only
+    /// the background
     /// IMAGE lightens — the storyboard composite's dim is premultiplied
     /// host-side and stays put.
     pub break_lighten: bool,
@@ -734,7 +735,7 @@ impl SceneState {
             gameplay_hidden: false,
             hidden: game.hidden,
             hit_animations: true,
-            break_lighten: false,
+            break_lighten: true,
             results_at: None,
             results_fade_frames: 0,
             results_fadein_frames: 0,

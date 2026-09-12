@@ -42,9 +42,10 @@
 //!   --offset-heatmap       Live hit-offset heatmap overlay (default
 //!                          off): the results screen's AccuracyHeatmap
 //!                          accumulating over gameplay
-//!   --break-lighten        Lighten the background dim by 0.3 during
-//!                          breaks (800ms eased; lazer
-//!                          LightenDuringBreaks). Default off
+//!   --break-lighten [on|off]
+//!                          Lighten the background by 0.3 during breaks
+//!                          (800ms eased; lazer LightenDuringBreaks).
+//!                          Default on
 //!   --hd [auto|on|off]     Hidden visual override (default auto: follow the
 //!                          replay's own mods)
 //!   --bg [on|off]          Beatmap background image (default on)
@@ -170,9 +171,9 @@ struct Options {
     /// off): the results screen's `AccuracyHeatmap` accumulating over
     /// gameplay at the bottom centre.
     offset_heatmap: bool,
-    /// Break-time background lightening (`--break-lighten`, default
-    /// off): during breaks the background dim lightens by 0.3, easing
-    /// over 800ms OutQuint (lazer `LightenDuringBreaks`).
+    /// Break-time background lightening (`--break-lighten [on|off]`,
+    /// default on = lazer): during breaks the background dim lightens
+    /// by 0.3, easing over 800ms OutQuint (lazer `LightenDuringBreaks`).
     break_lighten: bool,
     /// Seconds of the (static, expanded) results screen appended after
     /// gameplay (`--results <secs|off>`; default 4, `off` = 0).
@@ -387,7 +388,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
         argon_hud: false,
         hit_anim: true,
         offset_heatmap: false,
-        break_lighten: false,
+        break_lighten: true,
         results: 4.0,
         results_only: false,
         avatar: None,
