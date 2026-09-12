@@ -1,6 +1,6 @@
 [package]
 name = "osu_replay_render"
-version = "0.13.1"
+version = "0.14.0"
 edition = "2024"
 license = "MIT"
 
@@ -23,11 +23,6 @@ serde_json = "1"
 # 进程内音频解码(皮肤采样 mp3/ogg/flac → PCM,替代外部 ffmpeg;宿主
 # Aria 经 resolve_sample_wav 复用,与其 kira 侧 symphonia 同版本统一)
 symphonia = { version = "0.5", features = ["mp3", "ogg", "vorbis", "flac", "wav", "pcm"] }
-
-# 本地 sibling checkout 接管同 URL git 依赖(osu-parse / osu-replay-judge
-# 内部引用统一到同一份,类型不分裂;与 Aria 的 patch 同款)。
-[patch."https://github.com/Ohdmire/osu-parse.git"]
-osu-parse = { path = "../osu-parse" }
 
 [profile.release]
 lto = "thin"
