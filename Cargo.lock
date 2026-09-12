@@ -849,7 +849,6 @@ dependencies = [
 [[package]]
 name = "osu-parse"
 version = "0.1.3"
-source = "git+https://github.com/Ohdmire/osu-parse.git#2b59e5a4ce5b59bc7ffa02f0197bab3afbc5168b"
 dependencies = [
  "lzma-rs",
 ]

@@ -1049,10 +1049,13 @@ fn main() {
     let hits_path: Option<String> = if opts.hitsounds && opts.out.is_some() {
         let t0 = frame_times[0];
         let wall_secs = frame_times.len() as f64 / opts.fps;
-        let wav = hitsound::render_track_wav(&game, &game.sample_data, t0, wall_secs, game.rate, opts.hitsounds_volume, &resolved_skin);
+        // 谱面自带采样层(LegacyBeatmapSkin):谱面集目录内文件优先于
+        // 皮肤,custom sample bank 索引决定参与与否(lazer 同款链)。
+        let beatmap_store = hitsound::DirectorySampleStore::new(&map_dir);
+        let wav = hitsound::render_track_wav_with_beatmap(&game, &game.sample_data, t0, wall_secs, game.rate, opts.hitsounds_volume, &resolved_skin, Some(&beatmap_store));
         let p = format!("{}.hits.wav", opts.out.as_ref().unwrap());
         std::fs::write(&p, wav).unwrap_or_else(|e| panic!("write {}: {}", p, e));
-        eprintln!("hitsounds: {} ({} samples, {:.1}s)", p, if resolved_skin.is_legacy() { "user skin mixed with ArgonPro" } else { "ArgonPro" }, wall_secs);
+        eprintln!("hitsounds: {} ({} samples, {:.1}s)", p, if resolved_skin.is_legacy() { "beatmap/user skin mixed with ArgonPro" } else { "beatmap samples + ArgonPro" }, wall_secs);
         Some(p)
     } else {
         None

@@ -47,9 +47,21 @@
 //!
 //! When a user skin is active (`--skin <dir>`) its own samples take
 //! priority per element, with the ArgonPro set filling every slot the
-//! skin leaves open (see [`SampleResolver`]). Beatmap skins are never
-//! parsed — the renderer's deliberate deviation from lazer's chain,
-//! which would consult them first.
+//! skin leaves open (see [`SampleResolver`]).
+//!
+//! Beatmap-local sample files (the set folder's own
+//! `soft-hitnormal.wav` / `normal-hitfinish2.wav` / …) sit ABOVE the
+//! user skin, mirroring lazer's `LegacyBeatmapSkin` layer
+//! (`BeatmapSkinProvidingContainer` → `LegacyBeatmapSkin.GetSample` →
+//! user skin → default): a hit sample opts in via its custom sample
+//! bank index (`UseBeatmapSamples` — the object's hitSample
+//! `customIndex` when > 0, else the timing point's `sampleIndex`;
+//! index ≥ 2 additionally pins the lookup to the suffixed name via
+//! `UseCustomSampleBanks`, and a hitSample `filename` replaces the
+//! hitnormal slot outright as `FileHitSampleInfo`). A file found in
+//! the set folder is authoritative for its slot — including 0-byte
+//! placeholders (deliberate silence), never falling through to the
+//! skin. See [`BeatmapSampleStore`] and [`resolve_sample_bytes`].
 
 use crate::game::{GameData, ObjKind};
 use osu_parse::samples::{
@@ -79,7 +91,7 @@ const POSITIONAL_HITSOUNDS_LEVEL: f64 = 0.8;
 /// point that point itself applies, else normal/100.
 fn point_at(points: &[SamplePoint], t: f64) -> SamplePoint {
     if points.is_empty() {
-        return SamplePoint { time: f64::NEG_INFINITY, bank: Bank::Normal, volume: 100 };
+        return SamplePoint { time: f64::NEG_INFINITY, bank: Bank::Normal, custom_index: 0, volume: 100 };
     }
     let mut lo = 0usize;
     let mut hi = points.len();
@@ -95,32 +107,56 @@ fn point_at(points: &[SamplePoint], t: f64) -> SamplePoint {
 }
 
 /// A fully resolved playback sample.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct HitSample {
     name: &'static str,
     bank: Bank,
+    /// Merged custom sample bank index (`ApplyTo`: the object's
+    /// hitSample/edgeSets index when > 0, else the timing point's
+    /// `sampleIndex`). ≥1 opts into the beatmap's own sample files
+    /// (`UseBeatmapSamples`), ≥2 additionally pins lookups to the
+    /// suffixed name (`UseCustomSampleBanks`).
+    custom: i32,
     volume: i32,
+    /// The hitSample's explicit filename (`FileHitSampleInfo`): replaces
+    /// the banked hitnormal slot with this beatmap-local file.
+    filename: Option<String>,
 }
 
 /// `convertSoundType` + `LegacySampleControlPoint.ApplyTo`: hitnormal
-/// always, additions per flags; unspecified banks/volumes inherit from the
-/// sample point active at the given time.
+/// always, additions per flags; unspecified banks/volumes/custom index
+/// inherit from the sample point active at the given time.
 fn resolve_samples(sound_type: u8, info: &BankInfo, point: SamplePoint) -> Vec<HitSample> {
     let mut out = Vec::with_capacity(4);
-    let mut push = |name: &'static str, bank: Option<Bank>| {
-        let bank = bank.unwrap_or(point.bank);
-        let volume = if info.volume > 0 { info.volume } else { point.volume };
-        out.push(HitSample { name, bank, volume });
-    };
-    push("hitnormal", info.normal);
+    let custom = if info.custom_index > 0 { info.custom_index } else { point.custom_index };
+    let volume = if info.volume > 0 { info.volume } else { point.volume };
+    match info.filename.as_deref().filter(|f| !f.is_empty()) {
+        // `FileHitSampleInfo`: custom index forced to 1 (beatmap-local,
+        // never falls back through the suffixed chain), bank pinned to
+        // normal; additions below still play.
+        Some(file) => out.push(HitSample {
+            name: "hitnormal",
+            bank: Bank::Normal,
+            custom: 1,
+            volume,
+            filename: Some(file.to_string()),
+        }),
+        None => out.push(HitSample {
+            name: "hitnormal",
+            bank: info.normal.unwrap_or(point.bank),
+            custom,
+            volume,
+            filename: None,
+        }),
+    }
     if sound_type & 0b100 != 0 {
-        push("hitfinish", info.additions);
+        out.push(HitSample { name: "hitfinish", bank: info.additions.unwrap_or(point.bank), custom, volume, filename: None });
     }
     if sound_type & 0b10 != 0 {
-        push("hitwhistle", info.additions);
+        out.push(HitSample { name: "hitwhistle", bank: info.additions.unwrap_or(point.bank), custom, volume, filename: None });
     }
     if sound_type & 0b1000 != 0 {
-        push("hitclap", info.additions);
+        out.push(HitSample { name: "hitclap", bank: info.additions.unwrap_or(point.bank), custom, volume, filename: None });
     }
     out
 }
@@ -184,11 +220,18 @@ fn build_placements(game: &GameData, data: &SampleData, t0: f64, t_map_end: f64,
                 // `maxBonusSample`; its LookupNames tail falls back to
                 // "spinnerbonus" when a skin has no -max file).
                 let point = point_at(&data.points, raw.start_time);
+                let file = raw.bank.filename.clone();
                 for (oi, time, large) in &game.spinner_ticks {
                     if *oi == obj.index && *large && *time >= t0 && *time <= t_map_end {
                         out.push(Placement {
                             time: *time,
-                            sample: HitSample { name: "spinnerbonus", bank: point.bank, volume: point.volume },
+                            sample: HitSample {
+                                name: "spinnerbonus",
+                                bank: point.bank,
+                                custom: point.custom_index,
+                                volume: point.volume,
+                                filename: file.clone(),
+                            },
                             x: 256.0,
                             until: None,
                         });
@@ -198,7 +241,13 @@ fn build_placements(game: &GameData, data: &SampleData, t0: f64, t_map_end: f64,
                     if *oi == obj.index && *time >= t0 && *time <= t_map_end {
                         out.push(Placement {
                             time: *time,
-                            sample: HitSample { name: "spinnerbonus-max", bank: point.bank, volume: point.volume },
+                            sample: HitSample {
+                                name: "spinnerbonus-max",
+                                bank: point.bank,
+                                custom: point.custom_index,
+                                volume: point.volume,
+                                filename: file.clone(),
+                            },
                             x: 256.0,
                             until: None,
                         });
@@ -239,7 +288,7 @@ fn build_placements(game: &GameData, data: &SampleData, t0: f64, t_map_end: f64,
                         NestedKind::Tick => {
                             out.push(Placement {
                                 time: t,
-                                sample: HitSample { name: "slidertick", ..obj_normal },
+                                sample: HitSample { name: "slidertick", ..obj_normal.clone() },
                                 x: n.position[0],
                                 until: None,
                             });
@@ -270,12 +319,12 @@ fn build_placements(game: &GameData, data: &SampleData, t0: f64, t_map_end: f64,
                 let dbg = std::env::var("HITSOUND_DEBUG").is_ok();
                 let runs = tracked_runs(game, obj);
                 for sample in slide_loop_samples(&obj_samples, obj_normal, raw.sound_type) {
-                    let len_ms = resolver.clip(sample).map(|w| w.duration_ms()).unwrap_or(0.0);
+                    let len_ms = resolver.clip(&sample).map(|w| w.duration_ms()).unwrap_or(0.0);
                     if len_ms <= 0.0 {
                         continue;
                     }
                     for &(a, b) in &runs {
-                        tile_loop(&mut out, obj, a, b, sample, len_ms, game.rate, t0, t_map_end);
+                        tile_loop(&mut out, obj, a, b, &sample, len_ms, game.rate, t0, t_map_end);
                     }
                 }
                 if dbg {
@@ -299,6 +348,8 @@ fn build_placements(game: &GameData, data: &SampleData, t0: f64, t_map_end: f64,
     // drops to zero the combobreak sample plays if the old combo was > 20,
     // or on the very first break (`AlwaysPlayFirstComboBreak`, default
     // on). Full volume, centered (a plain `SampleInfo`, no balance).
+    // Plain SampleInfos carry no custom index and are not subject to the
+    // UseBeatmapSamples gate — a beatmap-local combobreak.wav serves them.
     {
         let mut first_break = false;
         let mut prev_combo = 0;
@@ -308,7 +359,13 @@ fn build_placements(game: &GameData, data: &SampleData, t0: f64, t_map_end: f64,
                 if e.time >= t0 && e.time <= t_map_end {
                     out.push(Placement {
                         time: e.time,
-                        sample: HitSample { name: "combobreak", bank: Bank::Normal, volume: 100 },
+                        sample: HitSample {
+                            name: "combobreak",
+                            bank: Bank::Normal,
+                            custom: 0,
+                            volume: 100,
+                            filename: None,
+                        },
                         x: 256.0,
                         until: None,
                     });
@@ -329,7 +386,7 @@ fn tile_loop(
     obj: &crate::game::ObjView,
     a: f64,
     b: f64,
-    sample: HitSample,
+    sample: &HitSample,
     len_ms: f64,
     rate: f64,
     t0: f64,
@@ -343,7 +400,7 @@ fn tile_loop(
         if t >= t0 && t <= t_map_end {
             let progress = if obj.duration > 0.0 { (t - obj.start_time) / obj.duration } else { 0.0 };
             let x = obj.slider_ball_at(progress.clamp(0.0, 1.0))[0];
-            out.push(Placement { time: t, sample, x, until: Some(b.min(t_map_end)) });
+            out.push(Placement { time: t, sample: sample.clone(), x, until: Some(b.min(t_map_end)) });
         }
         t += len_ms * rate;
     }
@@ -354,23 +411,29 @@ fn tile_loop(
 fn slider_object_samples(raw: &RawObj, obj: &crate::game::ObjView, data: &SampleData) -> (Vec<HitSample>, HitSample) {
     let head_point = point_at(&data.points, obj.start_time + CONTROL_POINT_LENIENCY + 1.0);
     let obj_samples = resolve_samples(raw.sound_type, &raw.bank, head_point);
-    let obj_normal = obj_samples.iter().find(|s| s.name == "hitnormal").copied().unwrap_or(HitSample {
+    let obj_normal = obj_samples.iter().find(|s| s.name == "hitnormal").cloned().unwrap_or(HitSample {
         name: "hitnormal",
         bank: head_point.bank,
+        custom: head_point.custom_index,
         volume: head_point.volume,
+        filename: None,
     });
     (obj_samples, obj_normal)
 }
 
 /// Looping samples of a tracked slider: `sliderslide` always,
-/// `sliderwhistle` when the object's whistle flag is set.
+/// `sliderwhistle` when the object's whistle flag is set
+/// (`CreateSlidingSamples`: the object's hitnormal/whistle sample with
+/// the name swapped — custom index and filename carry over).
 fn slide_loop_samples(obj_samples: &[HitSample], obj_normal: HitSample, sound_type: u8) -> Vec<HitSample> {
     let mut out = vec![HitSample { name: "sliderslide", ..obj_normal }];
     if sound_type & 0b10 != 0 {
         out.push(HitSample {
             name: "sliderwhistle",
             bank: obj_samples.iter().find(|s| s.name == "hitwhistle").map(|s| s.bank).unwrap_or(obj_normal.bank),
+            custom: obj_normal.custom,
             volume: obj_normal.volume,
+            filename: None,
         });
     }
     out
@@ -422,6 +485,14 @@ fn tracked_runs(game: &GameData, obj: &crate::game::ObjView) -> Vec<(f64, f64)> 
 pub struct LoopSoundEvent {
     pub name: &'static str,
     pub bank: &'static str,
+    /// Custom sample bank index merged per `ApplyTo` (object's own when
+    /// > 0, else the timing point's): ≥1 resolves from the beatmap's own
+    /// sample files, ≥2 adds the numeric lookup suffix.
+    pub custom: i32,
+    /// Explicit .osu hitSample filename on the reference sample
+    /// (`FileHitSampleInfo.With` keeps the file when the name is swapped
+    /// for the loop's) — set = the loop is that beatmap-local file.
+    pub filename: Option<String>,
     /// Beatmap sample volume 0-100 (receiver applies `max(5)` and the
     /// Effect channel volume).
     pub volume: i32,
@@ -441,6 +512,14 @@ pub enum LoopControl {
 }
 
 impl LoopSoundEvent {
+    /// The sound-table key identifying this loop's sample.
+    pub fn slot(&self) -> SampleSlot {
+        match &self.filename {
+            Some(filename) => SampleSlot::File { filename: filename.clone() },
+            None => SampleSlot::Bank { bank: self.bank, name: self.name, custom: self.custom },
+        }
+    }
+
     /// Run audible at map time `t`, if any (spinner runs include their
     /// fade tail).
     pub fn run_at(&self, t: f64) -> Option<usize> {
@@ -506,6 +585,8 @@ pub fn collect_loop_events(game: &GameData, data: &SampleData) -> Vec<LoopSoundE
                     out.push(LoopSoundEvent {
                         name: sample.name,
                         bank: sample.bank.as_str(),
+                        custom: sample.custom,
+                        filename: sample.filename,
                         volume: sample.volume,
                         runs: runs.clone(),
                         control: LoopControl::Slider { object_index: obj.index },
@@ -517,6 +598,8 @@ pub fn collect_loop_events(game: &GameData, data: &SampleData) -> Vec<LoopSoundE
                     out.push(LoopSoundEvent {
                         name: "spinnerspin",
                         bank: lp.sample.bank.as_str(),
+                        custom: lp.sample.custom,
+                        filename: lp.sample.filename.clone(),
                         volume: lp.sample.volume,
                         runs: lp.runs,
                         control: LoopControl::Spin { rotation: lp.rotation, spins_required: lp.spins_required },
@@ -567,8 +650,8 @@ const SPINNERBONUS_MAX: &[u8] = include_bytes!("../assets/sounds/Argon/spinnerbo
 /// LookupNames: "Gameplay/{Bank}-{Name}{Suffix}" → "Gameplay/{Bank}-{Name}".
 /// Suffix lookups need custom sample banks (index ≥ 2), which the
 /// embedded set doesn't provide, so only the plain bank form applies.
-fn sample_clip(sample: HitSample) -> Option<Clip> {
-    let bytes: &[u8] = match (sample.bank.as_str(), sample.name) {
+fn sample_clip(bank: &str, name: &str) -> Option<Clip> {
+    let bytes: &[u8] = match (bank, name) {
         ("normal", "hitnormal") => wav!("normal-hitnormal"),
         ("normal", "hitwhistle") => wav!("normal-hitwhistle"),
         ("normal", "hitfinish") => wav!("normal-hitfinish"),
@@ -600,35 +683,155 @@ fn sample_clip(sample: HitSample) -> Option<Clip> {
 }
 
 // ---------------------------------------------------------------------------
-// Sample resolution: user skin first, embedded ArgonPro fills the gaps
+// Sample resolution: beatmap files → user skin → embedded ArgonPro
 // ---------------------------------------------------------------------------
 
-/// Per-render hitsound resolver — lazer's gameplay sample chain with the
-/// beatmap-skin layer deliberately removed (this renderer never reads
-/// beatmap skins). The USER skin is asked first through lazer's
-/// `LegacySkin.GetSample` name chain (`getLegacyLookupNames`):
-/// `UseCustomSampleBanks` is only ever true for beatmap skins, so for a
-/// user skin the custom-sample-index suffix is always filtered out and
-/// the candidates collapse to the unsuffixed names
-/// `Gameplay/{bank}-{name}` and `Gameplay/{name}` (each expanding to its
-/// last path piece inside [`crate::skin::Skin::get_sample`]), plus the
-/// universal bank-less `{name}`. Every slot the skin leaves open is
-/// filled by the embedded ArgonPro set ([`sample_clip`]) — elements MIX
-/// between the two, exactly one provider per lookup. Both missing (or a
-/// skin file that fails to decode, which lazer treats as a null sample
-/// and walks past) → the slot is silent.
+/// Beatmap-local sample file access — the resource-store side of lazer's
+/// `LegacyBeatmapSkin`. Given a lookup stem ("soft-hitnormal2"), the
+/// implementation resolves the beatmap set's own file, trying the stable
+/// extension order [`SAMPLE_EXTENSIONS`] (stem, `.wav`, `.mp3`, `.ogg`),
+/// case-insensitively. A hit here is authoritative for the slot: 0-byte
+/// files (deliberate silence) and undecodable files must NOT fall
+/// through to the skin — mirrors the skin-layer policy downstream.
+pub trait BeatmapSampleStore {
+    fn sample_path(&self, stem: &str) -> Option<std::path::PathBuf>;
+}
+
+/// Stable's sample extension order (`Skin.RecycleSamples`: "osu-stable
+/// performs audio lookups in order of wav -> mp3 -> ogg"; the bare stem
+/// itself is tried first, as the framework's `GetFilenames` does).
+pub const SAMPLE_EXTENSIONS: &[&str] = &["", "wav", "mp3", "ogg"];
+
+/// `BeatmapSampleStore` over an unpacked beatmap set directory (stable
+/// layout / .osz extraction / renderer `--map` folder). The directory is
+/// scanned once into a lowercase filename → path map, so lookups are
+/// case-insensitive like the game's stores.
+pub struct DirectorySampleStore {
+    by_name: HashMap<String, std::path::PathBuf>,
+}
+
+impl DirectorySampleStore {
+    pub fn new(dir: &Path) -> DirectorySampleStore {
+        let mut by_name = HashMap::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+                by_name.insert(name.to_lowercase(), path);
+            }
+        }
+        DirectorySampleStore { by_name }
+    }
+}
+
+impl BeatmapSampleStore for DirectorySampleStore {
+    fn sample_path(&self, stem: &str) -> Option<std::path::PathBuf> {
+        let stem = stem.replace('\\', "/").to_lowercase();
+        let bare = stem.rsplit('/').next().unwrap_or(&stem).to_string();
+        SAMPLE_EXTENSIONS
+            .iter()
+            .find_map(|ext| {
+                let probe = if ext.is_empty() { bare.clone() } else { format!("{bare}.{ext}") };
+                self.by_name.get(&probe).cloned()
+            })
+            .or_else(|| {
+                // 声明名带子目录前缀而谱面集为平铺文件时的回退(同
+                // VirtualFiles.resolve 的策略)。
+                self.by_name.get(&bare).cloned()
+            })
+    }
+}
+
+/// 谱面层候选名 —— `HitSampleInfo.LookupNames` 在 `UseCustomSampleBanks`
+/// (谱面层)后缀过滤后的形态:
+/// - filename 槽(`FileHitSampleInfo.LookupNames`):[文件名, 去扩展名,
+///   normal-hitnormal, hitnormal](bank 钉在 normal,`ApplyTo` 不覆盖);
+/// - custom ≥ 2:只留 `{bank}-{name}{N}`(后缀强制,不许回退无后缀名);
+/// - custom = 1(含 filename 槽强制的 1):无后缀的 `{bank}-{name}` → `{name}`;
+/// - custom ≤ 0:`UseBeatmapSamples` 为假,谱面层不参与(空表)。
+///   combobreak 是无 bank 的 `SampleInfo`,不经过该门控,恒可查。
+pub fn beatmap_lookup_names(bank: &str, name: &str, custom: i32, filename: Option<&str>) -> Vec<String> {
+    if let Some(file) = filename.filter(|f| !f.is_empty()) {
+        let mut out = vec![file.to_string()];
+        // `Path.ChangeExtension(Filename, null)`:去掉最后一个扩展名。
+        if let Some((stem, _)) = file.rsplit_once('.') {
+            if !stem.is_empty() {
+                out.push(stem.to_string());
+            }
+        }
+        out.push("normal-hitnormal".to_string());
+        out.push("hitnormal".to_string());
+        return out;
+    }
+    if name == "combobreak" {
+        return vec!["combobreak".to_string()];
+    }
+    if custom >= 2 {
+        vec![format!("{bank}-{name}{custom}")]
+    } else if custom == 1 {
+        vec![format!("{bank}-{name}"), name.to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// 皮肤层候选名(`getLegacyLookupNames` 剥后缀 + 通用名收尾)。File 槽
+/// 无后缀不过滤,候选与 LookupNames 全集一致;combobreak 无 bank。
+fn skin_lookup_names(bank: &str, name: &str, filename: Option<&str>) -> Vec<String> {
+    if let Some(file) = filename.filter(|f| !f.is_empty()) {
+        let mut out = vec![file.to_string()];
+        if let Some((stem, _)) = file.rsplit_once('.') {
+            if !stem.is_empty() {
+                out.push(stem.to_string());
+            }
+        }
+        out.push("normal-hitnormal".to_string());
+        out.push("hitnormal".to_string());
+        return out;
+    }
+    if name == "combobreak" {
+        return vec!["Gameplay/combobreak".to_string()];
+    }
+    let mut names = vec![format!("Gameplay/{bank}-{name}"), format!("Gameplay/{name}")];
+    // `SpinnerBonusMaxSampleInfo` strips "-max" back to the plain entry.
+    if let Some(stripped) = name.strip_suffix("-max") {
+        names.push(format!("Gameplay/{bank}-{stripped}"));
+        names.push(format!("Gameplay/{stripped}"));
+    }
+    names
+}
+
+/// Per-render hitsound resolver — lazer's gameplay sample chain:
+/// beatmap-local files first (slots opted in via custom index ≥ 1 or an
+/// explicit filename, `LegacyBeatmapSkin.GetSample`'s `UseBeatmapSamples`
+/// gate), then the USER skin through lazer's `LegacySkin.GetSample` name
+/// chain, then the embedded ArgonPro set filling every open slot —
+/// elements MIX between layers, exactly one provider per lookup. A hit
+/// layer is authoritative: a file that exists but fails to decode (or a
+/// 0-byte placeholder, the map author's way of disabling a sound) is
+/// silence, never a fall-through.
 pub struct SampleResolver<'a> {
     skin: Option<&'a dyn crate::skin::Skin>,
+    beatmap: Option<&'a dyn BeatmapSampleStore>,
     /// `OsuSkinConfiguration.SpinnerFrequencyModulate` (default true): the
     /// spinning loop's playback rate rises with spin progress.
     frequency_modulate: bool,
-    cache: HashMap<(Bank, &'static str), Option<Arc<Clip>>>,
+    cache: HashMap<(Bank, &'static str, i32, Option<String>), Option<Arc<Clip>>>,
 }
 
 impl<'a> SampleResolver<'a> {
     pub fn new(skin: &'a dyn crate::skin::Skin) -> Self {
+        Self::with_beatmap(skin, None)
+    }
+
+    /// The full chain: skin + beatmap-local sample files.
+    pub fn with_beatmap(skin: &'a dyn crate::skin::Skin, beatmap: Option<&'a dyn BeatmapSampleStore>) -> Self {
         SampleResolver {
             skin: skin.is_legacy().then_some(skin),
+            beatmap,
             frequency_modulate: skin
                 .get_config(crate::skin::SkinLookup::Generic("SpinnerFrequencyModulate".into()))
                 .and_then(|v| v.as_bool())
@@ -639,103 +842,173 @@ impl<'a> SampleResolver<'a> {
 
     /// The embedded ArgonPro set alone (no user skin in scope).
     fn builtin() -> SampleResolver<'static> {
-        SampleResolver { skin: None, frequency_modulate: true, cache: HashMap::new() }
+        SampleResolver { skin: None, beatmap: None, frequency_modulate: true, cache: HashMap::new() }
     }
 
-    /// Resolve one sample: user skin file → embedded ArgonPro entry →
-    /// silent. Results (including negatives) are cached per (bank, name).
-    fn clip(&mut self, sample: HitSample) -> Option<Arc<Clip>> {
-        if let Some(hit) = self.cache.get(&(sample.bank, sample.name)) {
+    /// Resolve one sample: beatmap file → user skin file → embedded
+    /// ArgonPro entry → silent. Results (including negatives) are cached
+    /// per (bank, name, custom, filename).
+    fn clip(&mut self, sample: &HitSample) -> Option<Arc<Clip>> {
+        let key = (sample.bank, sample.name, sample.custom, sample.filename.clone());
+        if let Some(hit) = self.cache.get(&key) {
             return hit.clone();
         }
-        let mut resolved = self
-            .skin
-            .and_then(|skin| lookup_candidates(sample.bank.as_str(), sample.name).iter().find_map(|n| skin.get_sample(n)));
-        // `SpinnerBonusMaxSampleInfo.LookupNames`: the "-max" suffix
-        // strips back to the plain entry — a skin with only
-        // "spinnerbonus" serves the max spins too.
-        if resolved.is_none()
-            && let Some(stripped) = sample.name.strip_suffix("-max")
-        {
-            resolved = self
-                .skin
-                .and_then(|skin| lookup_candidates(sample.bank.as_str(), stripped).iter().find_map(|n| skin.get_sample(n)));
-        }
-        let clip = match resolved {
-            // 皮肤提供了该槽位 = 权威:解码失败(含 0 字节禁用占位)即静音,
-            // 不回退内置默认
-            Some(path) => match decode_sample_file(&path) {
-                Ok(clip) => Some(Arc::new(clip)),
-                Err(e) => {
-                    eprintln!(
-                        "hitsound: skin sample {} not decodable ({}), treated as disabled by the skin",
-                        path.display(),
-                        e
-                    );
-                    None
+        let bank = sample.bank.as_str();
+        let filename = sample.filename.as_deref();
+        let mut clip = None;
+        // 1. Beatmap-local layer (`LegacyBeatmapSkin`): only slots opted
+        //    in (custom ≥ 1 / filename / plain SampleInfo); a found file
+        //    ends the whole chain, decode failure included.
+        if let Some(store) = self.beatmap {
+            for cand in beatmap_lookup_names(bank, sample.name, sample.custom, filename) {
+                if let Some(path) = store.sample_path(&cand) {
+                    clip = match decode_sample_file(&path) {
+                        Ok(c) => Some(Arc::new(c)),
+                        Err(e) => {
+                            eprintln!(
+                                "hitsound: beatmap sample {} not decodable ({}), treated as disabled by the map",
+                                path.display(),
+                                e
+                            );
+                            None
+                        }
+                    };
+                    break;
                 }
-            },
-            // 皮肤未提供该槽位:内置默认
-            None => sample_clip(sample).map(Arc::new),
-        };
+            }
+        }
+        // 2. User skin (suffix stripped, File slots look up the raw name).
+        if clip.is_none() {
+            let mut names = skin_lookup_names(bank, sample.name, filename);
+            if filename.is_none() && let Some(stripped) = sample.name.strip_suffix("-max") {
+                names.extend(skin_lookup_names(bank, stripped, None));
+            }
+            let resolved = self
+                .skin
+                .and_then(|skin| names.iter().find_map(|n| skin.get_sample(n)));
+            clip = match resolved {
+                // 皮肤提供了该槽位 = 权威:解码失败(含 0 字节禁用占位)即静音,
+                // 不回退内置默认
+                Some(path) => match decode_sample_file(&path) {
+                    Ok(c) => Some(Arc::new(c)),
+                    Err(e) => {
+                        eprintln!(
+                            "hitsound: skin sample {} not decodable ({}), treated as disabled by the skin",
+                            path.display(),
+                            e
+                        );
+                        None
+                    }
+                },
+                // 皮肤未提供该槽位:内置默认(File 槽按 normal-hitnormal,
+                // "-max" 剥回普通条目)
+                None => {
+                    let name = if filename.is_some() {
+                        "hitnormal"
+                    } else {
+                        sample.name.strip_suffix("-max").unwrap_or(sample.name)
+                    };
+                    sample_clip(if filename.is_some() { "normal" } else { bank }, name).map(Arc::new)
+                }
+            };
+        }
         if clip.is_none() {
             eprintln!(
-                "hitsound warning: no sample for {}-{} in the skin or the default set, its hitsounds are silent",
-                sample.bank.as_str(),
-                sample.name
+                "hitsound warning: no sample for {}-{}{} in the beatmap, the skin or the default set, its hitsounds are silent",
+                bank,
+                sample.name,
+                sample.custom.max(0)
             );
         }
-        self.cache.insert((sample.bank, sample.name), clip.clone());
+        self.cache.insert(key, clip.clone());
         clip
     }
 
-    /// Distinct (bank, name) slots resolved so far (debug output).
+    /// Distinct slots resolved so far (debug output).
     fn distinct(&self) -> usize {
         self.cache.len()
     }
 }
 
-/// `HitSampleInfo.LookupNames` order for a user legacy skin (suffix
-/// always filtered: `UseCustomSampleBanks` is beatmap-skin-only).
-/// `Gameplay/combobreak` is a plain `SampleInfo` with no bank.
-fn lookup_candidates(bank: &str, name: &str) -> Vec<String> {
-    if name == "combobreak" {
-        vec!["Gameplay/combobreak".to_string()]
-    } else {
-        vec![format!("Gameplay/{bank}-{name}"), format!("Gameplay/{name}")]
+/// Bytes-level resolution for live-playback hosts that own their audio
+/// engine (decode the returned WAV themselves): the lazer chain with the
+/// beatmap-local layer enabled — beatmap set files (slots opted in via
+/// custom index ≥ 1 or an explicit filename) first, then the user skin
+/// under the same mix policy (skin WAVs pass through untouched, mp3/ogg
+/// decode in-process via symphonia), else the embedded ArgonPro entry.
+/// A hit layer is authoritative: 0-byte placeholders and read/decode
+/// failures mean silence, never a fall-through to the next layer.
+pub fn resolve_sample_bytes(
+    slot: &SampleSlot,
+    beatmap: Option<&dyn BeatmapSampleStore>,
+    skin: &dyn crate::skin::Skin,
+) -> Option<Vec<u8>> {
+    match slot {
+        SampleSlot::File { filename } => {
+            resolve_sample_parts("normal", "hitnormal", 1, Some(filename), beatmap, skin)
+        }
+        SampleSlot::Bank { bank, name, custom } => {
+            resolve_sample_parts(bank, name, *custom, None, beatmap, skin)
+        }
     }
 }
 
-/// Bytes-level resolution for live-playback hosts that own their audio
-/// engine (decode the returned WAV themselves): the user skin's file
-/// first under the same mix policy (skin WAVs pass through untouched,
-/// mp3/ogg decode in-process via symphonia), else the embedded ArgonPro
-/// entry.
-pub fn resolve_sample_wav(bank: &str, name: &str, skin: &dyn crate::skin::Skin) -> Option<Vec<u8>> {
-    if skin.is_legacy() {
-        let mut names = lookup_candidates(bank, name);
-        // `SpinnerBonusMaxSampleInfo` strips "-max" back to the plain
-        // entry (`SampleResolver::clip` mirrors this).
-        if let Some(stripped) = name.strip_suffix("-max") {
-            names.extend(lookup_candidates(bank, stripped));
+/// [`resolve_sample_bytes`] 的参数形态(事件字段直接传入,免构造)。
+pub fn resolve_sample_parts(
+    bank: &str,
+    name: &str,
+    custom: i32,
+    filename: Option<&str>,
+    beatmap: Option<&dyn BeatmapSampleStore>,
+    skin: &dyn crate::skin::Skin,
+) -> Option<Vec<u8>> {
+    // 1. Beatmap-local files (`LegacyBeatmapSkin` layer).
+    if let Some(store) = beatmap {
+        for cand in beatmap_lookup_names(bank, name, custom, filename) {
+            if let Some(path) = store.sample_path(&cand) {
+                return sample_file_bytes(&path);
+            }
         }
-        let path = names.iter().find_map(|n| skin.get_sample(n));
-        if let Some(path) = path {
+    }
+    // 2. User skin (suffix stripped).
+    if skin.is_legacy() {
+        let mut names = skin_lookup_names(bank, name, filename);
+        if filename.is_none() && let Some(stripped) = name.strip_suffix("-max") {
+            names.extend(skin_lookup_names(bank, stripped, None));
+        }
+        if let Some(path) = names.iter().find_map(|n| skin.get_sample(n)) {
             // 皮肤提供了该采样槽位 = 权威。0 字节占位是皮肤作者**有意禁用**
             // 该音效的惯用手法:读出/解码失败直接静音,绝不回退内置默认
             //(调用方对空字节/None 都按缺失处理,天然静音)。
-            let is_wav = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| e.eq_ignore_ascii_case("wav"));
-            if is_wav {
-                return std::fs::read(&path).ok();
-            }
-            return decode_wav_44k(&path);
+            return sample_file_bytes(&path);
         }
     }
-    // 皮肤未提供该槽位(或非 legacy 皮肤):回退内置默认
+    // 3. 皮肤未提供该槽位(或非 legacy 皮肤):回退内置默认(File 槽按
+    // normal-hitnormal,"-max" 剥回普通条目)
+    let name = if filename.is_some() { "hitnormal" } else { name.strip_suffix("-max").unwrap_or(name) };
+    let bank = if filename.is_some() { "normal" } else { bank };
     sample_bytes(bank, name).map(|b| b.to_vec())
+}
+
+/// 采样文件 → WAV 字节:wav 原样透传(0 字节占位 = Some(empty) → 静音),
+/// mp3/ogg/flac 进程内 symphonia 解码(失败 None = 静音)。
+fn sample_file_bytes(path: &Path) -> Option<Vec<u8>> {
+    let is_wav = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("wav"));
+    if is_wav {
+        std::fs::read(path).ok()
+    } else {
+        decode_wav_44k(path)
+    }
+}
+
+/// Bytes-level resolution without the beatmap-local layer (user skin →
+/// embedded ArgonPro) — the pre-beatmap-samples behavior, kept for hosts
+/// that resolve before a beatmap store exists.
+pub fn resolve_sample_wav(bank: &str, name: &str, skin: &dyn crate::skin::Skin) -> Option<Vec<u8>> {
+    resolve_sample_parts(bank, name, 0, None, None, skin)
 }
 
 /// Decode a skin sample file: WAV in-process ([`decode_wav`]); anything
@@ -987,21 +1260,11 @@ fn place(buf: &mut [f32], clip: &Clip, start_sec: f64, gl: f32, gr: f32, until_s
     }
 }
 
-/// Renders the hitsound track for the exported range and encodes it as a
-/// PCM16 stereo WAV. `t0` is the first output frame's map time,
-/// `wall_secs` the output video's duration in seconds; the track spans
-/// exactly that wall window so it muxes 1:1 with the video.
-/// `master_gain` scales the whole bus (`--hitsounds-volume`).
-///
-/// Loudness follows the game's defaults: samples play at their authored
-/// level (beatmap volume × the sample's mastering, Effect channel 1.0),
-/// no bus normalization. Stacked hits sum in float and the encoder's
-/// soft limiter replaces the DAC clipping the game would do.
 /// A one-shot hitsound event on the map timeline, for live preview
 /// playback (fire when the playhead crosses `time`). Loop sounds
 /// (sliderslide/sliderwhistle/spinnerspin) are separate: see
 /// [`collect_loop_events`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct HitsoundEvent {
     /// Map time in ms (judgement time).
     pub time: f64,
@@ -1010,11 +1273,40 @@ pub struct HitsoundEvent {
     pub name: &'static str,
     /// Sample bank: "normal"/"soft"/"drum".
     pub bank: &'static str,
+    /// Custom sample bank index (`ApplyTo` merge): ≥1 = resolve from the
+    /// beatmap's own sample files, ≥2 = `{bank}-{name}{N}` suffix lookup.
+    pub custom: i32,
+    /// Explicit .osu hitSample filename override (`FileHitSampleInfo`):
+    /// when set, the sample is this beatmap-local file and the banked
+    /// chain does not apply.
+    pub filename: Option<String>,
     /// Beatmap sample volume 0-100 (apply `max(5)` and the Effect
     /// channel volume on the receiver's side).
     pub volume: i32,
     /// Playfield X (0..512) for stereo balance.
     pub pan_x: f32,
+}
+
+/// Sample-slot identity for downstream sound tables: everything needed
+/// to run the lazer lookup chain (`HitSampleInfo.LookupNames`) minus the
+/// per-hit volume/pan.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum SampleSlot {
+    /// A banked gameplay sample: bank × name × custom sample bank index
+    /// (0/1 = unsuffixed lookup, ≥2 = `{bank}-{name}{N}`).
+    Bank { bank: &'static str, name: &'static str, custom: i32 },
+    /// An explicit .osu hitSample filename (`FileHitSampleInfo`).
+    File { filename: String },
+}
+
+impl HitsoundEvent {
+    /// The sound-table key identifying this event's sample.
+    pub fn slot(&self) -> SampleSlot {
+        match &self.filename {
+            Some(filename) => SampleSlot::File { filename: filename.clone() },
+            None => SampleSlot::Bank { bank: self.bank, name: self.name, custom: self.custom },
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1126,10 +1418,15 @@ fn spin_loop_for(game: &GameData, data: &SampleData, obj: &crate::game::ObjView,
     }
     let point = point_at(&data.points, raw.start_time);
     Some(SpinLoop {
+        // `referenceSample.With("spinnerspin")`: the .osu line's first
+        // sample's bank/volume/custom index (ApplyTo merge) with the
+        // name swapped; a filename reference keeps its file.
         sample: HitSample {
             name: "spinnerspin",
             bank: raw.bank.normal.unwrap_or(point.bank),
+            custom: if raw.bank.custom_index > 0 { raw.bank.custom_index } else { point.custom_index },
             volume: if raw.bank.volume > 0 { raw.bank.volume } else { point.volume },
+            filename: raw.bank.filename.clone(),
         },
         runs,
         rotation,
@@ -1162,7 +1459,7 @@ fn rotation_at(rot: &[(f64, f32)], t: f64) -> f64 {
 /// resolution via the resolver, then the pure [`synth_spin_loop`]).
 fn render_spin_loops(buf: &mut [f32], loops: &[SpinLoop], resolver: &mut SampleResolver, t0: f64, rate: f64) {
     for lp in loops {
-        let Some(clip) = resolver.clip(lp.sample) else { continue };
+        let Some(clip) = resolver.clip(&lp.sample) else { continue };
         synth_spin_loop(buf, &clip.data, lp, resolver.frequency_modulate, t0, rate);
     }
 }
@@ -1231,6 +1528,8 @@ pub fn collect_events(game: &GameData, data: &SampleData) -> Vec<HitsoundEvent> 
             time: p.time,
             name: p.sample.name,
             bank: p.sample.bank.as_str(),
+            custom: p.sample.custom,
+            filename: p.sample.filename,
             volume: p.sample.volume,
             pan_x: p.x,
         })
@@ -1274,8 +1573,34 @@ pub fn sample_bytes(bank: &str, name: &str) -> Option<&'static [u8]> {
     Some(bytes)
 }
 
+/// Renders the hitsound track for the exported range and encodes it as a
+/// PCM16 stereo WAV. `t0` is the first output frame's map time,
+/// `wall_secs` the output video's duration in seconds; the track spans
+/// exactly that wall window so it muxes 1:1 with the video.
+/// `master_gain` scales the whole bus (`--hitsounds-volume`).
+///
+/// Loudness follows the game's defaults: samples play at their authored
+/// level (beatmap volume × the sample's mastering, Effect channel 1.0),
+/// no bus normalization. Stacked hits sum in float and the encoder's
+/// soft limiter replaces the DAC clipping the game would do.
 pub fn render_track_wav(game: &GameData, data: &SampleData, t0: f64, wall_secs: f64, rate: f64, master_gain: f32, skin: &dyn crate::skin::Skin) -> Vec<u8> {
-    render_track(game, data, t0, wall_secs, rate, master_gain, true, skin)
+    render_track(game, data, t0, wall_secs, rate, master_gain, true, skin, None)
+}
+
+/// [`render_track_wav`] with the beatmap-local sample layer enabled: the
+/// set folder's own sample files take priority per slot over the skin
+/// (lazer `LegacyBeatmapSkin`). Pass `None` to skip the layer.
+pub fn render_track_wav_with_beatmap(
+    game: &GameData,
+    data: &SampleData,
+    t0: f64,
+    wall_secs: f64,
+    rate: f64,
+    master_gain: f32,
+    skin: &dyn crate::skin::Skin,
+    beatmap: Option<&dyn BeatmapSampleStore>,
+) -> Vec<u8> {
+    render_track(game, data, t0, wall_secs, rate, master_gain, true, skin, beatmap)
 }
 
 /// `render_track_wav` without the bus soft limiter: the sum stays
@@ -1287,12 +1612,27 @@ pub fn render_track_wav(game: &GameData, data: &SampleData, t0: f64, wall_secs: 
 /// float-sum mix only needs the headroom so PCM16 can carry stacks
 /// above unity.
 pub fn render_track_wav_linear(game: &GameData, data: &SampleData, t0: f64, wall_secs: f64, rate: f64, scale: f32, skin: &dyn crate::skin::Skin) -> Vec<u8> {
-    render_track(game, data, t0, wall_secs, rate, scale, false, skin)
+    render_track(game, data, t0, wall_secs, rate, scale, false, skin, None)
 }
 
-fn render_track(game: &GameData, data: &SampleData, t0: f64, wall_secs: f64, rate: f64, gain: f32, limit: bool, skin: &dyn crate::skin::Skin) -> Vec<u8> {
+/// [`render_track_wav_linear`] with the beatmap-local sample layer
+/// enabled (see [`render_track_wav_with_beatmap`]).
+pub fn render_track_wav_linear_with_beatmap(
+    game: &GameData,
+    data: &SampleData,
+    t0: f64,
+    wall_secs: f64,
+    rate: f64,
+    scale: f32,
+    skin: &dyn crate::skin::Skin,
+    beatmap: Option<&dyn BeatmapSampleStore>,
+) -> Vec<u8> {
+    render_track(game, data, t0, wall_secs, rate, scale, false, skin, beatmap)
+}
+
+fn render_track(game: &GameData, data: &SampleData, t0: f64, wall_secs: f64, rate: f64, gain: f32, limit: bool, skin: &dyn crate::skin::Skin, beatmap: Option<&dyn BeatmapSampleStore>) -> Vec<u8> {
     let t_map_end = t0 + wall_secs * rate * 1000.0;
-    let mut resolver = SampleResolver::new(skin);
+    let mut resolver = SampleResolver::with_beatmap(skin, beatmap);
     let placements = build_placements(game, &data, t0, t_map_end, &mut resolver);
     if std::env::var("HITSOUND_DEBUG").is_ok() {
         eprintln!("hitsound debug: parsed {} objects (game {}), {} points, {} placements in [{},{}]",
@@ -1306,7 +1646,7 @@ fn render_track(game: &GameData, data: &SampleData, t0: f64, wall_secs: f64, rat
     // decode warns once and drops only its own placements (a silent
     // `continue` here hid a 24-bit asset mismatch before).
     for p in &placements {
-        let Some(clip) = resolver.clip(p.sample) else {
+        let Some(clip) = resolver.clip(&p.sample) else {
             continue;
         };
         let volume = p.sample.volume.max(MINIMUM_SAMPLE_VOLUME) as f32 / 100.0;
@@ -1459,6 +1799,7 @@ mod zero_byte_skin_tests {
     }
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1483,8 +1824,7 @@ mod tests {
     /// The API-level regression: soft hitnormal resolves to a playable clip.
     #[test]
     fn soft_hitnormal_resolves_to_clip() {
-        let sample = HitSample { name: "hitnormal", bank: Bank::Soft, volume: 100 };
-        assert!(sample_clip(sample).is_some());
+        assert!(sample_clip("soft", "hitnormal").is_some());
     }
 
     /// Samples land sample-for-sample at their natural rate — rate mods
@@ -1525,23 +1865,23 @@ mod tests {
         assert!(skin.is_legacy());
         let mut resolver = SampleResolver::new(&skin);
 
-        let whistled = resolver.clip(HitSample { name: "hitwhistle", bank: Bank::Normal, volume: 100 }).unwrap();
+        let whistled = resolver.clip(&HitSample { name: "hitwhistle", bank: Bank::Normal, custom: 0, volume: 100, filename: None }).unwrap();
         assert!((45.0..55.0).contains(&whistled.duration_ms()), "skin file wins, got {}ms", whistled.duration_ms());
-        let builtin_whistle = sample_clip(HitSample { name: "hitwhistle", bank: Bank::Normal, volume: 100 }).unwrap();
+        let builtin_whistle = sample_clip("normal", "hitwhistle").unwrap();
         assert!(builtin_whistle.duration_ms() > 100.0);
 
         // The skin has no drum-hitfinish: the embedded ArgonPro copy fills it.
-        let finish = resolver.clip(HitSample { name: "hitfinish", bank: Bank::Drum, volume: 100 }).unwrap();
-        assert_eq!(finish.duration_ms(), sample_clip(HitSample { name: "hitfinish", bank: Bank::Drum, volume: 100 }).unwrap().duration_ms());
+        let finish = resolver.clip(&HitSample { name: "hitfinish", bank: Bank::Drum, custom: 0, volume: 100, filename: None }).unwrap();
+        assert_eq!(finish.duration_ms(), sample_clip("drum", "hitfinish").unwrap().duration_ms());
 
         // Universal bank-less file serves every bank's hitclap (lazer's
         // `Gameplay/{Name}` + raw-name tail of `getLegacyLookupNames`).
-        let clap = resolver.clip(HitSample { name: "hitclap", bank: Bank::Soft, volume: 100 }).unwrap();
+        let clap = resolver.clip(&HitSample { name: "hitclap", bank: Bank::Soft, custom: 0, volume: 100, filename: None }).unwrap();
         assert!((45.0..55.0).contains(&clap.duration_ms()));
 
         // Nothing provides this: silent, and cached as such.
-        assert!(resolver.clip(HitSample { name: "nosuchsound", bank: Bank::Soft, volume: 100 }).is_none());
-        assert!(resolver.clip(HitSample { name: "nosuchsound", bank: Bank::Soft, volume: 100 }).is_none());
+        assert!(resolver.clip(&HitSample { name: "nosuchsound", bank: Bank::Soft, custom: 0, volume: 100, filename: None }).is_none());
+        assert!(resolver.clip(&HitSample { name: "nosuchsound", bank: Bank::Soft, custom: 0, volume: 100, filename: None }).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1551,8 +1891,8 @@ mod tests {
     fn resolver_builtin_skin_uses_embedded_set() {
         let skin = crate::skin::load_skin(None).unwrap();
         let mut resolver = SampleResolver::new(&skin);
-        let clip = resolver.clip(HitSample { name: "hitnormal", bank: Bank::Normal, volume: 100 }).unwrap();
-        let builtin = sample_clip(HitSample { name: "hitnormal", bank: Bank::Normal, volume: 100 }).unwrap();
+        let clip = resolver.clip(&HitSample { name: "hitnormal", bank: Bank::Normal, custom: 0, volume: 100, filename: None }).unwrap();
+        let builtin = sample_clip("normal", "hitnormal").unwrap();
         assert_eq!(clip.duration_ms(), builtin.duration_ms());
     }
 
@@ -1562,8 +1902,7 @@ mod tests {
     #[test]
     fn spinner_samples_resolve_from_argon_layer() {
         for name in ["spinnerspin", "spinnerbonus", "spinnerbonus-max"] {
-            let sample = HitSample { name, bank: Bank::Normal, volume: 100 };
-            assert!(sample_clip(sample).is_some(), "{name} missing from the embedded set");
+            assert!(sample_clip("normal", name).is_some(), "{name} missing from the embedded set");
         }
     }
 
@@ -1648,7 +1987,7 @@ mod tests {
         // Constant rotation rate: 144 deg/s -> progress 0.4/s with
         // spins_required = 1 (stays under the 2.27x frequency cap).
         let lp = SpinLoop {
-            sample: HitSample { name: "spinnerspin", bank: Bank::Normal, volume: 100 },
+            sample: HitSample { name: "spinnerspin", bank: Bank::Normal, custom: 0, volume: 100, filename: None },
             runs: vec![(100.0, 900.0)],
             rotation: (0..=20).map(|i| (i as f64 * 100.0, i as f32 * 14.4)).collect(),
             spins_required: 1.0,
@@ -1685,5 +2024,128 @@ mod tests {
         // Later window runs faster: [700ms, 900ms] -> ratio ~0.71..0.78.
         let z2 = zcr(&buf, sr * 7 / 10, sr * 9 / 10);
         assert!(z2 > z + 30.0, "pitch rises with progress: {z} -> {z2}");
+    }
+}
+
+#[cfg(test)]
+mod beatmap_layer_tests {
+    use super::*;
+
+    /// 谱面层候选名:`UseCustomSampleBanks` 后缀强制(≥2 只留带后缀名)、
+    /// custom=1 无后缀、custom=0 不参与、filename 槽与 combobreak 的特例。
+    #[test]
+    fn beatmap_lookup_names_follow_lazer_chain() {
+        assert_eq!(
+            beatmap_lookup_names("soft", "hitnormal", 2, None),
+            vec!["soft-hitnormal2".to_string()],
+            "custom ≥ 2:只留带后缀名,不回退无后缀"
+        );
+        assert_eq!(
+            beatmap_lookup_names("soft", "hitnormal", 1, None),
+            vec!["soft-hitnormal".to_string(), "hitnormal".to_string()]
+        );
+        assert!(beatmap_lookup_names("soft", "hitnormal", 0, None).is_empty(), "custom=0:UseBeatmapSamples 为假,谱面层不参与");
+        assert_eq!(beatmap_lookup_names("normal", "combobreak", 0, None), vec!["combobreak".to_string()]);
+        assert_eq!(
+            beatmap_lookup_names("normal", "hitnormal", 1, Some("tickle.mp3")),
+            vec!["tickle.mp3".to_string(), "tickle".to_string(), "normal-hitnormal".to_string(), "hitnormal".to_string()]
+        );
+    }
+
+    /// 层级优先级:谱面文件(参与的槽位)> 用户皮肤 > 内置;命中即权威
+    /// (0 字节 = 静音,不跨层回退);custom=0 的谱面文件被无视。
+    #[test]
+    fn beatmap_files_layer_over_skin_and_builtin() {
+        let dir = std::env::temp_dir().join(format!("orr_beatmap_samples_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 45ms / 70ms 近静音:时长即可区分每一层提供的字节。
+        let short = encode_wav(&vec![0.01f32; 993], false); // ~45ms
+        let mid = encode_wav(&vec![0.01f32; 1546], false); // ~70ms
+        std::fs::write(dir.join("soft-hitnormal2.wav"), &short).unwrap();
+        std::fs::write(dir.join("soft-hitnormal.wav"), &mid).unwrap();
+        std::fs::write(dir.join("soft-hitclap2.wav"), b"").unwrap(); // 0 字节占位
+        std::fs::write(dir.join("tickle.wav"), &short).unwrap();
+        let store = DirectorySampleStore::new(&dir);
+
+        // 皮肤:提供自己的 soft-hitnormal / soft-hitclap。
+        let skin_dir = std::env::temp_dir().join(format!("orr_beatmap_skin_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&skin_dir);
+        std::fs::create_dir_all(&skin_dir).unwrap();
+        let skin_hit = encode_wav(&vec![0.02f32; 3085], false); // ~140ms,与上面都不同
+        std::fs::write(skin_dir.join("soft-hitnormal.wav"), &skin_hit).unwrap();
+        std::fs::write(skin_dir.join("soft-hitclap.wav"), &skin_hit).unwrap();
+        std::fs::write(skin_dir.join("skin.ini"), "[General]\nVersion: 2.5\n").unwrap();
+        let skin = crate::skin::load_skin(Some(&skin_dir)).unwrap();
+
+        let ms = |bytes: &Vec<u8>| decode_wav(bytes).map(|c| c.duration_ms()).unwrap_or(0.0);
+
+        // custom=2:谱面 soft-hitnormal2(45ms)压过皮肤的无后缀文件。
+        let r = resolve_sample_parts("soft", "hitnormal", 2, None, Some(&store), &skin).unwrap();
+        assert!((10.0..12.0).contains(&ms(&r)), "custom=2 应命中谱面带后缀文件: {:.0}ms", ms(&r));
+
+        // custom=1:谱面无后缀 soft-hitnormal(70ms)压过皮肤(140ms)。
+        let r = resolve_sample_parts("soft", "hitnormal", 1, None, Some(&store), &skin).unwrap();
+        assert!((16.0..19.0).contains(&ms(&r)), "custom=1 应命中谱面无后缀文件: {:.0}ms", ms(&r));
+
+        // custom=0:谱面文件不参与,皮肤(140ms)接管。
+        let r = resolve_sample_parts("soft", "hitnormal", 0, None, Some(&store), &skin).unwrap();
+        assert!((34.0..36.0).contains(&ms(&r)), "custom=0 应由皮肤提供: {:.0}ms", ms(&r));
+
+        // custom=3:谱面没有 soft-hitnormal3 → 皮肤剥后缀接管(140ms)。
+        let r = resolve_sample_parts("soft", "hitnormal", 3, None, Some(&store), &skin).unwrap();
+        assert!((34.0..36.0).contains(&ms(&r)), "缺失的后缀文件应剥后缀落到皮肤: {:.0}ms", ms(&r));
+
+        // 0 字节谱面占位 = 权威静音(不回退皮肤/内置)。
+        let r = resolve_sample_parts("soft", "hitclap", 2, None, Some(&store), &skin);
+        assert!(r.map(|b| b.is_empty()).unwrap_or(false), "0 字节占位应静音");
+
+        // filename 槽:谱面 tickle.wav 直接命中。
+        let r = resolve_sample_parts("normal", "hitnormal", 1, Some("tickle.wav"), Some(&store), &skin).unwrap();
+        assert!((10.0..12.0).contains(&ms(&r)), "filename 槽应命中谱面文件: {:.0}ms", ms(&r));
+
+        // filename 槽缺失:剥扩展名也 miss → 内置 normal-hitnormal(非空)。
+        let r = resolve_sample_parts("normal", "hitnormal", 1, Some("nosuch.ogg"), Some(&store), &skin);
+        assert!(r.is_some_and(|b| !b.is_empty()), "filename 缺失应回退内置 hitnormal");
+
+        // 无皮肤参与的非 legacy 内置皮肤同样工作(store 单独在场)。
+        let argon = crate::skin::load_skin(None).unwrap();
+        let r = resolve_sample_parts("soft", "hitnormal", 2, None, Some(&store), &argon).unwrap();
+        assert!((10.0..12.0).contains(&ms(&r)));
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&skin_dir).ok();
+    }
+
+    /// 解析 → 事件:timing point sampleIndex 与对象 hitSample 的
+    /// customIndex 合并(ApplyTo 语义),filename 槽以 File 形态出现在
+    /// 事件里。
+    #[test]
+    fn collect_events_carries_custom_index_and_filename() {
+        let map = "osu file format v14\n\
+                   \n[General]\nMode: 0\n\
+                   \n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:8\nSliderMultiplier:1.8\nSliderTickRate:1\n\
+                   \n[TimingPoints]\n500,400,4,2,2,45,1,0\n\
+                   \n[HitObjects]\n\
+                   100,100,1000,1,0,0:0:2:60:\n\
+                   200,100,1200,1,0,0:0:0:80:tickle.wav\n";
+        let dir = std::env::temp_dir().join(format!("orr_custom_idx_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("custom.osu");
+        std::fs::write(&path, map).unwrap();
+        let game = crate::game::load_autoplay(path.to_str().unwrap(), 0, false, false).unwrap();
+
+        let events = collect_events(&game, &game.sample_data);
+        let first = events.iter().find(|e| e.time == 1000.0).expect("object 1 judged");
+        assert_eq!(first.bank, "soft", "bank 继承 timing point(sampleSet=2)");
+        assert_eq!(first.custom, 2, "对象 customIndex=2 覆盖点级");
+        assert_eq!(first.volume, 60, "对象 volume 覆盖点级");
+        assert_eq!(first.slot(), SampleSlot::Bank { bank: "soft", name: "hitnormal", custom: 2 });
+
+        let second = events.iter().find(|e| e.time == 1200.0).expect("object 2 judged");
+        assert_eq!(second.custom, 1, "filename 槽强制 custom=1");
+        assert_eq!(second.volume, 80);
+        assert_eq!(second.slot(), SampleSlot::File { filename: "tickle.wav".to_string() });
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
