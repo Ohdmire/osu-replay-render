@@ -36,6 +36,12 @@
 //!                          beatmap ships none
 //!   --guides [on|off]      UR bar window guide lines (default on)
 //!   --pp [on|off]          Live PP counter (default on)
+//!   --hit-anim [on|off]    osu! hit animations (default on; off = the
+//!                          reduced-animation mode, hit circles fade over
+//!                          60ms instead of the pop pieces)
+//!   --offset-heatmap       Live hit-offset heatmap overlay (default
+//!                          off): the results screen's AccuracyHeatmap
+//!                          accumulating over gameplay
 //!   --hd [auto|on|off]     Hidden visual override (default auto: follow the
 //!                          replay's own mods)
 //!   --bg [on|off]          Beatmap background image (default on)
@@ -153,6 +159,14 @@ struct Options {
     /// default the skin's own score/accuracy/combo/health/key pieces are
     /// used when it provides them.
     argon_hud: bool,
+    /// osu! hit animations (`--hit-anim [on|off]`, default on = lazer).
+    /// Off = the reduced-animation mode (#38371): judged-hit circles
+    /// fade out over 60ms instead of the pop animations.
+    hit_anim: bool,
+    /// Live hit-offset heatmap overlay (`--offset-heatmap`, default
+    /// off): the results screen's `AccuracyHeatmap` accumulating over
+    /// gameplay at the bottom centre.
+    offset_heatmap: bool,
     /// Seconds of the (static, expanded) results screen appended after
     /// gameplay (`--results <secs|off>`; default 4, `off` = 0).
     results: f64,
@@ -199,6 +213,8 @@ struct ConfigJson {
     master_volume: Option<f32>,
     skin_colours: Option<bool>,
     argon_hud: Option<bool>,
+    hit_anim: Option<bool>,
+    offset_heatmap: Option<bool>,
     results: Option<f64>,
     results_only: Option<bool>,
     avatar: Option<String>,
@@ -361,6 +377,8 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
         master_volume: 0.6,
         skin_colours: false,
         argon_hud: false,
+        hit_anim: true,
+        offset_heatmap: false,
         results: 4.0,
         results_only: false,
         avatar: None,
@@ -548,6 +566,12 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
             }
             "--argon-hud" => {
                 opts.argon_hud = true;
+            }
+            "--hit-anim" => {
+                opts.hit_anim = parse_on_off(&args, &mut i, "hit-anim")?;
+            }
+            "--offset-heatmap" => {
+                opts.offset_heatmap = parse_on_off(&args, &mut i, "offset-heatmap")?;
             }
             "--results" => {
                 i += 1;
@@ -944,6 +968,8 @@ fn main() {
     state.hud.visible = opts.hud;
     state.hud.pp_display = opts.pp;
     state.hud.argon_hud = opts.argon_hud;
+    state.hit_animations = opts.hit_anim;
+    state.hud.offset_heatmap = opts.offset_heatmap;
     state.bg_opacity = if has_bg && opts.bg { Some(opts.bg_opacity) } else { None };
     // 任一层(元素/视频)激活即画故事板合成槽位;亮度跟随背景(--bg off
     // 时全亮 1.0)。

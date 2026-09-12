@@ -261,6 +261,12 @@ pub struct HudState {
     ur_processed: usize,
     /// Whether the whole UR bar (ticks/marker/arrow/number) renders.
     pub ur_bar: bool,
+    /// Live hit-offset heatmap overlay (the results screen's
+    /// `AccuracyHeatmap` as a gameplay HUD element): accumulates every
+    /// circle judgement up to the current time — green dots inside the
+    /// inner circle (position offset relative to the approach
+    /// direction), red x-marks outside (misses). Default off.
+    pub offset_heatmap: bool,
     /// Whether the UR bar's window guide lines (colour axis) render
     /// (only visible when `ur_bar` is on).
     pub ur_guides: bool,
@@ -324,6 +330,7 @@ impl HudState {
             ur_arrow_anim: None,
             ur_processed: 0,
             ur_bar: true,
+            offset_heatmap: false,
             ur_guides: true,
             key_overlay: true,
             keys: [KeyAnim::new(), KeyAnim::new(), KeyAnim::new()],
@@ -676,6 +683,11 @@ impl HudState {
             self.draw_ur_bar(game, assets, list, m, t);
         }
 
+        // --- Live hit-offset heatmap (`AccuracyHeatmap` overlay) ------------------
+        if self.offset_heatmap {
+            self.draw_offset_heatmap(game, assets, list, m, t);
+        }
+
         // --- Key overlay (Z/X/C tap display) ---------------------------------------
         if self.key_overlay && std::env::var("NO_KEYS").is_err() {
             if legacy_keys {
@@ -807,6 +819,24 @@ impl HudState {
     /// out, additive judgement line ticks (0.6 alpha, 100ms pop-in, 5s fade
     /// while shrinking), a Great-coloured centre circle marker and the
     /// moving-average chevron arrow (EMA 0.9/0.1, 800ms OutQuint slides).
+    /// Live `AccuracyHeatmap` overlay: the results-screen port drawn as a
+    /// gameplay HUD element, fed incrementally (events judged at or before
+    /// `t`). Sits at the bottom centre just above the UR bar; autoplay
+    /// feeds perfect-centre hits so the dots cluster in the middle — the
+    /// overlay earns its keep on real replays.
+    fn draw_offset_heatmap(&mut self, game: &GameData, assets: &Assets, list: &mut DrawList, m: &Mapper, t: f64) {
+        let events: Vec<crate::game::ResultsHitEvent> = game
+            .results_hit_events
+            .iter()
+            .filter(|e| e.time <= t)
+            .copied()
+            .collect();
+        if events.is_empty() {
+            return;
+        }
+        crate::results::draw_accuracy_heatmap(list, m, assets, [512.0, 588.0], 150.0, &events, false);
+    }
+
     fn draw_ur_bar(&mut self, game: &GameData, assets: &Assets, list: &mut DrawList, m: &Mapper, t: f64) {
         let n = game.ur_events.partition_point(|e| e.time <= t);
         if n == 0 {

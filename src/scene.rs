@@ -632,6 +632,13 @@ pub struct SceneState {
     /// Hidden mod active (from `GameData::hidden`); pub so a host can
     /// force HD visuals live on top of the replay's own mods.
     pub hidden: bool,
+    /// osu! "hit animations" setting (lazer `OsuRulesetSetting.
+    /// HitAnimations`, default on). Off = the reduced-animation mode
+    /// (#38371): a judged-hit circle fades out as a whole over 60ms Out
+    /// instead of the pop piece animations (legacy: 240ms sprite fade +
+    /// 1.4x pop; argon: 640ms piece fade), and the legacy number's quick
+    /// fade hack is bypassed so it rides the whole-piece fade.
+    pub hit_animations: bool,
     /// 只渲染背景 + storyboard(音频/判定照常):跳过 note/滑条/转盘/
     /// 跟随点/判定动画/光标等全部 gameplay 元素(壁纸"纯画面"模式)。
     pub gameplay_hidden: bool,
@@ -673,6 +680,7 @@ impl SceneState {
             hud: hud::HudState::new(),
             gameplay_hidden: false,
             hidden: game.hidden,
+            hit_animations: true,
             results_at: None,
             results_fade_frames: 0,
             results_fadein_frames: 0,
@@ -1067,8 +1075,14 @@ impl SceneState {
         // runs 800 * 0.8 = 640ms OutQuad - the ring lingers longest.
         // On miss the circle fades over 100ms. Legacy pieces fade their
         // sprites over 240ms Out with a 1.4x pop instead.
+        // Hit animations OFF (lazer #38371): the whole drawable fades out
+        // over 60ms Out on hit, crushing every piece animation - the
+        // slider tail's `Delay(800).FadeOut()` shares this circle path
+        // and gets the same treatment.
         let mut overall = if judged && hit {
-            if self.legacy.is_some() {
+            if !self.hit_animations {
+                value_at(t, ht, ht + 60.0, 1.0, 0.0, Easing::Out)
+            } else if self.legacy.is_some() {
                 value_at(t, ht, ht + 240.0, 1.0, 0.0, Easing::Linear)
             } else {
                 value_at(t, ht, ht + 640.0, 1.0, 0.0, Easing::OutQuad)
@@ -1100,6 +1114,7 @@ impl SceneState {
             hit,
             ht,
             t,
+            self.hit_animations,
         );
     }
 
@@ -1501,6 +1516,7 @@ impl SceneState {
                 h_hit,
                 h_time,
                 t,
+                self.hit_animations,
             );
         }
 
@@ -2273,6 +2289,7 @@ fn draw_circle_piece(
     hit: bool,
     ht: f64,
     t: f64,
+    hit_animations: bool,
 ) {
     if let Some(lg) = legacy {
         // SkinnableDrawable fallback semantics: a legacy skin serves the
@@ -2294,12 +2311,14 @@ fn draw_circle_piece(
                 hit,
                 ht,
                 t,
+                hit_animations,
                 circle,
                 overlay,
             );
             return;
         }
     }
+    let _ = hit_animations; // only the legacy piece branches on it
     draw_circle_piece_argon(assets, list, m, obj, accent, alpha, number, with_outer_fill, judged, hit, ht, t)
 }
 
@@ -2322,6 +2341,7 @@ fn draw_circle_piece_legacy(
     hit: bool,
     ht: f64,
     t: f64,
+    hit_animations: bool,
     circle: SkinTexture,
     overlay: Option<SkinTexture>,
 ) {
@@ -2350,9 +2370,12 @@ fn draw_circle_piece_legacy(
     draw_sprite(list, circle, tint);
 
     // Number: digit sprites at their authored size, fading per the
-    // skin's legacy version on hit.
+    // skin's legacy version on hit. Hit animations OFF bypasses the
+    // quick-fade hack (lazer #38371: the number rides the whole-piece
+    // 60ms fade instead — "slightly slower than other components, in
+    // practice not perceivable").
     if let Some(digits) = &lg.hitcircle_digits && number > 0 {
-        let number_alpha = if judged && hit {
+        let number_alpha = if judged && hit && hit_animations {
             if lg.version > 1.0 {
                 value_at(x, 0.0, 240.0 / 4.0, 1.0, 0.0, Easing::Linear) as f32
             } else {

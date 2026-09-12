@@ -1774,140 +1774,9 @@ fn draw_statistics(game: &GameData, assets: &Assets, m: &Mapper, list: &mut Draw
         let inner_w = h_size[0];
         let side = heatmap_side_max.min(inner_w);
         let hc = [h_area[0] + inner_w * 0.5, h_area[1] + row2_content * 0.5];
-        let (hx, hy) = (hc[0] * s, hc[1] * s);
-        let hs = side * s;
-        // Inner circle: dark fill + white border (0.8 portion).
-        let inner_r = HEATMAP_INNER * hs * 0.5;
-        list.disc([hx, hy], inner_r, Colour::from_hex(0x202624), Colour::from_hex(0x202624), Blend::Alpha);
-        list.ring([hx, hy], inner_r, 2.0 * s, Colour::WHITE, Colour::WHITE, Blend::Alpha);
-        // The movement axis (up-right/down-left diagonal, the direction
-        // `FindRelativeHitPosition` normalises onto) at full alpha; the
-        // crossing diagonal dimmed. Screen y is down, so up-right is
-        // (cos45, -sin45). Stroke = lazer's `line_thickness` 2.
-        let axis = [0.70710678, -0.70710678];
-        let half_len = (HEATMAP_INNER + 0.2) * hs * 0.5;
-        for (dir, alpha) in [(axis, 1.0), ([-axis[1], axis[0]], 0.6)] {
-            let p0 = [hx - dir[0] * half_len, hy - dir[1] * half_len];
-            let p1 = [hx + dir[0] * half_len, hy + dir[1] * half_len];
-            list.capsule(p0, p1, 2.0 * s, Colour::WHITE.opacity(alpha), Blend::Alpha);
-        }
-        // End ticks at the overshoot (up-right) tip: Height-10 Width-2
-        // circles rotated ±45 WITHIN the 45°-rotated container, i.e.
-        // horizontal + vertical on screen (a '+' crosshair).
-        let (ex, ey) = (hx + axis[0] * half_len, hy + axis[1] * half_len);
-        for (dx, dy) in [(1.0f32, 0.0), (0.0, 1.0)] {
-            let p0 = [ex - dx * 5.0 * s, ey - dy * 5.0 * s];
-            let p1 = [ex + dx * 5.0 * s, ey + dy * 5.0 * s];
-            list.capsule(p0, p1, 2.0 * s, Colour::WHITE, Blend::Alpha);
-        }
-        // The point grid (33x33); only non-zero cells render.
-        let mut grid = vec![0i32; (HEATMAP_POINTS * HEATMAP_POINTS) as usize];
-        let centre = (HEATMAP_POINTS - 1) as f32 * 0.5;
-        let local_inner = centre * HEATMAP_INNER;
-        let mut peak = 0i32;
-        for e in ev {
-            let Some(last) = e.last_pos else { continue };
-            let rel = find_relative_hit_position(last, e.pos, e.cursor, e.radius as f64, HEATMAP_ROTATION);
-            let px = centre + local_inner * rel[0];
-            let py = centre + local_inner * rel[1];
-            let c = px.round() as i32;
-            let r = py.round() as i32;
-            if c < 0 || r < 0 || c >= HEATMAP_POINTS || r >= HEATMAP_POINTS {
-                continue;
-            }
-            let cell = &mut grid[(r * HEATMAP_POINTS + c) as usize];
-            *cell += 1;
-            peak = peak.max(*cell);
-        }
-        let cell = hs / HEATMAP_POINTS as f32;
-        // (hx, hy) is the square's CENTRE; the grid spans it from the
-        // top-left corner at (hx - hs/2, hy - hs/2).
-        let (gx, gy) = (hx - hs * 0.5, hy - hs * 0.5);
-        for r in 0..HEATMAP_POINTS {
-            for c in 0..HEATMAP_POINTS {
-                let count = grid[(r * HEATMAP_POINTS + c) as usize];
-                if count == 0 {
-                    continue;
-                }
-                // `GridPoint` hit test: distance from the grid centre
-                // (16.5, 16.5) against the 0.8 inner radius (16.5 * 0.8),
-                // exactly the drawn circle's radius.
-                let grid_centre = HEATMAP_POINTS as f32 * 0.5;
-                let dx = c as f32 + 0.5 - grid_centre;
-                let dy = r as f32 + 0.5 - grid_centre;
-                let dist = (dx * dx + dy * dy).sqrt();
-                let is_hit = dist <= grid_centre * HEATMAP_INNER;
-                let cx = gx + (c as f32 + 0.5) * cell;
-                let cy = gy + (r as f32 + 0.5) * cell;
-                if is_hit {
-                    // HitPoint: alpha/colour by count vs peak.
-                    let mut amount = 0.2 * (count as f32 / 10.0).min(1.0);
-                    amount += 0.8 * count as f32 / peak.max(1) as f32;
-                    amount = crate::draw::Easing::OutQuint.apply(amount.min(1.0) as f64) as f32;
-                    let alpha = (amount / 0.95).min(1.0);
-                    let base = Colour::from_hex(0x66FFCC);
-                    let colour = if amount > 0.95 { base.lighten((amount - 0.95).min(1.0)) } else { base };
-                    list.disc(
-                        [cx, cy],
-                        cell * 0.5,
-                        colour.opacity(alpha),
-                        colour.opacity(alpha),
-                        Blend::Alpha,
-                    );
-                } else {
-                    // MissPoint: an x-mark in red.
-                    let col = Colour::from_hex(0xFF6666).opacity(0.8);
-                    let e = cell * 0.28;
-                    for rot in [45.0f32, -45.0] {
-                        let (sn, cs) = rot.to_radians().sin_cos();
-                        list.capsule(
-                            [cx - cs * e, cy - sn * e],
-                            [cx + cs * e, cy + sn * e],
-                            0.8 * s,
-                            col,
-                            Blend::Alpha,
-                        );
-                    }
-                }
-            }
-        }
-        // Overshoot / Undershoot labels: lazer anchors upright text at the
-        // axis tips (`Origin = Anchor.BottomLeft` / `Anchor.TopRight`,
-        // `Y = ±(inner + ext)/2`, `Padding = 2`): Overshoot's bottom-left
-        // corner just past the up-right tip, Undershoot's top-right just
-        // past the down-left tip. Both line segments END at the tips, so
-        // the text stays clear of the diagonals and the ticks.
-        let (ow, o_top, o_bot) = ttf_measure(assets.semibold, "Overshoot", 12.0 * s, 0.0);
-        let oh = o_bot - o_top;
-        let (tx, ty) = (hx + axis[0] * half_len, hy + axis[1] * half_len);
-        draw_ttf_text(
-            list,
-            assets.atlas,
-            assets.semibold,
-            false,
-            "Overshoot",
-            [tx + 2.0 * s + ow * 0.5, ty - 2.0 * s - oh * 0.5],
-            12.0 * s,
-            Colour::WHITE,
-            0.0,
-            Blend::Alpha,
-        );
-        let (uw, u_top, u_bot) = ttf_measure(assets.semibold, "Undershoot", 12.0 * s, 0.0);
-        let uh = u_bot - u_top;
-        let (ux, uy) = (hx - axis[0] * half_len, hy - axis[1] * half_len);
-        draw_ttf_text(
-            list,
-            assets.atlas,
-            assets.semibold,
-            false,
-            "Undershoot",
-            [ux - 2.0 * s - uw * 0.5, uy + 2.0 * s + uh * 0.5],
-            12.0 * s,
-            Colour::WHITE,
-            0.0,
-            Blend::Alpha,
-        );
+        draw_accuracy_heatmap(list, m, assets, hc, side, ev, true);
     }
+
 
     // ------------------------------------------------------------------
     // Bottom row: Difficulty Graph - per-object rosu-pp strain curves
@@ -2077,10 +1946,165 @@ fn hit_error_stats(ev: &[crate::game::ResultsHitEvent], rate: f64) -> (Option<f6
     (Some(mean), Some(10.0 * var.sqrt() / rate))
 }
 
+/// `AccuracyHeatmap` port shared by the results screen and the live
+/// gameplay overlay: dark inner disc (0.8 portion) with white border, the
+/// 45° overshoot/undershoot axis (cross axis dimmed 0.6), the '+'
+/// crosshair at the overshoot tip, and the 33×33 point grid - green
+/// `HitPoint`s inside the inner circle (alpha/lightness by count vs
+/// peak), red `MissPoint` x-marks outside. `centre`/`side` are VIRTUAL
+/// units; `labels` draws the Overshoot/Undershoot captions (skip for the
+/// smaller live overlay).
+pub(crate) fn draw_accuracy_heatmap(
+    list: &mut DrawList,
+    m: &Mapper,
+    assets: &Assets,
+    centre: [f32; 2],
+    side: f32,
+    events: &[crate::game::ResultsHitEvent],
+    labels: bool,
+) {
+    let s = m.virt;
+    let (hx, hy) = (centre[0] * s, centre[1] * s);
+    let hs = side * s;
+    // Inner circle: dark fill + white border (0.8 portion).
+    let inner_r = HEATMAP_INNER * hs * 0.5;
+    list.disc([hx, hy], inner_r, Colour::from_hex(0x202624), Colour::from_hex(0x202624), Blend::Alpha);
+    list.ring([hx, hy], inner_r, 2.0 * s, Colour::WHITE, Colour::WHITE, Blend::Alpha);
+    // The movement axis (up-right/down-left diagonal, the direction
+    // `FindRelativeHitPosition` normalises onto) at full alpha; the
+    // crossing diagonal dimmed. Screen y is down, so up-right is
+    // (cos45, -sin45). Stroke = lazer's `line_thickness` 2.
+    let axis = [0.70710678, -0.70710678];
+    let half_len = (HEATMAP_INNER + 0.2) * hs * 0.5;
+    for (dir, alpha) in [(axis, 1.0), ([-axis[1], axis[0]], 0.6)] {
+        let p0 = [hx - dir[0] * half_len, hy - dir[1] * half_len];
+        let p1 = [hx + dir[0] * half_len, hy + dir[1] * half_len];
+        list.capsule(p0, p1, 2.0 * s, Colour::WHITE.opacity(alpha), Blend::Alpha);
+    }
+    // End ticks at the overshoot (up-right) tip: Height-10 Width-2
+    // circles rotated ±45 WITHIN the 45°-rotated container, i.e.
+    // horizontal + vertical on screen (a '+' crosshair).
+    let (ex, ey) = (hx + axis[0] * half_len, hy + axis[1] * half_len);
+    for (dx, dy) in [(1.0f32, 0.0), (0.0, 1.0)] {
+        let p0 = [ex - dx * 5.0 * s, ey - dy * 5.0 * s];
+        let p1 = [ex + dx * 5.0 * s, ey + dy * 5.0 * s];
+        list.capsule(p0, p1, 2.0 * s, Colour::WHITE, Blend::Alpha);
+    }
+    // The point grid (33x33); only non-zero cells render.
+    let mut grid = vec![0i32; (HEATMAP_POINTS * HEATMAP_POINTS) as usize];
+    let centre_g = (HEATMAP_POINTS - 1) as f32 * 0.5;
+    let local_inner = centre_g * HEATMAP_INNER;
+    let mut peak = 0i32;
+    for e in events {
+        let Some(last) = e.last_pos else { continue };
+        let rel = find_relative_hit_position(last, e.pos, e.cursor, e.radius as f64, HEATMAP_ROTATION);
+        let px = centre_g + local_inner * rel[0];
+        let py = centre_g + local_inner * rel[1];
+        let c = px.round() as i32;
+        let r = py.round() as i32;
+        if c < 0 || r < 0 || c >= HEATMAP_POINTS || r >= HEATMAP_POINTS {
+            continue;
+        }
+        let cell = &mut grid[(r * HEATMAP_POINTS + c) as usize];
+        *cell += 1;
+        peak = peak.max(*cell);
+    }
+    let cell = hs / HEATMAP_POINTS as f32;
+    // (hx, hy) is the square's CENTRE; the grid spans it from the
+    // top-left corner at (hx - hs/2, hy - hs/2).
+    let (gx, gy) = (hx - hs * 0.5, hy - hs * 0.5);
+    for r in 0..HEATMAP_POINTS {
+        for c in 0..HEATMAP_POINTS {
+            let count = grid[(r * HEATMAP_POINTS + c) as usize];
+            if count == 0 {
+                continue;
+            }
+            // `GridPoint` hit test: distance from the grid centre
+            // (16.5, 16.5) against the 0.8 inner radius (16.5 * 0.8),
+            // exactly the drawn circle's radius.
+            let grid_centre = HEATMAP_POINTS as f32 * 0.5;
+            let dx = c as f32 + 0.5 - grid_centre;
+            let dy = r as f32 + 0.5 - grid_centre;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let is_hit = dist <= grid_centre * HEATMAP_INNER;
+            let cx = gx + (c as f32 + 0.5) * cell;
+            let cy = gy + (r as f32 + 0.5) * cell;
+            if is_hit {
+                // HitPoint: alpha/colour by count vs peak.
+                let mut amount = 0.2 * (count as f32 / 10.0).min(1.0);
+                amount += 0.8 * count as f32 / peak.max(1) as f32;
+                amount = crate::draw::Easing::OutQuint.apply(amount.min(1.0) as f64) as f32;
+                let alpha = (amount / 0.95).min(1.0);
+                let base = Colour::from_hex(0x66FFCC);
+                let colour = if amount > 0.95 { base.lighten((amount - 0.95).min(1.0)) } else { base };
+                list.disc(
+                    [cx, cy],
+                    cell * 0.5,
+                    colour.opacity(alpha),
+                    colour.opacity(alpha),
+                    Blend::Alpha,
+                );
+            } else {
+                // MissPoint: an x-mark in red.
+                let col = Colour::from_hex(0xFF6666).opacity(0.8);
+                let e = cell * 0.28;
+                for rot in [45.0f32, -45.0] {
+                    let (sn, cs) = rot.to_radians().sin_cos();
+                    list.capsule(
+                        [cx - cs * e, cy - sn * e],
+                        [cx + cs * e, cy + sn * e],
+                        0.8 * s,
+                        col,
+                        Blend::Alpha,
+                    );
+                }
+            }
+        }
+    }
+    // Overshoot / Undershoot labels: lazer anchors upright text at the
+    // axis tips (`Origin = Anchor.BottomLeft` / `Anchor.TopRight`,
+    // `Y = ±(inner + ext)/2`, `Padding = 2`): Overshoot's bottom-left
+    // corner just past the up-right tip, Undershoot's top-right just
+    // past the down-left tip. Both line segments END at the tips, so
+    // the text stays clear of the diagonals and the ticks.
+    if labels {
+        let (ow, o_top, o_bot) = ttf_measure(assets.semibold, "Overshoot", 12.0 * s, 0.0);
+        let oh = o_bot - o_top;
+        let (tx, ty) = (hx + axis[0] * half_len, hy + axis[1] * half_len);
+        draw_ttf_text(
+            list,
+            assets.atlas,
+            assets.semibold,
+            false,
+            "Overshoot",
+            [tx + 2.0 * s + ow * 0.5, ty - 2.0 * s - oh * 0.5],
+            12.0 * s,
+            Colour::WHITE,
+            0.0,
+            Blend::Alpha,
+        );
+        let (uw, u_top, u_bot) = ttf_measure(assets.semibold, "Undershoot", 12.0 * s, 0.0);
+        let uh = u_bot - u_top;
+        let (ux, uy) = (hx - axis[0] * half_len, hy - axis[1] * half_len);
+        draw_ttf_text(
+            list,
+            assets.atlas,
+            assets.semibold,
+            false,
+            "Undershoot",
+            [ux - 2.0 * s - uw * 0.5, uy + 2.0 * s + uh * 0.5],
+            12.0 * s,
+            Colour::WHITE,
+            0.0,
+            Blend::Alpha,
+        );
+    }
+}
+
 /// `AccuracyHeatmap.FindRelativeHitPosition`: the hit point normalised
 /// against the previous-object -> this-object movement, rotated by
 /// `rotation` degrees.
-fn find_relative_hit_position(
+pub(crate) fn find_relative_hit_position(
     previous: [f32; 2],
     next: [f32; 2],
     hit: [f32; 2],
