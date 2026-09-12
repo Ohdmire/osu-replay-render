@@ -1549,11 +1549,18 @@ impl SceneState {
         };
         let head_alpha = if h_judged {
             if h_hit {
-                // Same ArgonMainCirclePiece hit fade as circles: the whole
-                // piece (border included) fades out over 800 * 0.8 = 640ms,
-                // OutQuad - the colour block (fills/flash) is long gone by
-                // then, so the ring lingers longest.
-                value_at(t, h_time, h_time + 640.0, 1.0, 0.0, Easing::OutQuad)
+                if !self.hit_animations {
+                    // #38371:`DrawableSliderHead : DrawableHitCircle` 且不
+                    // 覆写 UpdateHitStateTransforms —— 命中时继承整件
+                    // 60ms Out 淡出(与 draw_circle 同款),压过分件动画。
+                    value_at(t, h_time, h_time + 60.0, 1.0, 0.0, Easing::Out)
+                } else {
+                    // Same ArgonMainCirclePiece hit fade as circles: the whole
+                    // piece (border included) fades out over 800 * 0.8 = 640ms,
+                    // OutQuad - the colour block (fills/flash) is long gone by
+                    // then, so the ring lingers longest.
+                    value_at(t, h_time, h_time + 640.0, 1.0, 0.0, Easing::OutQuad)
+                }
             } else {
                 value_at(t, h_time, h_time + 100.0, 1.0, 0.0, Easing::Linear)
             }
