@@ -859,8 +859,8 @@ dependencies = [
 
 [[package]]
 name = "osu-parse"
-version = "0.2.0"
-source = "git+https://github.com/Ohdmire/osu-parse.git#2e1369dc565c7ba15f3aa56fac79eaadb79e5bc1"
+version = "0.2.1"
+source = "git+https://github.com/Ohdmire/osu-parse.git#2c94097d0cc8f89f0c822a492967ad6ffecb52b0"
 dependencies = [
  "lzma-rs",
 ]
@@ -889,7 +889,7 @@ dependencies = [
 
 [[package]]
 name = "osu_replay_render"
-version = "0.14.10"
+version = "0.14.11"
 dependencies = [
  "ab_glyph",
  "jpeg-decoder",
