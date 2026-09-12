@@ -681,9 +681,10 @@ pub struct SceneState {
     /// fade hack is bypassed so it rides the whole-piece fade.
     pub hit_animations: bool,
     /// Break-time background lightening (lazer `LightenDuringBreaks` +
-    /// `UserDimContainer`): during breaks the background image's dim
-    /// level lightens by 0.3 (`BREAK_LIGHTEN_AMOUNT`), easing the
-    /// entry/exit edges over 800ms OutQuint. Break detection per
+    /// `UserDimContainer`): during breaks the effective DimLevel drops by
+    /// 0.3 (`BREAK_LIGHTEN_AMOUNT`) — in `bg_opacity`'s brightness terms
+    /// (1 - DimLevel) the tint INCREASES by 0.3 — easing the entry/exit
+    /// edges over 800ms OutQuint. Break detection per
     /// `BreakTracker`: the beatmap's effective breaks (>= 650ms) as
     /// [start, end - 325ms), plus the lead-in (t < first - 2000) and
     /// post-completion periods. Default OFF (the wallpaper's autoplay
@@ -847,12 +848,14 @@ impl SceneState {
                 Colour::BLACK.opacity(1.0)
             } else {
                 // lazer DimLevel:图像灰度染色 rgb×(1-dim),不是 alpha
-                // 淡出(淡出会透出清屏色)。休息段(dim - 0.3)在此处
-                // 生效,见 [`SceneState::break_lighten_at`]。
+                // 淡出(淡出会透出清屏色)。注意 `bg_opacity` 存的是染色值
+                // 本身 = 1 - DimLevel(亮度),不是暗度 —— 休息段减淡是
+                // DimLevel - 0.3,换算到亮度即 min(op + 0.3, 1):加,不
+                // 是减(减就变暗了)。见 [`break_lighten_at`]。
                 let op = if self.break_lighten {
                     let first = game.objects.first().map(|o| o.start_time);
                     let last = game.objects.last().map(|o| o.end_time);
-                    (op - break_lighten_at(&game.breaks, first, last, t)).max(0.0)
+                    (op + break_lighten_at(&game.breaks, first, last, t)).min(1.0)
                 } else {
                     op
                 };
@@ -2978,6 +2981,18 @@ mod tests {
         // 短于 650ms 的 break 无效,不产生任何边沿。
         let short = [(11000.0, 11500.0)];
         assert_eq!(break_lighten_at(&short, first, last, 11200.0), 0.0);
+    }
+
+    /// 应用方向:bg_opacity 是亮度(1 - DimLevel),休息段减淡 = 暗度减
+    /// 0.3 = 亮度**加** 0.3 封顶 —— 曾经写反成减,画面反而变暗。
+    #[test]
+    fn break_lighten_brightens() {
+        let full = break_lighten_at(&[(11000.0, 13000.0)], Some(10000.0), Some(15100.0), 12000.0);
+        assert!((full - 0.3).abs() < 1e-6);
+        // 亮度 0.3(暗度 0.7,lazer 默认)+ 0.3 → 0.6,变亮。
+        assert!((0.3 + full - 0.6).abs() < 1e-6);
+        // 高亮度封顶 1.0,不越界。
+        assert!((0.8 + full).min(1.0) == 1.0);
     }
 
     /// L-shaped path: head (0,0) -> corner (100,0) -> end (100,100), slider
