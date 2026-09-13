@@ -438,7 +438,10 @@ fn with_lead_in(mut snapshots: Vec<FrameSnap>, rate: f64) -> Vec<FrameSnap> {
     snapshots
 }
 
-pub fn load(map_path: &str, replay_path: &str) -> Result<GameData, String> {    let content = std::fs::read_to_string(map_path).map_err(|e| format!("cannot read beatmap {map_path}: {e}"))?;
+/// [`load`] with the rosu-pp pass skippable (`with_pp: false` — hosts whose
+/// HUD hides the PP counter skip the stars/PP timeline for load time; the
+/// results screen then carries no PP/graph data).
+pub fn load_with_pp(map_path: &str, replay_path: &str, with_pp: bool) -> Result<GameData, String> {    let content = std::fs::read_to_string(map_path).map_err(|e| format!("cannot read beatmap {map_path}: {e}"))?;
     let mut map = beatmap::decode(&content)?;
     let rep = replay::decode_file(replay_path, map.version)?;
 
@@ -461,17 +464,24 @@ pub fn load(map_path: &str, replay_path: &str) -> Result<GameData, String> {    
     data.map_audio = map.general.audio_filename.clone();
     data.map_background = map.background.clone();
     data.sample_data = std::mem::take(&mut map.sample_data);
-    if let Some(pp) = crate::pp::calculate(content.as_bytes(), rep.header.mods, classic, &engine) {
-        data.pp = pp.pp;
-        data.pp_max = pp.pp_max;
-        data.pp_events = pp.events;
-        data.stars = pp.stars;
-        data.pp_breakdown = Some((pp.breakdown, pp.breakdown_max));
-        data.strain_aim_pts = pp.strain_aim_pts;
-        data.strain_speed_pts = pp.strain_speed_pts;
-        data.strain_reading_pts = pp.strain_reading_pts;
+    if with_pp {
+        if let Some(pp) = crate::pp::calculate(content.as_bytes(), rep.header.mods, classic, &engine) {
+            data.pp = pp.pp;
+            data.pp_max = pp.pp_max;
+            data.pp_events = pp.events;
+            data.stars = pp.stars;
+            data.pp_breakdown = Some((pp.breakdown, pp.breakdown_max));
+            data.strain_aim_pts = pp.strain_aim_pts;
+            data.strain_speed_pts = pp.strain_speed_pts;
+            data.strain_reading_pts = pp.strain_reading_pts;
+        }
     }
     Ok(data)
+}
+
+/// [`load_with_pp`] with the rosu-pp pass always on (previous behaviour).
+pub fn load(map_path: &str, replay_path: &str) -> Result<GameData, String> {
+    load_with_pp(map_path, replay_path, true)
 }
 
 /// Beatmap preview with the Autoplay mod: frames come from the local port
