@@ -548,15 +548,19 @@ impl Renderer {
             max_texture_dimension_2d: adapter.limits().max_texture_dimension_2d.min(16384),
             ..wgpu::Limits::default()
         };
-        let (device, queue) = block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("renderer"),
-                required_features: wgpu::Features::empty(),
-                required_limits,
-                memory_hints: wgpu::MemoryHints::Performance,
-            },
-            None,
-        ))
+        // Anime4K 超分链把 R32F 中间纹理按可过滤采样绑定:适配器支持时
+        // 开启 FLOAT32_FILTERABLE(视频超分与渲染共用本设备)。
+        let mut features = wgpu::Features::empty();
+        if adapter.features().contains(wgpu::Features::FLOAT32_FILTERABLE) {
+            features |= wgpu::Features::FLOAT32_FILTERABLE;
+        }
+        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("renderer"),
+            required_features: features,
+            required_limits,
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+        }))
         .expect("request device");
 
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1416,7 +1420,7 @@ impl Renderer {
         let buffer = &self.readback_ring[slot];
         let slice = buffer.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll(wgpu::PollType::Wait);
         let data = slice.get_mapped_range();
         out.clear();
         out.extend_from_slice(&data);
@@ -1645,7 +1649,7 @@ impl Renderer {
         let buffer = &self.yuv.as_ref().unwrap().ring[slot];
         let slice = buffer.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll(wgpu::PollType::Wait);
         let data = slice.get_mapped_range();
         out.copy_from_slice(&data);
         drop(data);

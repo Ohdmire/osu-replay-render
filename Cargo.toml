@@ -12,7 +12,7 @@ rosu-pp = { git = "https://github.com/Apeuriox/rosu-pp.git", branch = "pp-rework
 # Beatmap storyboard layer (.osu Events + shared .osb) — same checkout as
 # the standalone renderer, library target only (no winit/zip on Android).
 osu-storyboard-render = { git = "https://github.com/Ohdmire/osu-storyboard-render.git", branch = "main", default-features = false }
-wgpu = "24"
+wgpu = "25"
 raw-window-handle = "0.6"
 pollster = "0.4"
 png = "0.17"

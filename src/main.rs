@@ -161,6 +161,8 @@ struct Options {
     /// setting off). Default: the beatmap's colours win and the skin's
     /// only apply when the beatmap ships none.
     skin_colours: bool,
+    /// Upscale mode for video frames & the background (`--upscale`).
+    upscale: osu_replay_render::UpscaleMode,
     /// Keep the Argon HUD even with a user skin (`--argon-hud`); by
     /// default the skin's own score/accuracy/combo/health/key pieces are
     /// used when it provides them.
@@ -358,7 +360,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
     let autoplay = args.iter().any(|a| a == "--autoplay");
     let min_args = if autoplay { 2 } else { 3 };
     if args.len() < min_args {
-        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--hud on|off] [--hd auto|on|off] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro|dir] [--argon-hud] [--guides on|off] [--pp on|off] [--audio [file.mp3]] [--audio-offset ms] [--bg on|off] [--bg-opacity 0..1] [--storyboard on|off] [--video on|off] [--cursor-size 0.1..=2] [--hitsounds] [--skin-colours] [--results secs|off] [--results-only] [--avatar image] [--config file.json] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
+        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--hud on|off] [--hd auto|on|off] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro|dir] [--argon-hud] [--guides on|off] [--pp on|off] [--audio [file.mp3]] [--audio-offset ms] [--bg on|off] [--bg-opacity 0..1] [--storyboard on|off] [--video on|off] [--cursor-size 0.1..=2] [--hitsounds] [--skin-colours] [--upscale off|fsr|anime4k] [--results secs|off] [--results-only] [--avatar image] [--config file.json] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
     }
     let map_path = args[1].clone();
     let replay_path = if autoplay { None } else { Some(args[2].clone()) };
@@ -395,6 +397,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
         bgm_volume: 0.6,
         master_volume: 0.6,
         skin_colours: false,
+        upscale: osu_replay_render::UpscaleMode::Off,
         argon_hud: false,
         hit_anim: true,
         offset_heatmap: false,
@@ -581,6 +584,11 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
             }
             "--hitsounds" => {
                 opts.hitsounds = true;
+            }
+            "--upscale" => {
+                let m = args.get(i + 1).cloned().unwrap_or_default();
+                opts.upscale = osu_replay_render::UpscaleMode::parse(&m);
+                i += 1;
             }
             "--skin-colours" => {
                 opts.skin_colours = true;
@@ -920,6 +928,8 @@ fn main() {
     };
 
     let has_bg = bg_image.is_some();
+    // BG 超分(`--upscale fsr|anime4k`):载入期一次性放大后进图集
+    let bg_image = osu_replay_render::upscale_bg(bg_image, opts.upscale, (opts.width, opts.height));
     // Composite slot size: the output resolution, capped at 1080p so huge
     // renders don't balloon the atlas (the scene upsamples linearly).
     let sb_slot = (
@@ -988,6 +998,8 @@ fn main() {
     if let Some(sb) = &mut sb_layer {
         sb.set_elements_enabled(opts.storyboard);
         sb.set_video_enabled(opts.video);
+        // 视频通道超分(`--upscale`):原帧 → FSR/Anime4K → 槽位分辨率
+        sb.set_video_upscale(opts.upscale, sb_slot);
     }
     let mut state = SceneState::new(&game, opts.width, opts.height);
     state.pro_skin = opts.skin == "argon-pro";

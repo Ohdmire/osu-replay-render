@@ -124,7 +124,7 @@ impl SurfaceRenderer {
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
         }))
-        .ok_or("没有支持该窗口的 GPU 适配器")?;
+        .map_err(|e| format!("没有支持该窗口的 GPU 适配器({e})"))?;
 
         let renderer = Renderer::from_adapter(adapter, width, height, atlas);
         eprintln!(

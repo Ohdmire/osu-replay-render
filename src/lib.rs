@@ -25,8 +25,63 @@ pub mod surface;
 
 pub use raw_window_handle;
 
+/// 超分模式(视频帧 / BG):FSR 1 或 Anime4K。
+pub use osu_storyboard_render::render::upscale::UpscaleMode;
+
 use draw::{Atlas, Image, Region, TtfFont};
 use skin::SkinTexture;
+
+/// 载入期对谱面背景做一次性超分(BG 为静态图,放大一次进图集,零每帧
+/// 成本)。内部临时创建 GPU 设备跑链后释放;`Off` / 源分辨率已达目标
+/// 时原样返回。目标尺寸 = 场景分辨率(16:9 内部分辨率)。
+pub fn upscale_bg(bg: Option<Image>, mode: UpscaleMode, target: (u32, u32)) -> Option<Image> {
+    let bg = bg?;
+    if mode == UpscaleMode::Off || bg.width == 0 || bg.height == 0 || (bg.width >= target.0 && bg.height >= target.1) {
+        return Some(bg);
+    }
+    let rgba = image_bg_upscale(&bg, mode, target)?;
+    Some(rgba)
+}
+
+fn image_bg_upscale(img: &Image, mode: UpscaleMode, target: (u32, u32)) -> Option<Image> {
+    // 临时设备:一次性链跑完即弃(载入期 ~100-300ms 的设备初始化成本)
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+    })) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("upscale_bg: 无 GPU 适配器({e}),跳过超分");
+            return None;
+        }
+    };
+    let mut features = wgpu::Features::empty();
+    if adapter.features().contains(wgpu::Features::FLOAT32_FILTERABLE) {
+        features |= wgpu::Features::FLOAT32_FILTERABLE;
+    }
+    let (device, queue) = match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("upscale_bg device"),
+        required_features: features,
+        ..Default::default()
+    })) {
+        Ok(dq) => dq,
+        Err(e) => {
+            eprintln!("upscale_bg: 设备创建失败({e}),跳过超分");
+            return None;
+        }
+    };
+    eprintln!("upscale_bg: {}x{} -> {}x{} ({:?})", img.width, img.height, target.0, target.1, mode);
+    let (w, h, out) = osu_storyboard_render::render::upscale::upscale_image(
+        &device,
+        &queue,
+        (img.width, img.height, &img.rgba),
+        mode,
+        target,
+    );
+    Some(Image { width: w, height: h, rgba: out.into_owned() })
+}
 
 /// Exo 2 (SIL OFL 1.1, see assets/fonts/OFL-Exo2.txt): the text family,
 /// embedded and final — there is deliberately no font-switching mechanism.

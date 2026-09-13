@@ -576,6 +576,16 @@ impl StoryboardLayer {
         self.video_enabled = on;
     }
 
+    /// 视频通道超分(FSR/Anime4K):原帧经放大链后以 `target`(SB 合成
+    /// 槽分辨率)进入合成,替代合成器内部的线性拉伸。透传 SbRenderer。
+    pub fn set_video_upscale(
+        &mut self,
+        mode: osu_storyboard_render::render::upscale::UpscaleMode,
+        target: (u32, u32),
+    ) {
+        self.sb.set_video_upscale(mode, target);
+    }
+
     /// 预取 storyboard 贴图(按元素起播时刻排序,动画展开全部帧),直到
     /// GPU 预算或 `deadline`。宿主在起播前调用:帧动画式 SB 单拍激活
     /// 数百张新贴图,惰性加载会让那一帧同步解码整批——首播卡一下、回看
