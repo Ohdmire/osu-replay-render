@@ -32,14 +32,30 @@ use draw::{Atlas, Image, Region, TtfFont};
 use skin::SkinTexture;
 
 /// 载入期对谱面背景做一次性超分(BG 为静态图,放大一次进图集,零每帧
-/// 成本)。内部临时创建 GPU 设备跑链后释放;`Off` / 源分辨率已达目标
-/// 时原样返回。目标尺寸 = 场景分辨率(16:9 内部分辨率)。
+/// 成本)。内部临时创建 GPU 设备跑链后释放;`Off` / 源两维都不小于
+/// 目标时原样返回。目标为**等比例覆盖**场景分辨率的尺寸(随后
+/// build_atlas 的 cover_crop 照常裁切到渲染比例 —— 曾经直接放大到
+/// (target.0, target.1) 会把非 16:9 源图拉伸变形)。
 pub fn upscale_bg(bg: Option<Image>, mode: UpscaleMode, target: (u32, u32)) -> Option<Image> {
     let bg = bg?;
-    if mode == UpscaleMode::Off || bg.width == 0 || bg.height == 0 || (bg.width >= target.0 && bg.height >= target.1) {
+    if mode == UpscaleMode::Off
+        || bg.width == 0
+        || bg.height == 0
+        || (bg.width >= target.0 && bg.height >= target.1)
+        || target.0 == 0
+        || target.1 == 0
+    {
         return Some(bg);
     }
-    let rgba = image_bg_upscale(&bg, mode, target)?;
+    // 等比例放大到覆盖目标(两维都 >= target),保持源宽高比
+    let scale = (target.0 as f32 / bg.width as f32)
+        .max(target.1 as f32 / bg.height as f32)
+        .max(1.0);
+    let cover = (
+        ((bg.width as f32 * scale).round() as u32).max(target.0),
+        ((bg.height as f32 * scale).round() as u32).max(target.1),
+    );
+    let rgba = image_bg_upscale(&bg, mode, cover)?;
     Some(rgba)
 }
 
