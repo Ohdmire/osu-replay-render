@@ -960,6 +960,7 @@ dependencies = [
 [[package]]
 name = "osu-storyboard-render"
 version = "0.1.5"
+source = "git+https://github.com/Ohdmire/osu-storyboard-render.git?branch=main#f397fee308c097ac417dea06e515795f9747dc97"
 dependencies = [
  "anime4k-wgpu",
  "anyhow",

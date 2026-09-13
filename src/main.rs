@@ -928,8 +928,6 @@ fn main() {
     };
 
     let has_bg = bg_image.is_some();
-    // BG 超分(`--upscale fsr|anime4k`):载入期一次性放大后进图集
-    let bg_image = osu_replay_render::upscale_bg(bg_image, opts.upscale, (opts.width, opts.height));
     // Composite slot size: the output resolution, capped at 1080p so huge
     // renders don't balloon the atlas (the scene upsamples linearly).
     let sb_slot = (
@@ -978,9 +976,9 @@ fn main() {
     // back to that downscale inside build_atlas.
     let atlas_max_dim = Renderer::probe_max_texture_dimension_2d();
     let (atlas, fonts) = build_atlas(
-        bg_image,
+        bg_image.clone(),
         Some(opts.width as f32 / opts.height.max(1) as f32),
-        avatar_image,
+        avatar_image.clone(),
         &mut resolved_skin,
         atlas_max_dim,
         storyboard_slots,
@@ -988,6 +986,29 @@ fn main() {
     eprintln!("atlas: {}x{} (max_dim {atlas_max_dim})", atlas.width, atlas.height);
 
     let mut renderer = Renderer::new(opts.width, opts.height, &atlas);
+    // BG 超分(`--upscale`):主渲染设备上一次性放大(无第二设备 —— 同
+    // 进程反复建/销临时设备与 dx12 生命周期交错会偶发致命错误),
+    // 放大后重打包图集热换
+    if opts.upscale != osu_replay_render::UpscaleMode::Off {
+        if let Some(up) = osu_replay_render::upscale_bg(
+            renderer.device(),
+            renderer.queue(),
+            bg_image.clone(),
+            opts.upscale,
+            (opts.width, opts.height),
+        ) {
+            let (atlas2, _) = build_atlas(
+                Some(up),
+                Some(opts.width as f32 / opts.height.max(1) as f32),
+                avatar_image.clone(),
+                &mut resolved_skin,
+                atlas_max_dim,
+                storyboard_slots,
+            );
+            eprintln!("atlas (upscaled {:?}): {}x{}", opts.upscale, atlas2.width, atlas2.height);
+            renderer.set_atlas(&atlas2);
+        }
+    }
     // Storyboard GPU layer on the renderer's device; below-layers dim with
     // the background (osu! DimLevel semantics), full when it is off.
     let mut sb_layer = sb_parsed.map(|p| {
