@@ -584,6 +584,18 @@ impl StoryboardLayer {
         target: (u32, u32),
     ) {
         self.sb.set_video_upscale(mode, target);
+        // 立刻重建当前帧:暂停时 pump_video 不出帧(时钟冻结),新链
+        // 要等下一帧才会被采样 —— 把管道里保留的最后一帧重推过新链,
+        // 切滤镜在暂停状态下也即时可见。
+        if let Some(v) = &self.video {
+            if let Some(pipe) = &v.source {
+                let (w, h) = (v.info.width, v.info.height);
+                if w > 0 && h > 0 && pipe.frame.len() == (w * h * 4) as usize {
+                    let frame = pipe.frame.clone();
+                    self.sb.write_frame(VIDEO_KEY, w, h, &frame);
+                }
+            }
+        }
     }
 
     /// 预取 storyboard 贴图(按元素起播时刻排序,动画展开全部帧),直到
