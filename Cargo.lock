@@ -959,7 +959,7 @@ dependencies = [
 
 [[package]]
 name = "osu-storyboard-render"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anime4k-wgpu",
  "anyhow",
@@ -981,7 +981,7 @@ dependencies = [
 
 [[package]]
 name = "osu_replay_render"
-version = "0.14.13"
+version = "0.14.16"
 dependencies = [
  "ab_glyph",
  "jpeg-decoder",
