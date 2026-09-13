@@ -2,13 +2,13 @@
 //! consumes: the game's default skin. Its hit objects are vector-drawn
 //! (the existing `scene.rs` Argon visuals ARE this skin), so the only
 //! textures it serves are the three embedded sprites the Argon components
-//! use. `GetConfig` answers the default combo colours - everything else
+//! use. `GetConfig` answers the argon combo colours - everything else
 //! misses so lookups fall through to the user skin first when chained
 //! (lazer: user skin container wraps the default skin container).
 
 use std::path::PathBuf;
 
-use crate::draw::Image;
+use crate::draw::{Colour, Image};
 
 use super::configuration::SkinConfiguration;
 use super::lookup::{GlobalSkinColours, SkinComboColourLookup, SkinLookup, SkinValue};
@@ -33,6 +33,13 @@ impl ArgonSkin {
         let mut configuration = SkinConfiguration::default();
         configuration.legacy_version = Some(super::configuration::LATEST_VERSION);
         configuration.is_latest_version = true;
+        // `ArgonSkin` ctor: `Configuration.CustomComboColours` = the six
+        // argon colours. Without them `combo_colours()` would fall to the
+        // default stable four (`AllowDefaultComboColoursFallback`).
+        configuration.custom_combo_colours = crate::game::ARGON_COMBO_COLOURS
+            .iter()
+            .map(|&c| Colour::from_hex(c))
+            .collect();
 
         let decode = |bytes: &[u8]| -> Image {
             let (w, h, rgba) = decode_png_rgba(bytes);
@@ -75,8 +82,8 @@ impl Skin for ArgonSkin {
     }
 
     /// `ArgonSkin.GetConfig`: `GlobalSkinColours.ComboColours` and
-    /// `SkinComboColourLookup` only (the defaults from
-    /// `SkinConfiguration.ComboColours`); every other lookup misses.
+    /// `SkinComboColourLookup` only (the six custom colours `new()` put
+    /// in `SkinConfiguration.ComboColours`); every other lookup misses.
     fn get_config(&self, lookup: SkinLookup) -> Option<SkinValue> {
         match lookup {
             SkinLookup::GlobalColour(GlobalSkinColours::ComboColours) => {

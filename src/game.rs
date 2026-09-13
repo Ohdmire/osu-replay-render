@@ -1045,9 +1045,11 @@ pub fn health_at(game: &GameData, t: f64) -> f64 {
 /// colours only apply when the beatmap ships none (its
 /// `AllowDefaultComboColoursFallback` is false, so the lookup falls
 /// through to the user skin). `force == true` is the stable behaviour:
-/// an installed legacy skin's colours (custom, or the default stable
-/// fallback) always override the beatmap's, like lazer with
-/// "Beatmap skins" off.
+/// the current skin's colours - user legacy custom (or the default
+/// stable fallback) or the builtin argon six - always override the
+/// beatmap's, like lazer with "Beatmap colours" off (the beatmap skin's
+/// colour lookup is skipped, and `ArgonSkin.GetConfig` answers combo
+/// colour lookups with no legacy gate).
 ///
 /// Re-entrant: every call re-maps the whole palette from the base one
 /// `build()` stored (`combo_colours`: beatmap `[Colours]` or the argon
@@ -1063,7 +1065,7 @@ pub fn apply_skin_combo_colours(game: &mut GameData, skin: &crate::skin::Resolve
             crate::skin::SkinValue::ComboColours(c) => Some(c),
             _ => None,
         })
-        .filter(|c| !c.is_empty() && skin.is_legacy());
+        .filter(|c| !c.is_empty());
     let palette = match skin_colours {
         Some(c) if force || !game.has_beatmap_colours => c,
         _ => game.combo_colours.clone(),
@@ -1114,5 +1116,71 @@ SliderTickRate:1
         eprintln!("[ur-check] ur_events = {}", game.ur_events.len());
         assert!(!game.ur_events.is_empty(), "autoplay UR 事件表为空 —— HUD UR 条不会绘制");
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod combo_colour_tests {
+    use super::*;
+    use crate::skin::{load_skin, GlobalSkinColours, Skin, SkinLookup, SkinValue};
+
+    /// 内置 Argon(无用户皮肤)时 force(`--skin-colours` / osu-player
+    /// "强制皮肤色")也必须生效:lazer 的 `ArgonSkin.GetConfig` 对 combo
+    /// 色无条件应答(自定义六色),"Beatmap colours" 关掉后谱面
+    /// `[Colours]` 被跳过、皮肤色赢。回归:`apply_skin_combo_colours`
+    /// 曾用 `is_legacy()` 把 Argon 挡掉,且 `ArgonSkin` 漏设
+    /// `CustomComboColours`(会答出经典默认四色)。
+    #[test]
+    fn argon_forced_skin_colours_override_beatmap_colours() {
+        let map = "osu file format v14
+
+[General]
+Mode: 0
+
+[Colours]
+Combo1 : 255,255,255
+Combo2 : 1,2,3
+
+[Difficulty]
+HPDrainRate:5
+CircleSize:4
+OverallDifficulty:8
+ApproachRate:8
+SliderMultiplier:1.8
+SliderTickRate:1
+
+[TimingPoints]
+500,400,4,2,0,45,1,0
+
+[HitObjects]
+100,100,1000,1,0,0:0:0:0:0
+200,100,1200,1,0,0:0:0:0:0
+";
+        let mut game = load_autoplay_content(map, 0, false, false).unwrap();
+        assert!(game.has_beatmap_colours, "[Colours] 未被解析,测试前提不成立");
+
+        let skin = load_skin(None).unwrap();
+        // 皮肤层:Argon 答出自定义六色,而不是经典默认四色。
+        let value = skin
+            .get_config(SkinLookup::GlobalColour(GlobalSkinColours::ComboColours))
+            .expect("argon skin must answer ComboColours");
+        let colours = match value {
+            SkinValue::ComboColours(c) => c,
+            _ => panic!("expected SkinValue::ComboColours"),
+        };
+        assert_eq!(colours.len(), 6, "ArgonSkin 须答出六色,得到 {colours:?}");
+
+        // force=false:谱面色赢(lazer "Beatmap colours" 开)。
+        let beatmap_colour = game.objects[0].colour;
+        apply_skin_combo_colours(&mut game, &skin, false);
+        assert_eq!(game.objects[0].colour, beatmap_colour);
+
+        // force=true:Argon 六色覆盖谱面色。
+        apply_skin_combo_colours(&mut game, &skin, true);
+        let expected = Colour::from_hex(
+            ARGON_COMBO_COLOURS[(game.objects[0].combo_colour_index as usize) % ARGON_COMBO_COLOURS.len()],
+        );
+        assert_eq!(game.objects[0].colour, expected);
+        assert_ne!(game.objects[0].colour, beatmap_colour);
     }
 }
