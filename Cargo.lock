@@ -982,10 +982,11 @@ dependencies = [
 
 [[package]]
 name = "osu_replay_render"
-version = "0.14.16"
+version = "0.14.18"
 dependencies = [
  "ab_glyph",
  "jpeg-decoder",
+ "log",
  "osu-parse",
  "osu-storyboard-render",
  "osu_replay_judge",

@@ -1,6 +1,6 @@
 [package]
 name = "osu_replay_render"
-version = "0.14.16"
+version = "0.14.18"
 edition = "2024"
 license = "MIT"
 
@@ -15,6 +15,7 @@ osu-storyboard-render = { git = "https://github.com/Ohdmire/osu-storyboard-rende
 wgpu = "25"
 raw-window-handle = "0.6"
 pollster = "0.4"
+log = "0.4"
 png = "0.17"
 jpeg-decoder = "0.3"
 ab_glyph = "0.2"

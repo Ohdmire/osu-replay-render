@@ -562,6 +562,14 @@ impl Renderer {
             trace: wgpu::Trace::Off,
         }))
         .expect("request device");
+        // wgpu 错误捕获:默认 uncaptured handler 直接 panic 杀进程,具体
+        // 错误只随 panic 打到无处可看的 stderr。这里改为记录(宿主日志
+        // 文件可见)并继续 —— 壁纸进程不因单次 GPU 错误死亡,错误细节
+        // 供定位。
+        device.on_uncaptured_error(Box::new(|e| {
+            log::error!("wgpu 未捕获错误(不致命): {e}");
+            eprintln!("wgpu uncaptured error: {e}");
+        }));
 
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("scene shader"),
