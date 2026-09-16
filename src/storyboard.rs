@@ -383,6 +383,10 @@ impl ParsedStoryboard {
             finished: false,
             frame_pts: f64::NEG_INFINITY,
             spawn_attempts: 0,
+            #[cfg(not(target_os = "android"))]
+            last_frame: None,
+            #[cfg(not(target_os = "android"))]
+            retry_from_ms: None,
         });
         let replaces_bg = self.replaces_background;
         StoryboardLayer {
@@ -403,19 +407,37 @@ impl ParsedStoryboard {
     }
 }
 
-/// 桌面视频源:ffmpeg rawvideo(RGBA)管道,顺序解码。
+/// 桌面视频源:ffmpeg rawvideo(RGBA)管道 + 独立读帧线程。
+///
+/// 读帧在后台线程进行,整帧经有界通道交付(通道满 → 读线程阻塞,
+/// ffmpeg 的 stdout 缓冲随之填满、解码自然限速);泵端只做非阻塞
+/// `try_recv` —— ffmpeg 冷启动(百 MB 级静态 exe 首次执行的 Defender
+/// 扫描 + 冷页载入)出首帧可达数秒到数十秒,若在事件循环里同步等,
+/// 整个壁纸会冻住而音乐照播(音频在独立线程),解冻后管道还会因
+/// "落后超阈值"被按当前时刻 `-ss` 重起,从未显示过的视频开头被
+/// 整体跳过(首播裁头)。
 #[cfg(not(target_os = "android"))]
 struct VideoPipe {
-    child: std::process::Child,
-    stdout: std::process::ChildStdout,
-    frame: Vec<u8>,
+    /// None = 测试伪造的管道(无真实进程)。
+    child: Option<std::process::Child>,
+    /// 读帧线程 → 泵:整帧 RGBA;`None` = EOF/读错误(终结标记,FIFO)。
+    frames: std::sync::mpsc::Receiver<Option<Vec<u8>>>,
     /// 下一帧的 map 时间(ms)。
     next_pts_ms: f64,
     step_ms: f64,
-    /// 管道起播时刻:-ss 落点是关键帧,可能在目标时刻前数秒(GOP),
-    /// 起播后的补帧期不算"落后重起",否则会反复重起在同一关键帧。
+    /// 管道 spawn 时刻(启动超时判据)。
     spawned_at: std::time::Instant,
+    /// 首帧产出时刻 = 解码真正开始。落后重起(respawn)的宽限从这起算,
+    /// 而非 spawn:首帧还在路上的冷启动等待不算"落后",不能据此重起。
+    first_frame_at: Option<std::time::Instant>,
+    /// 最近一次取到帧的 map 时间(ms)。
+    last_pts_ms: f64,
 }
+
+/// 读帧线程通道容量:解码追帧(快进补播)时限制在途帧的内存
+/// (720p RGBA ≈ 3.7MB/帧),读满即背压。
+#[cfg(not(target_os = "android"))]
+const VIDEO_FRAME_QUEUE: usize = 3;
 
 #[cfg(not(target_os = "android"))]
 impl VideoPipe {
@@ -455,30 +477,103 @@ impl VideoPipe {
             }
         };
         let stdout = child.stdout.take()?;
-        let frame = vec![0u8; (info.width * info.height * 4) as usize];
+        let frames = Self::spawn_frame_reader(stdout, (info.width * info.height * 4) as usize);
         let step_ms = if info.fps > 0.0 { 1000.0 / info.fps } else { 33.0 };
         let next_pts_ms = info.start_ms as f64 + seek_s * 1000.0;
-        Some(VideoPipe { child, stdout, frame, next_pts_ms, step_ms, spawned_at: std::time::Instant::now() })
+        log::info!("[video-probe] spawn: -ss {seek_s:.3}s next_pts={next_pts_ms:.0}ms step={step_ms:.1}ms");
+        Some(VideoPipe {
+            child: Some(child),
+            frames,
+            next_pts_ms,
+            step_ms,
+            spawned_at: std::time::Instant::now(),
+            first_frame_at: None,
+            last_pts_ms: f64::NEG_INFINITY,
+        })
     }
 
-    /// 读取一帧到 self.frame;EOF/错误返回 false。
-    fn read_frame(&mut self) -> bool {
-        let mut off = 0;
-        while off < self.frame.len() {
-            match self.stdout.read(&mut self.frame[off..]) {
-                Ok(0) | Err(_) => return false,
-                Ok(n) => off += n,
+    /// 读帧线程:整帧读满即投递;EOF/错误投递 `None` 终结。接收端
+    /// (VideoPipe)被丢弃时 send 失败,线程随管道关闭自然退出。
+    fn spawn_frame_reader(
+        mut stdout: std::process::ChildStdout,
+        frame_len: usize,
+    ) -> std::sync::mpsc::Receiver<Option<Vec<u8>>> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(VIDEO_FRAME_QUEUE);
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; frame_len];
+            let mut off = 0;
+            loop {
+                match stdout.read(&mut buf[off..]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        off += n;
+                        if off == buf.len() {
+                            let frame = std::mem::replace(&mut buf, vec![0u8; frame_len]);
+                            if tx.send(Some(frame)).is_err() {
+                                return; // 接收端已丢弃
+                            }
+                            off = 0;
+                        }
+                    }
+                }
             }
-        }
-        true
+            let _ = tx.send(None);
+        });
+        rx
+    }
+
+    /// 落后重起判定(纯决策,便于测试):解码未开始(无首帧)→ 永不
+    /// 重起 —— 首帧在路上的冷启动等待不是落后,按当前时刻 `-ss` 重起
+    /// 会裁掉从未显示过的开头。解码已在跑(出过帧)且落后超阈值、距
+    /// 首帧超宽限 → 重起(慢于实时的解码/大前跳 seek:同步优先于完整,
+    /// 壁纸语义)。宽限同样自首帧起算:`-ss` 落点关键帧可能在目标前
+    /// 数秒(大 GOP,如 Button 的首个 19.8s),补帧期(4 帧/拍,远快于
+    /// 实时)不算落后,否则会反复重起在同一关键帧。
+    fn needs_respawn(&self, t: f64) -> bool {
+        let Some(first) = self.first_frame_at else { return false };
+        t - self.next_pts_ms > StoryboardLayer::RESPAWN_BEHIND_MS
+            && first.elapsed() > StoryboardLayer::RESPAWN_GRACE
+    }
+
+    /// 启动超时:spawn 后这么久仍未出首帧 = 进程被挂起/AV 拦截一类,
+    /// 按启动失败处理(原 seek 目标重试,不裁开头)。
+    fn startup_timed_out(&self) -> bool {
+        self.first_frame_at.is_none() && self.spawned_at.elapsed() > StoryboardLayer::VIDEO_STARTUP_TIMEOUT
+    }
+
+    /// 测试用假管道:不启动 ffmpeg,帧由测试经返回的 sender 投递。
+    /// `spawned_at`/`first_frame_at` 由测试按场景预置。
+    #[cfg(test)]
+    fn fake(
+        next_pts_ms: f64,
+        step_ms: f64,
+        spawned_at: std::time::Instant,
+        first_frame_at: Option<std::time::Instant>,
+    ) -> (Self, std::sync::mpsc::SyncSender<Option<Vec<u8>>>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(VIDEO_FRAME_QUEUE);
+        (
+            VideoPipe {
+                child: None,
+                frames: rx,
+                next_pts_ms,
+                step_ms,
+                spawned_at,
+                first_frame_at,
+                last_pts_ms: f64::NEG_INFINITY,
+            },
+            tx,
+        )
     }
 }
 
 #[cfg(not(target_os = "android"))]
 impl Drop for VideoPipe {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        // 读帧线程持有 stdout:子进程被杀 → 管道断开 → read 返回 → 线程退出
     }
 }
 
@@ -497,6 +592,63 @@ struct VideoState {
     frame_pts: f64,
     /// ffmpeg 管道启动尝试数(首帧前被外部干掉时有限重试)。
     spawn_attempts: u32,
+    /// 最近入纹理的帧(超分链热切时重推;Android 邮箱路径不用)。
+    #[cfg(not(target_os = "android"))]
+    last_frame: Option<Vec<u8>>,
+    /// 失败重试的保留 seek 目标(map ms):首帧前管道死亡/启动超时的
+    /// 重试必须落回原目标 —— 按"当前渲染时刻"重试会把从未显示过的
+    /// 开头裁掉。消费后清空。
+    #[cfg(not(target_os = "android"))]
+    retry_from_ms: Option<f64>,
+}
+
+#[cfg(not(target_os = "android"))]
+impl VideoState {
+    /// 非阻塞推进解码:最多 `max` 帧、直到 `t` 或管道暂空。返回
+    /// (本拍取到的帧数, 是否耗尽 EOF)。时间戳按恒定帧率推进
+    /// (rawvideo 无 pts),首帧到达时记 `first_frame_at`。
+    fn drain(&mut self, t: f64, max: u32) -> (u32, bool) {
+        let mut eof = false;
+        let mut popped = 0u32;
+        let Some(pipe) = self.source.as_mut() else { return (0, false) };
+        while pipe.next_pts_ms <= t && popped < max {
+            match pipe.frames.try_recv() {
+                Ok(Some(frame)) => {
+                    pipe.first_frame_at.get_or_insert_with(std::time::Instant::now);
+                    pipe.last_pts_ms = pipe.next_pts_ms;
+                    pipe.next_pts_ms += pipe.step_ms;
+                    self.frame_pts = pipe.last_pts_ms;
+                    self.last_frame = Some(frame);
+                    popped += 1;
+                }
+                Ok(None) => {
+                    eof = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    eof = true;
+                    break;
+                }
+            }
+        }
+        (popped, eof)
+    }
+
+    /// 首帧前管道死亡(EOF):丢弃管道并把原 seek 目标留给重试。返回
+    /// true = 已登记重试;false = 已出过帧,应走正常耗尽(finished)。
+    /// 典型症状:安全软件首次放行前拦截 ffmpeg(表现为"第二次播放才
+    /// 出视频")—— 按当前时刻重试会裁开头,必须原位重试。
+    fn retry_before_first_frame(&mut self) -> bool {
+        if self.frame_pts != f64::NEG_INFINITY {
+            return false;
+        }
+        if let Some(pipe) = self.source.as_ref() {
+            self.retry_from_ms = Some(pipe.next_pts_ms);
+        }
+        self.source = None;
+        true
+    }
 }
 
 /// The GPU half: the library's sprite renderer, compositing directly
@@ -585,14 +737,19 @@ impl StoryboardLayer {
     ) {
         self.sb.set_video_upscale(mode, target);
         // 立刻重建当前帧:暂停时 pump_video 不出帧(时钟冻结),新链
-        // 要等下一帧才会被采样 —— 把管道里保留的最后一帧重推过新链,
-        // 切滤镜在暂停状态下也即时可见。
+        // 要等下一帧才会被采样 —— 把最近入纹理的帧重推过新链,
+        // 切滤镜在暂停状态下也即时可见。管道已重置(seek/循环)时无
+        // 留档帧,等新帧自然到来。
         if let Some(v) = &self.video {
-            if let Some(pipe) = &v.source {
-                let (w, h) = (v.info.width, v.info.height);
-                if w > 0 && h > 0 && pipe.frame.len() == (w * h * 4) as usize {
-                    let frame = pipe.frame.clone();
-                    self.sb.write_frame(VIDEO_KEY, w, h, &frame);
+            let (w, h) = (v.info.width, v.info.height);
+            if v.source.is_some() && w > 0 && h > 0 {
+                #[cfg(not(target_os = "android"))]
+                if let Some(frame) = v.last_frame.as_ref() {
+                    self.sb.write_frame(VIDEO_KEY, w, h, frame);
+                }
+                #[cfg(target_os = "android")]
+                if let Some((fw, fh, rgba)) = v.source.as_ref() {
+                    self.sb.write_frame(VIDEO_KEY, *fw, *fh, rgba);
                 }
             }
         }
@@ -621,6 +778,11 @@ impl StoryboardLayer {
             v.finished = false;
             v.frame_pts = f64::NEG_INFINITY;
             v.spawn_attempts = 0;
+            #[cfg(not(target_os = "android"))]
+            {
+                v.last_frame = None;
+                v.retry_from_ms = None;
+            }
         }
     }
 
@@ -735,14 +897,22 @@ impl StoryboardLayer {
         }
     }
 
-    /// 视频落后当前渲染时刻超过此值(ms)时,丢弃管道并按当前时间 `-ss`
-    /// 重起(关键帧快 seek)。否则大前跳 seek 后的顺序补帧会长时间阻塞
-    /// 事件循环——BGM 在 kira 音频线程先行,恢复时时钟硬对齐把整段
-    /// 打击音效跳过;解码慢于实时的视频更是每拍都卡(音效持续偏移)。
+    /// 视频落后当前渲染时刻超过此值(ms)且已出过首帧时,丢弃管道并按
+    /// 当前时间 `-ss` 重起(关键帧快 seek)。否则大前跳 seek 后的顺序
+    /// 补帧追帧期过长;解码慢于实时的视频会持续偏移。
     const RESPAWN_BEHIND_MS: f64 = 1500.0;
 
-    /// 推进桌面视频解码器到时刻 t(读帧直到追上或达单拍上限;渲染时间
-    /// 单调递增,与管道节奏天然同步)。
+    /// 落后重起的宽限:距**首帧**(不是 spawn——首帧在路上的冷启动等待
+    /// 不是落后)超过此时长才允许重起。覆盖 `-ss` 落点关键帧在目标前
+    /// 数秒的大 GOP 补帧期(4 帧/拍,远快于实时)。
+    const RESPAWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// 管道启动超时:spawn 后这么久仍未出首帧 = 进程被挂起/AV 拦截一类,
+    /// 按启动失败处理(保留 seek 目标重试;重试额度用尽则放弃视频)。
+    const VIDEO_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// 推进桌面视频解码器到时刻 t(非阻塞读帧直到追上或达单拍上限;
+    /// 渲染时间单调递增,与管道节奏天然同步)。
     #[cfg(not(target_os = "android"))]
     fn pump_video(&mut self, t: f32) {
         let (w, h) = match &self.video {
@@ -752,6 +922,8 @@ impl StoryboardLayer {
         let v = self.video.as_mut().unwrap();
         if v.source.is_none() {
             // 懒启动:接近视频开始再 spawn,-ss 直接跳到当前渲染位置。
+            // 失败重试(retry_from_ms)必须落回原 seek 目标:按"当前渲染
+            // 时刻"重试会把从未显示过的开头裁掉。
             if t as f64 + 1000.0 < v.info.start_ms as f64 {
                 return;
             }
@@ -760,62 +932,117 @@ impl StoryboardLayer {
                 return;
             }
             v.spawn_attempts += 1;
+            let from = v.retry_from_ms.take().unwrap_or(t as f64);
             let info = v.info.clone();
             let ffmpeg = self.ffmpeg_bin.clone();
-            v.source = VideoPipe::spawn(&info, t as f64, ffmpeg.as_deref());
+            v.source = VideoPipe::spawn(&info, from, ffmpeg.as_deref());
             if v.source.is_none() {
                 v.finished = true;
-                return;
             }
-            // spawn 当拍不读帧:ffmpeg -ss 起播到首帧输出的阻塞留给下一拍
             return;
         }
-        // 大幅落后(大前跳 seek / 解码跟不上实时):丢弃管道,下一拍按
-        // 当前时间 -ss 重起,不顺序补帧。主动重起不占失败重试额度。
-        // 起播宽限:-ss 落点的关键帧可能在目标前数秒(GOP),补帧期
-        // (4 帧/拍,远快于实时)不算落后,否则会反复重起同一关键帧。
-        if let Some(pipe) = &v.source {
-            if t as f64 - pipe.next_pts_ms > Self::RESPAWN_BEHIND_MS
-                && pipe.spawned_at.elapsed() > std::time::Duration::from_secs(5)
-            {
+        // 管道判定(取帧前):启动超时 → 保留 seek 目标重试(不裁开头);
+        // 落后重起仅在"已出首帧"(解码真正在跑)后由 needs_respawn 判定
+        // —— 首帧在路上的冷启动等待不是落后,按当前时刻 -ss 重起会把
+        // 从未显示过的开头整体裁掉(首播裁头的根因)。
+        if let Some(pipe) = v.source.as_ref() {
+            if pipe.startup_timed_out() {
+                eprintln!(
+                    "storyboard: 视频管道 {:?} 未出首帧,按启动失败原位重试",
+                    v.info.path
+                );
+                let from = pipe.next_pts_ms;
+                v.source = None;
+                v.retry_from_ms = Some(from);
+                return;
+            }
+            if pipe.needs_respawn(t as f64) {
+                log::info!(
+                    "[video-probe] respawn: t={} next_pts={} behind={:.0}ms",
+                    t,
+                    pipe.next_pts_ms,
+                    t as f64 - pipe.next_pts_ms
+                );
                 v.source = None;
                 v.spawn_attempts = 0;
                 return;
             }
         }
-        // 单拍顺序读取上限:把本拍阻塞限制在几帧时间内,事件循环
-        // (时钟积分 + 打击音效)得以按拍推进,欠账由后续拍补齐。
+        // 非阻塞取帧(读帧线程在后台等 ffmpeg 冷启动):首帧未到时本拍
+        // 空转即返回,事件循环照常推进;首帧到达后按单拍上限补帧,
+        // 追帧期画面快速推进,内容完整。
         const PUMP_MAX_FRAMES: u32 = 4;
-        let mut updated = false;
-        if let Some(pipe) = &mut v.source {
-            let mut frames = 0u32;
-            while pipe.next_pts_ms <= t as f64 && frames < PUMP_MAX_FRAMES {
-                if !pipe.read_frame() {
-                    if v.frame_pts == f64::NEG_INFINITY {
-                        // 首帧未到管道即结束:解码进程被外部终止的典型症状
-                        // (安全软件首次放行前拦截 ffmpeg —— 表现为"第二次
-                        // 播放才出视频")。丢弃管道下一轮重试(有上限),
-                        // 不静默放弃。
-                        eprintln!(
-                            "storyboard: 视频管道首帧前结束({:?}),重试 {}/2",
-                            v.info.path, v.spawn_attempts
-                        );
-                        v.source = None;
-                        return;
-                    }
-                    v.finished = true;
-                    break;
-                }
-                v.frame_pts = pipe.next_pts_ms;
-                pipe.next_pts_ms += pipe.step_ms;
-                updated = true;
-                frames += 1;
+        let (popped, eof) = v.drain(t as f64, PUMP_MAX_FRAMES);
+        if eof && !v.retry_before_first_frame() {
+            // 已出过帧的正常耗尽:保留最后一帧显示到结束
+            v.finished = true;
+        }
+        if popped > 0 {
+            if let Some(frame) = v.last_frame.as_ref() {
+                self.sb.write_frame(VIDEO_KEY, w, h, frame);
             }
         }
-        if updated {
-            if let Some(pipe) = &v.source {
-                self.sb.write_frame(VIDEO_KEY, w, h, &pipe.frame);
+    }
+
+    /// 起播前预热视频管道:按起播时刻 spawn + 有界等首帧(至多
+    /// `deadline`)。ffmpeg 冷启动(大体积静态 exe 首次执行的 Defender
+    /// 扫描 + 冷页载入)出首帧可达数秒;放到加载期等待,起播时第一帧
+    /// 已就绪、画面与音乐同帧开始。超时即返回(管道保留,播放期泵以
+    /// 非阻塞方式继续等,永不因等待裁开头);首帧前 EOF 则登记原目标
+    /// 重试,交还泵的失败重试链。须在 `set_video_bins` 之后调用。
+    #[cfg(not(target_os = "android"))]
+    pub fn prewarm_video(&mut self, from_map_ms: f64, deadline: std::time::Instant) {
+        if !self.video_enabled {
+            return;
+        }
+        let (info, ffmpeg) = {
+            let Some(v) = self.video.as_ref() else { return };
+            if v.source.is_some() || v.finished || v.info.width == 0 {
+                return;
             }
+            if from_map_ms + 1000.0 < v.info.start_ms as f64 {
+                return; // 与懒启动同一门槛:视频开始还早,不值得预热
+            }
+            (v.info.clone(), self.ffmpeg_bin.clone())
+        };
+        let v = self.video.as_mut().unwrap();
+        v.spawn_attempts += 1;
+        match VideoPipe::spawn(&info, from_map_ms, ffmpeg.as_deref()) {
+            Some(pipe) => v.source = Some(pipe),
+            None => {
+                v.finished = true;
+                return;
+            }
+        }
+        loop {
+            let (_, eof) = v.drain(f64::INFINITY, 1);
+            if eof {
+                if v.retry_before_first_frame() {
+                    eprintln!(
+                        "storyboard: 预热管道首帧前结束({:?}),交还泵重试",
+                        v.info.path
+                    );
+                } else {
+                    // 已出过帧的正常耗尽(超短视频):帧照常入纹理
+                    v.finished = true;
+                    if let Some(frame) = v.last_frame.as_ref() {
+                        let (w, h) = (v.info.width, v.info.height);
+                        self.sb.write_frame(VIDEO_KEY, w, h, frame);
+                    }
+                }
+                return;
+            }
+            if v.frame_pts != f64::NEG_INFINITY {
+                break; // 首帧已到,写入纹理,起播即可见
+            }
+            if std::time::Instant::now() >= deadline {
+                break; // 冷启动过慢:管道保留,播放期继续等(不裁开头)
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if let Some(frame) = v.last_frame.as_ref() {
+            let (w, h) = (v.info.width, v.info.height);
+            self.sb.write_frame(VIDEO_KEY, w, h, frame);
         }
     }
 
@@ -928,13 +1155,32 @@ mod opp_video_chain_tests {
         probe_video(&mut info2, None);
         assert_eq!((info2.width, info2.height), (160, 120), "注入路径探测");
 
-        let mut pipe = VideoPipe::spawn(&info2, 0.0, None).expect("解码管道启动");
-        assert!(pipe.read_frame(), "读出第一帧 RGBA");
-        assert!(pipe.frame.len() == 160 * 120 * 4, "帧尺寸");
-        drop(pipe);
+        // 读帧线程 + 非阻塞 drain:等首帧(阻塞式 recv 兜底测试超时)。
+        let mut state = VideoState {
+            info: info2.clone(),
+            source: Some(VideoPipe::spawn(&info2, 0.0, None).expect("解码管道启动")),
+            finished: false,
+            frame_pts: f64::NEG_INFINITY,
+            spawn_attempts: 1,
+            last_frame: None,
+            retry_from_ms: None,
+        };
+        let (popped, _) = poll_first_frame(&mut state, std::time::Duration::from_secs(10));
+        assert!(popped > 0, "读出第一帧 RGBA");
+        assert_eq!(state.last_frame.as_ref().unwrap().len(), 160 * 120 * 4, "帧尺寸");
+        drop(state);
         // -ss 起播路径(懒启动从中途 spawn)同样要能出帧。
-        let mut seeked = VideoPipe::spawn(&info2, 500.0, None).expect("seek 管道启动");
-        assert!(seeked.read_frame(), "seek 后读出帧 RGBA");
+        let mut seeked = VideoState {
+            info: info2.clone(),
+            source: Some(VideoPipe::spawn(&info2, 500.0, None).expect("seek 管道启动")),
+            finished: false,
+            frame_pts: f64::NEG_INFINITY,
+            spawn_attempts: 1,
+            last_frame: None,
+            retry_from_ms: None,
+        };
+        let (popped, _) = poll_first_frame(&mut seeked, std::time::Duration::from_secs(10));
+        assert!(popped > 0, "seek 后读出帧 RGBA");
 
         // 显示矩阵旋转:ffmpeg rawvideo 已转置输出帧,probe 必须交换宽高,
         // 否则 write_frame 按错误尺寸上传,画面错乱变形。
@@ -970,6 +1216,139 @@ mod opp_video_chain_tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 测试辅助:轮询 drain 直到出首帧/EOF/超时(模拟泵的逐拍推进)。
+    fn poll_first_frame(v: &mut VideoState, timeout: std::time::Duration) -> (u32, bool) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let (popped, eof) = v.drain(f64::INFINITY, 1);
+            if popped > 0 || eof || std::time::Instant::now() >= deadline {
+                return (popped, eof);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// 测试用 VideoState(桌面字段全预置)。
+    fn fake_state(pipe: VideoPipe) -> VideoState {
+        VideoState {
+            info: VideoInfo {
+                path: PathBuf::from("fake.mp4"),
+                start_ms: 0.0,
+                duration_ms: 0.0,
+                width: 160,
+                height: 120,
+                fps: 25.0,
+            },
+            source: Some(pipe),
+            finished: false,
+            frame_pts: f64::NEG_INFINITY,
+            spawn_attempts: 1,
+            last_frame: None,
+            retry_from_ms: None,
+        }
+    }
+
+    /// 首播裁头回归:冷启动(首帧未到)时,无论落后多少、spawn 多久,
+    /// 都不得判"落后重起"—— 那会按当前时刻 -ss 重起,把从未显示过的
+    /// 开头整体裁掉(实测 Button (Flask) 的 optc.flv 首个 GOP 19.8s,
+    /// 冷 ffmpeg 首帧 >5s 即触发)。
+    #[test]
+    fn cold_start_wait_is_never_respawn() {
+        let spawned_at = std::time::Instant::now() - std::time::Duration::from_secs(20);
+        let (pipe, _tx) = VideoPipe::fake(0.0, 40.0, spawned_at, None);
+        // 渲染时钟已走 60s(阻塞式旧实现里 = 首帧等了 60s),管道 next_pts 仍为 0
+        assert!(!pipe.needs_respawn(60_000.0), "首帧未到 = 冷启动等待,不是落后");
+        // 启动超时未到(30s):继续等
+        assert!(!pipe.startup_timed_out());
+    }
+
+    /// 启动超时(进程挂起/AV 拦截):按启动失败处理 —— 原目标重试,
+    /// 不是 -ss 当前时刻。
+    #[test]
+    fn startup_timeout_requires_retry_not_seek() {
+        let spawned_at = std::time::Instant::now() - (StoryboardLayer::VIDEO_STARTUP_TIMEOUT + std::time::Duration::from_secs(1));
+        let (pipe, _tx) = VideoPipe::fake(0.0, 40.0, spawned_at, None);
+        assert!(pipe.startup_timed_out(), "超时未出首帧应判启动失败");
+    }
+
+    /// 解码确实落后(已出帧、超宽限):应重起(同步优先于完整)。
+    #[test]
+    fn decoding_behind_after_grace_respawns() {
+        let first_frame_at = std::time::Instant::now() - std::time::Duration::from_secs(6);
+        let (pipe, _tx) = VideoPipe::fake(0.0, 40.0, std::time::Instant::now(), Some(first_frame_at));
+        assert!(pipe.needs_respawn(2_000.0), "已出帧且落后 2s、距首帧超宽限 → 重起");
+    }
+
+    /// -ss 落点关键帧在目标前数秒(大 GOP 补帧期):宽限内不重起
+    /// (否则反复重起在同一关键帧)。
+    #[test]
+    fn gop_catchup_within_grace_is_not_behind() {
+        let first_frame_at = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        let (pipe, _tx) = VideoPipe::fake(0.0, 40.0, std::time::Instant::now(), Some(first_frame_at));
+        assert!(!pipe.needs_respawn(60_000.0), "距首帧未超宽限 → 补帧期,不重起");
+    }
+
+    /// 首帧前管道死亡(AV 拦截 ffmpeg):重试必须保留原 seek 目标,
+    /// 不得改用"当前渲染时刻"(否则开头被裁)。
+    #[test]
+    fn eof_before_first_frame_preserves_seek_target() {
+        let (pipe, tx) = VideoPipe::fake(5_000.0, 40.0, std::time::Instant::now(), None);
+        let mut state = fake_state(pipe);
+        tx.send(None).unwrap(); // 立即 EOF
+        let (_, eof) = state.drain(1e9, 4);
+        assert!(eof);
+        assert!(state.retry_before_first_frame(), "首帧前 EOF 应登记重试");
+        assert!(state.source.is_none(), "死亡管道已丢弃");
+        assert_eq!(state.retry_from_ms, Some(5_000.0), "重试落回原 seek 目标(不是当前时刻)");
+
+        // 已出过帧的 EOF:不登记重试,走正常耗尽
+        let (pipe2, tx2) = VideoPipe::fake(0.0, 40.0, std::time::Instant::now(), None);
+        let mut state2 = fake_state(pipe2);
+        tx2.send(Some(vec![0u8; 160 * 120 * 4])).unwrap();
+        tx2.send(None).unwrap();
+        let _ = state2.drain(1e9, 4);
+        assert!(!state2.retry_before_first_frame(), "已出帧 → 正常耗尽(finished)");
+    }
+
+    /// drain 时间戳推进与 EOF 报告:恒定帧率步进,本批最后一帧留档。
+    #[test]
+    fn drain_advances_pts_and_reports_eof() {
+        let (pipe, tx) = VideoPipe::fake(0.0, 40.0, std::time::Instant::now(), None);
+        let mut state = fake_state(pipe);
+        let frame = vec![7u8; 160 * 120 * 4];
+        tx.send(Some(frame.clone())).unwrap();
+        tx.send(Some(frame.clone())).unwrap();
+        tx.send(None).unwrap();
+        let (popped, eof) = state.drain(1e9, 4);
+        assert_eq!((popped, eof), (2, true), "2 帧 + EOF 一次取尽");
+        assert_eq!(state.frame_pts, 40.0, "最后一帧时间 = 0 + 1×step");
+        assert_eq!(state.source.as_ref().unwrap().next_pts_ms, 80.0);
+        assert!(state.last_frame.as_ref().unwrap().iter().all(|&b| b == 7));
+        // 单拍上限:再投帧也不超 max
+        tx.send(Some(frame)).unwrap();
+        let (popped, _) = state.drain(1e9, 1);
+        assert_eq!(popped, 1);
+    }
+
+    /// 冷启动结束的衔接:迟到帧到达 → drain 消费并记 first_frame_at,
+    /// 宽限从这一刻起算(此前等待期永不重起)。
+    #[test]
+    fn late_first_frame_flips_into_decoding_with_fresh_grace() {
+        let spawned_at = std::time::Instant::now() - std::time::Duration::from_secs(20);
+        let (pipe, tx) = VideoPipe::fake(0.0, 40.0, spawned_at, None);
+        let mut state = fake_state(pipe);
+        // 等待期:渲染时钟已 20s,帧未到 —— 非阻塞空转,不判落后
+        let (popped, eof) = state.drain(20_000.0, 4);
+        assert_eq!((popped, eof), (0, false), "无帧可取,空转");
+        // 首帧迟到到达(读帧线程投递)
+        tx.send(Some(vec![1u8; 160 * 120 * 4])).unwrap();
+        let (popped, _) = state.drain(20_000.0, 4);
+        assert_eq!(popped, 1, "迟到帧立即被消费");
+        let pipe = state.source.as_ref().unwrap();
+        assert!(pipe.first_frame_at.is_some(), "首帧时刻已记录");
+        assert!(!pipe.needs_respawn(20_000.0), "宽限自首帧重新起算,补帧期不重起");
     }
 
     /// 视频显示尺寸严格等比(lazer DrawableStoryboardVideo:
