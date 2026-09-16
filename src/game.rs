@@ -438,9 +438,12 @@ fn with_lead_in(mut snapshots: Vec<FrameSnap>, rate: f64) -> Vec<FrameSnap> {
     snapshots
 }
 
-/// [`load`] with the rosu-pp pass skippable (`with_pp: false` — hosts whose
-/// HUD hides the PP counter skip the stars/PP timeline for load time; the
-/// results screen then carries no PP/graph data).
+/// [`load`] with the rosu-pp pass skippable (`with_pp: false` — hosts that
+/// won't consume PP/stars data skip the calculation for load time; the
+/// results screen then carries no PP/graph data). Decide by whether PP data
+/// is wanted at all (the host's PP-display option, a results screen, a
+/// later backfill), NOT by HUD visibility — HUD is a pure display toggle
+/// over precomputed data.
 pub fn load_with_pp(map_path: &str, replay_path: &str, with_pp: bool) -> Result<GameData, String> {    let content = std::fs::read_to_string(map_path).map_err(|e| format!("cannot read beatmap {map_path}: {e}"))?;
     let mut map = beatmap::decode(&content)?;
     let rep = replay::decode_file(replay_path, map.version)?;
@@ -495,7 +498,8 @@ pub fn load(map_path: &str, replay_path: &str) -> Result<GameData, String> {
 /// its visuals on top of the host's own `hidden` flag.
 /// `hidden`: host-side HD visual switch (same effect as the HD bit).
 /// `with_pp`: skip the rosu-pp pass (stars/PP timeline) when the host won't
-/// display it (live wallpaper with HUD off) — saves load time.
+/// consume PP data — decide by the host's PP-display option (or a later
+/// backfill re-run), NOT by HUD visibility; HUD is a pure display toggle.
 pub fn load_autoplay(map_path: &str, mods_bits: u32, hidden: bool, with_pp: bool) -> Result<GameData, String> {
     let content = std::fs::read_to_string(map_path).map_err(|e| format!("cannot read beatmap {map_path}: {e}"))?;
     load_autoplay_content(&content, mods_bits, hidden, with_pp)
