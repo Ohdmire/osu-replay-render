@@ -3,8 +3,8 @@
 //! osu! stable semantics) through the `osu-storyboard-render` library.
 //!
 //! The storyboard is composited into two offscreen Rgba8Unorm textures —
-//! below (Background/Fail/Pass) and above (Foreground/Overlay) the
-//! playfield, matching osu!'s layer order — and GPU-copied every frame
+//! below (Background/Fail/Pass/Foreground, lazer underlay) and above
+//! (Overlay proxy only) the playfield — and GPU-copied every frame
 //! into full-frame atlas slots (`Region::Storyboard` /
 //! `Region::StoryboardForeground`). The scene blits those slots as
 //! premultiplied coverage so additive sprites add light onto the
@@ -26,7 +26,7 @@
 
 use crate::draw::{Atlas, Region};
 use osu_storyboard_render::osb::model::Layer;
-use osu_storyboard_render::osb::timeline::{CompiledStoryboard, FailState};
+use osu_storyboard_render::osb::timeline::{CompiledStoryboard, FailState, TriggerEvent, TriggerKind};
 use osu_storyboard_render::render::renderer::{
     build_draws_filtered, prefetch_textures as sb_prefetch_textures, Draw, GpuInstance,
     Renderer as SbRenderer,
@@ -86,6 +86,8 @@ pub struct ParsedStoryboard {
     /// 视频独占故事板)。视口若按 4:3 处理,视频会被放得更大、裁掉更多,
     /// 看起来像异常拉伸。
     video_only: bool,
+    /// `[General] UseSkinSprites`.
+    use_skin_sprites: bool,
 }
 
 /// 在目录里大小写不敏感地找文件名(视频/素材常与声明大小写不符)。
@@ -310,18 +312,14 @@ fn finish_storyboard(
         })
         .unwrap_or(false);
 
-    // 上槽 = Foreground + Overlay。stable 把 Foreground 画在物件前面
-    // (Background/Fail/Pass 在后);lazer 把整棵故事板放在 underlay、只把
-    // Overlay 代理到物件上方,Foreground 加色精灵因此和背景挤在同一张
-    // 槽里,重叠后槽位变不透明,背景亮度透不过来。
-    let foreground = story
-        .elements
-        .iter()
-        .any(|e| matches!(e.sprite().layer, Layer::Foreground | Layer::Overlay));
+    // lazer `Player.createOverlayComponents` 只把 Overlay 代理到物件上方。
+    // Foreground 留在 underlay，和 Background/Fail/Pass 一起画在游玩区后面。
+    let foreground = story.elements.iter().any(|e| e.sprite().layer == Layer::Overlay);
     // lazer onlyHasVideoElements:背景行已被 loader 剔除、接管型背景裸
     // 精灵已在上面剔除,剩下的元素为空且带视频 = 只有视频的故事板。
     let video_only = story.elements.is_empty() && !story.videos.is_empty();
     let compiled_samples = story.samples.clone();
+    let use_skin_sprites = story.use_skin_sprites;
     let compiled = CompiledStoryboard::compile(story);
     // CPU 解码缓存预算:SB_CACHE_MB 环境变量覆盖(嵌入式/壁纸宿主可调低
     // 换内存;缺省与独立渲染器一致)。视频式逐帧动画的 storyboard 可引用
@@ -340,6 +338,7 @@ fn finish_storyboard(
             replaces_background,
             video,
             video_only,
+            use_skin_sprites,
         })
 }
 
@@ -349,6 +348,17 @@ impl ParsedStoryboard {
     /// playfield draw).
     pub fn has_foreground(&self) -> bool {
         self.foreground
+    }
+
+    pub fn use_skin_sprites(&self) -> bool {
+        self.use_skin_sprites
+    }
+
+    /// Skin images for `UseSkinSprites`. Ignored when the flag is off.
+    pub fn set_skin_files(&mut self, files: std::collections::HashMap<String, std::path::PathBuf>) {
+        if self.use_skin_sprites {
+            self.assets.set_skin_files(files);
+        }
     }
 
     /// Whether the host must hide `Region::Background` while this
@@ -405,6 +415,7 @@ impl ParsedStoryboard {
             video_only: self.video_only,
             replaces_bg,
             elements_enabled: true,
+            passing: true,
             video_enabled: true,
         }
     }
@@ -678,6 +689,8 @@ pub struct StoryboardLayer {
     replaces_bg: bool,
     /// 元素层开关(`--storyboard`):off 时只画视频层,精灵层全部跳过。
     elements_enabled: bool,
+    /// lazer `DrawableStoryboard`：`health >= 0.5` 为 Pass，否则 Fail。
+    passing: bool,
     /// 视频层开关(`--video`):off 时不解码也不画视频。
     video_enabled: bool,
 }
@@ -713,6 +726,82 @@ impl StoryboardLayer {
     /// 故事板暗度(= 背景亮度;精灵绘制时 RGB 预乘)。
     pub fn set_dim(&mut self, dim: f32) {
         self.dim = dim.clamp(0.0, 1.0);
+    }
+
+    /// `DrawableStoryboard`：血量 ≥ 0.5 显示 Pass 层，否则显示 Fail 层。
+    pub fn set_passing(&mut self, passing: bool) {
+        self.passing = passing;
+    }
+
+    fn fail_state(&self) -> FailState {
+        if self.passing { FailState::Pass } else { FailState::Fail }
+    }
+}
+
+/// Passing/Failing edges, hit judgements, and hit-sample bursts for
+/// `StoryboardTriggerController`. The initial passing=true does not emit
+/// an event (`BindValueChanged` is not invoked on bind).
+pub fn gameplay_trigger_events(game: &crate::game::GameData) -> Vec<TriggerEvent> {
+    use osu_replay_judge::score::hit_result_ext;
+    let mut events = Vec::new();
+    let mut prev_pass = true;
+    let mut knots = vec![game.health.drain_start, game.health.drain_end];
+    for e in &game.health.events {
+        knots.push(e.0);
+    }
+    for &(a, b) in &game.health.no_drain {
+        knots.push(a);
+        knots.push(b);
+    }
+    knots.sort_by(f64::total_cmp);
+    knots.dedup_by(|a, b| (*a - *b).abs() < 1e-3);
+    for w in knots.windows(2) {
+        let (t0, t1) = (w[0], w[1]);
+        if t1 <= t0 {
+            continue;
+        }
+        let h0 = crate::game::health_at(game, t0);
+        let h1 = crate::game::health_at(game, t1);
+        let p0 = h0 >= 0.5;
+        let p1 = h1 >= 0.5;
+        if p0 == p1 {
+            continue;
+        }
+        let frac = if (h1 - h0).abs() < 1e-9 { 0.0 } else { ((0.5 - h0) / (h1 - h0)).clamp(0.0, 1.0) };
+        let t = t0 + (t1 - t0) * frac;
+        let now = p1;
+        if now != prev_pass {
+            events.push(TriggerEvent {
+                time: t as f32,
+                kind: if now { TriggerKind::Passing } else { TriggerKind::Failing },
+            });
+            prev_pass = now;
+        }
+    }
+    for ev in &game.events {
+        if hit_result_ext::is_hit(ev.result) && hit_result_ext::is_scorable(ev.result) {
+            events.push(TriggerEvent { time: ev.time as f32, kind: TriggerKind::HitObjectHit });
+        }
+    }
+    for group in crate::hitsound::trigger_sample_groups(game) {
+        events.push(TriggerEvent {
+            time: group.time_ms as f32,
+            kind: TriggerKind::Samples(group.samples),
+        });
+    }
+    events
+}
+
+impl StoryboardLayer {
+    /// 把已发生的 Passing/Failing/HitObjectHit/HitSound 展开进精灵命令。
+    /// 只应在开画前调用一次。
+    pub fn arm_triggers(&mut self, events: &[TriggerEvent]) {
+        if events.is_empty() {
+            return;
+        }
+        for el in &mut self.compiled.elements {
+            el.apply_triggers(events);
+        }
     }
 
     pub fn elements_enabled(&self) -> bool {
@@ -834,17 +923,17 @@ impl StoryboardLayer {
             self.pump_video(t);
         }
 
+        let fail = self.fail_state();
         let mut below_draws = if self.elements_enabled {
-            // 下槽:Background/Fail/Pass(视频另插在最底)。Foreground 与
-            // Overlay 走上槽,画在物件前面。
+            // underlay：Background/Fail/Pass/Foreground。只有 Overlay 走上槽。
             build_draws_filtered(
                 &mut self.sb,
                 &mut self.assets,
                 &self.compiled,
                 t,
-                FailState::Pass,
+                fail,
                 dim,
-                |layer| matches!(layer, Layer::Background | Layer::Fail | Layer::Pass),
+                |layer| !matches!(layer, Layer::Overlay),
             )
         } else {
             Vec::new()
@@ -877,9 +966,9 @@ impl StoryboardLayer {
                     &mut self.assets,
                     &self.compiled,
                     t,
-                    FailState::Pass,
+                    fail,
                     dim,
-                    |layer| matches!(layer, Layer::Foreground | Layer::Overlay),
+                    |layer| matches!(layer, Layer::Overlay),
                 )
             } else {
                 Vec::new()

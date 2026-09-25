@@ -864,7 +864,7 @@ fn main() {
     // halves are toggled independently (elements vs video layer).
     // 解析必须先于背景解码:背景接管(ReplacesBackground)判定决定背景图
     // 是否还要加载(被接管的谱面由故事板自己绘制那张背景,如 execute me)。
-    let sb_parsed = if opts.storyboard || opts.video {
+    let mut sb_parsed = if opts.storyboard || opts.video {
         let parsed = osu_replay_render::storyboard::parse_beatmap(
             std::path::Path::new(&map_path),
             game.map_background.as_deref(),
@@ -1011,8 +1011,18 @@ fn main() {
     }
     // Storyboard GPU layer on the renderer's device; below-layers dim with
     // the background (osu! DimLevel semantics), full when it is off.
-    let mut sb_layer = sb_parsed.map(|p| {
-        p.into_layer(renderer.device(), renderer.queue(), sb_slot.0, sb_slot.1)
+    if let Some(parsed) = sb_parsed.as_mut() {
+        if parsed.use_skin_sprites() {
+            if let Some(files) = resolved_skin.legacy().map(|s| s.image_files().clone()) {
+                parsed.set_skin_files(files);
+            }
+        }
+    }
+    let mut sb_layer = sb_parsed.map(|mut p| {
+        let events = osu_replay_render::storyboard::gameplay_trigger_events(&game);
+        let mut layer = p.into_layer(renderer.device(), renderer.queue(), sb_slot.0, sb_slot.1);
+        layer.arm_triggers(&events);
+        layer
     });
     // Independent halves: `--storyboard` drives the sprite layers,
     // `--video` the video layer (either alone still creates the layer).
@@ -1266,6 +1276,9 @@ fn main() {
         // Storyboard composites first: the atlas copies are queue-ordered
         // ahead of the scene submission below.
         if let Some(sb) = &mut sb_layer {
+            let bright = crate::scene::effective_brightness(sb_dim, state.break_lighten, &game, ft);
+            sb.set_dim(bright);
+            sb.set_passing(game::health_at(&game, ft) >= 0.5);
             sb.render(ft as f32, &mut renderer, &atlas);
         }
         // Pipelined: submit this frame WITHOUT waiting for the GPU, and

@@ -149,6 +149,14 @@ fn visit_skin_tree(
 }
 
 impl LegacySkin {
+    /// Image files keyed the way `GetTexture` looks them up
+    /// (lowercased path, no extension).
+    pub fn image_files(&self) -> &HashMap<String, PathBuf> {
+        &self.files
+    }
+}
+
+impl LegacySkin {
     /// Construct from a skin directory. Parses `skin.ini` when present
     /// (both decoder passes, like `LegacySkin.ParseConfigurationStream`);
     /// a missing ini leaves the `LATEST_VERSION` default of the `Skin`

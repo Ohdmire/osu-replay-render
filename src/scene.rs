@@ -92,7 +92,37 @@ fn hd_fade_in(obj: &ObjView) -> f64 {
 /// the last object's end (`HasCompleted`). The value eases between edges;
 /// the newest edge at or before `t` wins (edges alternate lighten/normal,
 /// so the ease always runs from the opposite value).
-fn break_lighten_at(breaks: &[(f64, f64)], first_start: Option<f64>, last_end: Option<f64>, t: f64) -> f32 {
+/// Brightness (`1 - DimLevel`) after `UserDimContainer` break lightening.
+pub fn effective_brightness(base: f32, lighten: bool, game: &GameData, t: f64) -> f32 {
+    if !lighten {
+        return base.clamp(0.0, 1.0);
+    }
+    let first = game.objects.first().map(|o| o.start_time);
+    let last = game.objects.last().map(|o| o.end_time);
+    (base + break_lighten_at(&game.breaks, first, last, t)).min(1.0)
+}
+
+/// `LetterboxOverlay` alpha at `t` for breaks with `HasEffect` (duration >= 650ms).
+fn letterbox_alpha(breaks: &[(f64, f64)], t: f64) -> f32 {
+    const FADE: f64 = 325.0;
+    const MIN_BREAK: f64 = 650.0;
+    let mut alpha = 0.0f32;
+    for &(start, end) in breaks {
+        if end - start < MIN_BREAK || t < start || t > end {
+            continue;
+        }
+        let fade_in = ((t - start) / FADE).clamp(0.0, 1.0) as f32;
+        let fade_out = if t >= end - FADE {
+            (1.0 - ((t - (end - FADE)) / FADE).clamp(0.0, 1.0)) as f32
+        } else {
+            1.0
+        };
+        alpha = alpha.max(fade_in.min(fade_out));
+    }
+    alpha
+}
+
+pub fn break_lighten_at(breaks: &[(f64, f64)], first_start: Option<f64>, last_end: Option<f64>, t: f64) -> f32 {
     const BREAK_FADE: f64 = 325.0;
     const MIN_BREAK: f64 = 650.0;
     const FADE: f64 = 800.0;
@@ -695,9 +725,12 @@ pub struct SceneState {
     /// post-completion periods. Default ON (lazer parity:
     /// `SetDefault(OsuSetting.LightenDuringBreaks, true)`). NOTE: only
     /// the background
-    /// IMAGE lightens — the storyboard composite's dim is premultiplied
-    /// host-side and stays put.
+    /// IMAGE and the storyboard share it. The host multiplies the same
+    /// brightness into storyboard sprites each frame (`StoryboardLayer::set_dim`).
     pub break_lighten: bool,
+    /// `[General] LetterboxInBreaks`。休息段在故事板之上、物件之下盖
+    /// 上下各 12.5% 的黑边（`LetterboxOverlay`）。
+    pub letterbox_in_breaks: bool,
     /// 只渲染背景 + storyboard(音频/判定照常):跳过 note/滑条/转盘/
     /// 跟随点/判定动画/光标等全部 gameplay 元素(壁纸"纯画面"模式)。
     pub gameplay_hidden: bool,
@@ -742,6 +775,7 @@ impl SceneState {
             hidden: game.hidden,
             hit_animations: true,
             break_lighten: true,
+            letterbox_in_breaks: game.letterbox_in_breaks,
             results_at: None,
             results_fade_frames: 0,
             results_fadein_frames: 0,
@@ -908,7 +942,31 @@ impl SceneState {
             self.blit_storyboard(assets.atlas, list, crate::draw::Region::Storyboard);
         }
 
-        // 0.9 纯画面模式:只画背景 + storyboard(含前景槽),跳过 gameplay。
+        // LetterboxOverlay: underlay, above the storyboard, below hit objects.
+        // Top and bottom bars are each 12.5% of the screen. FadeInFromZero /
+        // FadeOut are linear over BREAK_FADE_DURATION (325ms); the fade-out
+        // starts at breakEnd - 325. Breaks shorter than 650ms have no effect.
+        if self.letterbox_in_breaks {
+            let alpha = letterbox_alpha(&game.breaks, t);
+            if alpha > 0.001 {
+                let m = &self.mapper;
+                let bar_h = m.screen_h * 0.125;
+                let col = Colour::BLACK.opacity(alpha);
+                list.quad_gradient(
+                    &[[0.0, 0.0], [m.screen_w, 0.0], [m.screen_w, bar_h], [0.0, bar_h]],
+                    [col; 4],
+                    Blend::Alpha,
+                );
+                let y0 = m.screen_h - bar_h;
+                list.quad_gradient(
+                    &[[0.0, y0], [m.screen_w, y0], [m.screen_w, m.screen_h], [0.0, m.screen_h]],
+                    [col; 4],
+                    Blend::Alpha,
+                );
+            }
+        }
+
+        // 0.9 纯画面模式:只画背景 + storyboard(含 Overlay 槽),跳过 gameplay。
         if self.gameplay_hidden {
             if self.storyboard_fg {
                 self.blit_storyboard(assets.atlas, list, crate::draw::Region::StoryboardForeground);
@@ -981,17 +1039,9 @@ impl SceneState {
             }
         }
 
-        // 7. Cursor + trail.
-        if self.show_cursor {
-            self.draw_trail(list, assets);
-            if !self.gameplay_hidden {
-                draw_cursor(self.legacy.as_ref(), assets, list, cursor_screen, self.cursor_expand as f32, self.cursor_size, self.mapper.virt, t);
-            }
-        }
-
-        // 7.5 Storyboard above-layers (Foreground/Overlay): over the
-        // playfield, under the HUD. Same DimLevel as the below slot
-        // (premultiplied into each sprite).
+        // 7. Overlay storyboard, then HUD, then the cursor.
+        // `Player.createOverlayComponents`: Overlay proxy, HUDOverlay,
+        // cursor proxy. Foreground stays in the underlay slot.
         if self.storyboard_fg {
             self.blit_storyboard(assets.atlas, list, crate::draw::Region::StoryboardForeground);
         }
@@ -1000,6 +1050,11 @@ impl SceneState {
         // 屏幕上会和结算页互相打架,进结算即消失。
         if !is_results {
             self.hud.draw(game, assets, list, &self.mapper, t);
+        }
+
+        if self.show_cursor {
+            self.draw_trail(list, assets);
+            draw_cursor(self.legacy.as_ref(), assets, list, cursor_screen, self.cursor_expand as f32, self.cursor_size, self.mapper.virt, t);
         }
 
         // 9. Results screen: fades in once the gameplay has fully faded

@@ -367,6 +367,8 @@ pub struct GameData {
     pub map_audio: Option<String>,
     /// `[Events]` background image filename (relative to the map).
     pub map_background: Option<String>,
+    /// `[General] LetterboxInBreaks`.
+    pub letterbox_in_breaks: bool,
     /// `.osu` sample-side data (banks/volumes/hit samples) parsed with the
     /// beatmap; consumed by the hitsound synthesis.
     pub sample_data: osu_parse::samples::SampleData,
@@ -466,6 +468,7 @@ pub fn load_with_pp(map_path: &str, replay_path: &str, with_pp: bool) -> Result<
     // parsed once here instead of re-reading the .osu downstream.
     data.map_audio = map.general.audio_filename.clone();
     data.map_background = map.background.clone();
+    data.letterbox_in_breaks = map.general.letterbox_in_breaks.unwrap_or(false);
     data.sample_data = std::mem::take(&mut map.sample_data);
     if with_pp {
         if let Some(pp) = crate::pp::calculate(content.as_bytes(), rep.header.mods, classic, &engine) {
@@ -543,6 +546,7 @@ pub fn load_autoplay_content(osu_text: &str, mods_bits: u32, hidden: bool, with_
     data.player = "osu!".to_string();
     data.map_audio = map.general.audio_filename.clone();
     data.map_background = map.background.clone();
+    data.letterbox_in_breaks = map.general.letterbox_in_breaks.unwrap_or(false);
     data.sample_data = std::mem::take(&mut map.sample_data);
     // HD 视觉(纯装饰:不改判定/PP;mod 位与宿主开关取或)
     data.hidden = hidden || mods.hidden;
@@ -970,6 +974,7 @@ fn build(
         map_meta,
         map_audio: None,
         map_background: None,
+        letterbox_in_breaks: false,
         sample_data: Default::default(),
         stars: f64::NAN,
         pp: f64::NAN,

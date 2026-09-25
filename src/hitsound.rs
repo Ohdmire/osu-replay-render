@@ -1630,6 +1630,40 @@ pub fn render_track_wav_linear_with_beatmap(
     render_track(game, data, t0, wall_secs, rate, scale, false, skin, beatmap)
 }
 
+/// One `PlaySamples` burst for storyboard `HitSound` triggers.
+/// Looping slide samples are omitted: lazer fires the trigger from the
+/// hit-object sample list, not from each `sliderslide` tile.
+pub struct TriggerSampleGroup {
+    pub time_ms: f64,
+    pub samples: Vec<osu_parse::storyboard::timeline::PlayedHit>,
+}
+
+pub fn trigger_sample_groups(game: &GameData) -> Vec<TriggerSampleGroup> {
+    let mut resolver = SampleResolver::builtin();
+    let placements = build_placements(game, &game.sample_data, f64::NEG_INFINITY, f64::INFINITY, &mut resolver);
+    let mut groups: Vec<TriggerSampleGroup> = Vec::new();
+    for p in placements {
+        if p.until.is_some() || !p.sample.name.starts_with("hit") {
+            continue;
+        }
+        let suffix = (p.sample.custom >= 2).then(|| p.sample.custom.to_string());
+        let hit = osu_parse::storyboard::timeline::PlayedHit {
+            name: p.sample.name.to_string(),
+            bank: p.sample.bank.as_str().to_string(),
+            suffix,
+        };
+        let key = (p.time * 1000.0).round() as i64;
+        if let Some(g) = groups.last_mut() {
+            if (g.time_ms * 1000.0).round() as i64 == key {
+                g.samples.push(hit);
+                continue;
+            }
+        }
+        groups.push(TriggerSampleGroup { time_ms: p.time, samples: vec![hit] });
+    }
+    groups
+}
+
 fn render_track(game: &GameData, data: &SampleData, t0: f64, wall_secs: f64, rate: f64, gain: f32, limit: bool, skin: &dyn crate::skin::Skin, beatmap: Option<&dyn BeatmapSampleStore>) -> Vec<u8> {
     let t_map_end = t0 + wall_secs * rate * 1000.0;
     let mut resolver = SampleResolver::with_beatmap(skin, beatmap);
