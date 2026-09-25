@@ -147,6 +147,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let t = textureSampleLevel(tex, samp, in.uv.xy, 0.0);
         let a = in.color.a * t.a;
         c = vec4<f32>(in.color.rgb * t.rgb * a, a);
+    } else if (mode == 12.0) {
+        // Premultiplied atlas region (storyboard slot). RGB is already
+        // coverage-weighted. Additive sprites add RGB and leave alpha at
+        // 0, so multiplying RGB by alpha again would erase the glow and
+        // a saturated alpha would hide the dimmed background.
+        let t = textureSampleLevel(tex, samp, in.uv.xy, 0.0);
+        c = vec4<f32>(in.color.rgb * t.rgb, in.color.a * t.a);
     } else if (mode == 1.0) {
         // Ring: annulus band, outer radius aux.y, thickness aux.z.
         let d = length(in.local);

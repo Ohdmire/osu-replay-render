@@ -6,8 +6,9 @@
 //! below (Background/Fail/Pass) and above (Foreground/Overlay) the
 //! playfield, matching osu!'s layer order — and GPU-copied every frame
 //! into full-frame atlas slots (`Region::Storyboard` /
-//! `Region::StoryboardForeground`) that the scene draws like the
-//! background image. No readback, no extra scene passes.
+//! `Region::StoryboardForeground`). The scene blits those slots as
+//! premultiplied coverage so additive sprites add light onto the
+//! background instead of replacing it. No readback, no extra scene passes.
 //!
 //! Background replacement (lazer `Storyboard.ReplacesBackground` +
 //! `Player.storyboardReplacesBackground`): when the storyboard's
@@ -309,12 +310,14 @@ fn finish_storyboard(
         })
         .unwrap_or(false);
 
-    // 上槽 = Overlay 层代理(lazer Player.createOverlayComponents 只把
-    // OverlayLayerContainer 代理到物件上方);Foreground 在下槽。
+    // 上槽 = Foreground + Overlay。stable 把 Foreground 画在物件前面
+    // (Background/Fail/Pass 在后);lazer 把整棵故事板放在 underlay、只把
+    // Overlay 代理到物件上方,Foreground 加色精灵因此和背景挤在同一张
+    // 槽里,重叠后槽位变不透明,背景亮度透不过来。
     let foreground = story
         .elements
         .iter()
-        .any(|e| matches!(e.sprite().layer, Layer::Overlay));
+        .any(|e| matches!(e.sprite().layer, Layer::Foreground | Layer::Overlay));
     // lazer onlyHasVideoElements:背景行已被 loader 剔除、接管型背景裸
     // 精灵已在上面剔除,剩下的元素为空且带视频 = 只有视频的故事板。
     let video_only = story.elements.is_empty() && !story.videos.is_empty();
@@ -832,8 +835,8 @@ impl StoryboardLayer {
         }
 
         let mut below_draws = if self.elements_enabled {
-            // lazer Player.cs:整棵故事板(含 Foreground)都在 underlay,
-            // 画在 playfield 后面;只有 Overlay 层代理到物件上方
+            // 下槽:Background/Fail/Pass(视频另插在最底)。Foreground 与
+            // Overlay 走上槽,画在物件前面。
             build_draws_filtered(
                 &mut self.sb,
                 &mut self.assets,
@@ -841,7 +844,7 @@ impl StoryboardLayer {
                 t,
                 FailState::Pass,
                 dim,
-                |layer| !matches!(layer, Layer::Overlay),
+                |layer| matches!(layer, Layer::Background | Layer::Fail | Layer::Pass),
             )
         } else {
             Vec::new()
@@ -876,7 +879,7 @@ impl StoryboardLayer {
                     t,
                     FailState::Pass,
                     dim,
-                    |layer| matches!(layer, Layer::Overlay),
+                    |layer| matches!(layer, Layer::Foreground | Layer::Overlay),
                 )
             } else {
                 Vec::new()

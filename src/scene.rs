@@ -761,6 +761,21 @@ impl SceneState {
         self.hud.invalidate_skin_cache();
     }
 
+    /// 把故事板槽位按预乘 over 贴到全屏。加色精灵在槽里只贡献 RGB
+    /// (alpha 仍是普通精灵写下的覆盖),直乘 alpha 会把这层光抹掉。
+    fn blit_storyboard(&self, atlas: &Atlas, list: &mut DrawList, region: crate::draw::Region) {
+        let m = &self.mapper;
+        list.image_premultiplied(
+            atlas,
+            region,
+            [m.screen_w * 0.5, m.screen_h * 0.5],
+            [m.screen_w, m.screen_h],
+            0.0,
+            Colour { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+            Blend::Alpha,
+        );
+    }
+
     pub fn build_frame(
         &mut self,
         game: &GameData,
@@ -887,22 +902,17 @@ impl SceneState {
         // SAME DimLevel as the background — as a gray colour tint
         // (rgb × (1-dim), alpha unchanged), not an alpha fade.
         if self.storyboard.is_some() {
-            let m = &self.mapper;
-            // 暗度已在精灵绘制时逐实例预乘进槽位内容(见 StoryboardLayer::set_dim),
-            // 这里原样合成;若再乘一次,叠加类精灵在槽内饱和的白色会把色调钳成灰。
-            list.image(
-                assets.atlas,
-                crate::draw::Region::Storyboard,
-                [m.screen_w * 0.5, m.screen_h * 0.5],
-                [m.screen_w, m.screen_h],
-                0.0,
-                Colour { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
-                Blend::Alpha,
-            );
+            // 暗度已在精灵绘制时逐实例预乘进槽位(见 StoryboardLayer::set_dim)。
+            // 槽位是预乘结果:加色精灵只加 RGB、不写 alpha,必须按预乘 over
+            // 贴回,光才会叠在背景上并跟着背景亮度走。
+            self.blit_storyboard(assets.atlas, list, crate::draw::Region::Storyboard);
         }
 
-        // 0.9 纯画面模式:只画背景 + storyboard,跳过全部 gameplay 元素。
+        // 0.9 纯画面模式:只画背景 + storyboard(含前景槽),跳过 gameplay。
         if self.gameplay_hidden {
+            if self.storyboard_fg {
+                self.blit_storyboard(assets.atlas, list, crate::draw::Region::StoryboardForeground);
+            }
             return;
         }
 
@@ -979,21 +989,11 @@ impl SceneState {
             }
         }
 
-        // 7.5 Storyboard above-layers (Foreground/Overlay composite):
-        // over the playfield like osu!, under the HUD. lazer 的
-        // DimmableStoryboard 把整棵 DrawableStoryboard(含 Foreground/
-        // Overlay 层)一起染色,因此与 below 同一 DimLevel。
+        // 7.5 Storyboard above-layers (Foreground/Overlay): over the
+        // playfield, under the HUD. Same DimLevel as the below slot
+        // (premultiplied into each sprite).
         if self.storyboard_fg {
-            let m = &self.mapper;
-            list.image(
-                assets.atlas,
-                crate::draw::Region::StoryboardForeground,
-                [m.screen_w * 0.5, m.screen_h * 0.5],
-                [m.screen_w, m.screen_h],
-                0.0,
-                Colour { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
-                Blend::Alpha,
-            );
+            self.blit_storyboard(assets.atlas, list, crate::draw::Region::StoryboardForeground);
         }
 
         // 8. HUD.结算阶段隐藏(不随 gameplay 淡出):分数/血条等留在

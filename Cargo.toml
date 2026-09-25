@@ -28,6 +28,9 @@ symphonia = { version = "0.5", features = ["mp3", "ogg", "vorbis", "flac", "wav"
 [profile.release]
 lto = "thin"
 
+[patch."https://github.com/Ohdmire/osu-storyboard-render.git"]
+osu-storyboard-render = { path = "../osu-storyboard-render" }
+
 [lib]
 name = "osu_replay_render"
 path = "src/lib.rs"

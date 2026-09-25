@@ -233,6 +233,10 @@ pub const MODE_GLOWRING: f32 = 9.0;
 /// (local space is centred). Corner colours give the vertical gradient.
 pub const MODE_ROUNDED: f32 = 11.0;
 pub const MODE_GLOWFILL: f32 = 10.0;
+/// Storyboard atlas slot. RGB is already premultiplied; alpha is the
+/// coverage of normal-blended sprites only (additive sprites add RGB
+/// and leave alpha untouched).
+pub const MODE_PREMULT: f32 = 12.0;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -383,7 +387,36 @@ impl DrawList {
         colour: Colour,
         blend: Blend,
     ) {
-        self.image_sub(atlas, region, center, size, rotation_deg, colour, blend, 0.0, 0.0, 1.0, 1.0);
+        self.image_region(atlas, region, center, size, rotation_deg, colour, blend, MODE_TEXTURED, 0.0, 0.0, 1.0, 1.0);
+    }
+
+    /// [`image`] for a premultiplied atlas region (storyboard composite
+    /// slots). Straight-alpha sampling would multiply RGB by alpha again
+    /// and drop additive glow whose alpha was left at 0.
+    pub fn image_premultiplied(
+        &mut self,
+        atlas: &Atlas,
+        region: Region,
+        center: [f32; 2],
+        size: [f32; 2],
+        rotation_deg: f32,
+        colour: Colour,
+        blend: Blend,
+    ) {
+        self.image_region(
+            atlas,
+            region,
+            center,
+            size,
+            rotation_deg,
+            colour,
+            blend,
+            MODE_PREMULT,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+        );
     }
 
     /// Textured quad restricted to a sub-rectangle of the region (u/v in
@@ -398,6 +431,37 @@ impl DrawList {
         rotation_deg: f32,
         colour: Colour,
         blend: Blend,
+        u0: f32,
+        v0: f32,
+        u1: f32,
+        v1: f32,
+    ) {
+        self.image_region(
+            atlas,
+            region,
+            center,
+            size,
+            rotation_deg,
+            colour,
+            blend,
+            MODE_TEXTURED,
+            u0,
+            v0,
+            u1,
+            v1,
+        );
+    }
+
+    fn image_region(
+        &mut self,
+        atlas: &Atlas,
+        region: Region,
+        center: [f32; 2],
+        size: [f32; 2],
+        rotation_deg: f32,
+        colour: Colour,
+        blend: Blend,
+        mode: f32,
         u0: f32,
         v0: f32,
         u1: f32,
@@ -432,7 +496,7 @@ impl DrawList {
             color: [colour.r, colour.g, colour.b, colour.a],
             color2: [0.0; 4],
             uv: [uv[0], uv[1], 0.0, 0.0],
-            aux: [MODE_TEXTURED, 0.0, 0.0, 0.0],
+            aux: [mode, 0.0, 0.0, 0.0],
         };
         let v: [Vertex; 4] = std::array::from_fn(|i| mk(corners[i]));
         self.set_blend(blend);
