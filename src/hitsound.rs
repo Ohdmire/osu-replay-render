@@ -749,7 +749,8 @@ impl BeatmapSampleStore for DirectorySampleStore {
 /// (谱面层)后缀过滤后的形态:
 /// - filename 槽(`FileHitSampleInfo.LookupNames`):[文件名, 去扩展名,
 ///   normal-hitnormal, hitnormal](bank 钉在 normal,`ApplyTo` 不覆盖);
-/// - custom ≥ 2:只留 `{bank}-{name}{N}`(后缀强制,不许回退无后缀名);
+/// - custom ≥ 2:先 `{bank}-{name}{N}`(后缀强制,不回退同 bank 的无后缀名),
+///   再 `hitSample.Name`(lazer `getLegacyLookupNames` 末尾的通用名);
 /// - custom = 1(含 filename 槽强制的 1):无后缀的 `{bank}-{name}` → `{name}`;
 /// - custom ≤ 0:`UseBeatmapSamples` 为假,谱面层不参与(空表)。
 ///   combobreak 是无 bank 的 `SampleInfo`,不经过该门控,恒可查。
@@ -770,7 +771,9 @@ pub fn beatmap_lookup_names(bank: &str, name: &str, custom: i32, filename: Optio
         return vec!["combobreak".to_string()];
     }
     if custom >= 2 {
-        vec![format!("{bank}-{name}{custom}")]
+        // 后缀过滤丢掉 `{bank}-{name}` / `{name}` 里不以组号结尾的项,
+        // 然后无条件再查一次不带组号的音效名。
+        vec![format!("{bank}-{name}{custom}"), name.to_string()]
     } else if custom == 1 {
         vec![format!("{bank}-{name}"), name.to_string()]
     } else {
@@ -2071,8 +2074,8 @@ mod beatmap_layer_tests {
     fn beatmap_lookup_names_follow_lazer_chain() {
         assert_eq!(
             beatmap_lookup_names("soft", "hitnormal", 2, None),
-            vec!["soft-hitnormal2".to_string()],
-            "custom ≥ 2:只留带后缀名,不回退无后缀"
+            vec!["soft-hitnormal2".to_string(), "hitnormal".to_string()],
+            "custom ≥ 2:带组号优先,再查通用名"
         );
         assert_eq!(
             beatmap_lookup_names("soft", "hitnormal", 1, None),
@@ -2099,6 +2102,8 @@ mod beatmap_layer_tests {
         std::fs::write(dir.join("soft-hitnormal2.wav"), &short).unwrap();
         std::fs::write(dir.join("soft-hitnormal.wav"), &mid).unwrap();
         std::fs::write(dir.join("soft-hitclap2.wav"), b"").unwrap(); // 0 字节占位
+        let universal = encode_wav(&vec![0.01f32; 5000], false); // ~57ms
+        std::fs::write(dir.join("hitclap.wav"), &universal).unwrap();
         std::fs::write(dir.join("tickle.wav"), &short).unwrap();
         let store = DirectorySampleStore::new(&dir);
 
@@ -2130,9 +2135,13 @@ mod beatmap_layer_tests {
         let r = resolve_sample_parts("soft", "hitnormal", 3, None, Some(&store), &skin).unwrap();
         assert!((34.0..36.0).contains(&ms(&r)), "缺失的后缀文件应剥后缀落到皮肤: {:.0}ms", ms(&r));
 
-        // 0 字节谱面占位 = 权威静音(不回退皮肤/内置)。
+        // 0 字节谱面占位 = 权威静音(不回退皮肤/内置,也不做通用名二次查找)。
         let r = resolve_sample_parts("soft", "hitclap", 2, None, Some(&store), &skin);
         assert!(r.map(|b| b.is_empty()).unwrap_or(false), "0 字节占位应静音");
+
+        // 组号文件缺失:谱面里的通用名 hitclap 优先于皮肤。
+        let r = resolve_sample_parts("soft", "hitclap", 4, None, Some(&store), &skin).unwrap();
+        assert!((54.0..60.0).contains(&ms(&r)), "组号缺失应命中谱面通用名: {:.0}ms", ms(&r));
 
         // filename 槽:谱面 tickle.wav 直接命中。
         let r = resolve_sample_parts("normal", "hitnormal", 1, Some("tickle.wav"), Some(&store), &skin).unwrap();

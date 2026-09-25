@@ -951,14 +951,14 @@ dependencies = [
 
 [[package]]
 name = "osu-parse"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "lzma-rs",
 ]
 
 [[package]]
 name = "osu-storyboard-render"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anime4k-wgpu",
  "anyhow",
@@ -980,7 +980,7 @@ dependencies = [
 
 [[package]]
 name = "osu_replay_render"
-version = "0.14.19"
+version = "0.14.20"
 dependencies = [
  "ab_glyph",
  "jpeg-decoder",
