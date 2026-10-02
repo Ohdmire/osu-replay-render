@@ -142,11 +142,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     var c: vec4<f32>;
 
     if (mode == 0.0) {
-        // Textured (atlas): sample and premultiply by total alpha so the
-        // One/OneMinusSrcAlpha blend behaves like straight-alpha compositing.
+        // Atlas RGB is premultiplied at pack time. osu-framework's
+        // `sh_Texture.fs` outputs straight `v_Colour * texel`, then
+        // `BlendingParameters.Mixture` / `Additive` multiply RGB by
+        // SrcAlpha in the blend unit. Doing that multiply after a linear
+        // sample lets alpha-0 texels whose RGB is still white bleed into
+        // the colour (cursor trails). Premultiply first, then scale only
+        // by the vertex alpha — one multiply, same as SrcAlpha on a
+        // straight sample that was not contaminated.
         let t = textureSampleLevel(tex, samp, in.uv.xy, 0.0);
         let a = in.color.a * t.a;
-        c = vec4<f32>(in.color.rgb * t.rgb * a, a);
+        c = vec4<f32>(in.color.rgb * t.rgb * in.color.a, a);
     } else if (mode == 12.0) {
         // Premultiplied atlas region (storyboard slot). RGB is already
         // coverage-weighted. Additive sprites add RGB and leave alpha at
@@ -670,6 +676,10 @@ impl Renderer {
             })
         };
 
+        // Colour factors are the premultiplied form of osu-framework
+        // `BlendingParameters`. Mixture is (SrcAlpha, OneMinusSrcAlpha)
+        // and Additive is (SrcAlpha, One); both use alpha (One, One).
+        // Output RGB is already coverage-weighted, so SrcAlpha becomes One.
         let premult_alpha = wgpu::BlendState {
             color: wgpu::BlendComponent {
                 src_factor: wgpu::BlendFactor::One,
@@ -678,7 +688,7 @@ impl Renderer {
             },
             alpha: wgpu::BlendComponent {
                 src_factor: wgpu::BlendFactor::One,
-                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                dst_factor: wgpu::BlendFactor::One,
                 operation: wgpu::BlendOperation::Add,
             },
         };

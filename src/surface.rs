@@ -79,6 +79,11 @@ impl SurfaceRenderer {
     /// The device/queue the scene renders with (shared with the window
     /// surface) — embedders build their auxiliary layers (e.g. the
     /// storyboard composites) on the SAME device.
+    /// 内部场景纹理的宽高。切歌时用来判断能不能复用这套设备。
+    pub fn scene_size(&self) -> (u32, u32) {
+        (self.renderer.width, self.renderer.height)
+    }
+
     pub fn device(&self) -> &wgpu::Device {
         &self.device
     }

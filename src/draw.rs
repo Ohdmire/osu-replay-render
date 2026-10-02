@@ -1389,7 +1389,16 @@ fn pack(images: &[(Region, Image)], width: u32) -> Atlas {
                 let src = ((row * img.width * 4) as usize, ((row * img.width + img.width) * 4) as usize);
                 let dst = (((py + row) * width + px) as usize * 4)
                     ..(((py + row) * width + px + img.width) as usize * 4);
-                rgba[dst].copy_from_slice(&img.rgba[src.0..src.1]);
+                rgba[dst.clone()].copy_from_slice(&img.rgba[src.0..src.1]);
+                // Straight RGBA -> premultiplied RGB. Alpha stays, so a
+                // later sample can still recover coverage. Transparent
+                // texels become black and cannot tint a linear filter.
+                for px in rgba[dst].chunks_exact_mut(4) {
+                    let a = px[3] as f32 / 255.0;
+                    px[0] = (px[0] as f32 * a).round() as u8;
+                    px[1] = (px[1] as f32 * a).round() as u8;
+                    px[2] = (px[2] as f32 * a).round() as u8;
+                }
             }
         }
 

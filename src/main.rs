@@ -182,6 +182,14 @@ struct Options {
     /// Cursor rendering (`--cursor [on|off]`, default on): off draws no
     /// cursor and no trail at all.
     show_cursor: bool,
+    /// `OsuRulesetSetting.SnakingInSliders` (`--snaking-in`, default on).
+    snaking_in: bool,
+    /// `OsuRulesetSetting.SnakingOutSliders` (`--snaking-out`, default on).
+    snaking_out: bool,
+    /// `OsuRulesetSetting.ShowCursorTrail` (`--cursor-trail`, default on).
+    show_cursor_trail: bool,
+    /// `OsuRulesetSetting.ShowCursorRipples` (`--cursor-ripples`, default off).
+    show_cursor_ripples: bool,
     /// Seconds of the (static, expanded) results screen appended after
     /// gameplay (`--results <secs|off>`; default 4, `off` = 0).
     results: f64,
@@ -232,6 +240,10 @@ struct ConfigJson {
     offset_heatmap: Option<bool>,
     break_lighten: Option<bool>,
     show_cursor: Option<bool>,
+    snaking_in: Option<bool>,
+    snaking_out: Option<bool>,
+    show_cursor_trail: Option<bool>,
+    show_cursor_ripples: Option<bool>,
     results: Option<f64>,
     results_only: Option<bool>,
     avatar: Option<String>,
@@ -341,6 +353,10 @@ fn apply_config(opts: &mut Options, c: ConfigJson) -> Result<(), String> {
     if let Some(v) = c.offset_heatmap { opts.offset_heatmap = v; }
     if let Some(v) = c.break_lighten { opts.break_lighten = v; }
     if let Some(v) = c.show_cursor { opts.show_cursor = v; }
+    if let Some(v) = c.snaking_in { opts.snaking_in = v; }
+    if let Some(v) = c.snaking_out { opts.snaking_out = v; }
+    if let Some(v) = c.show_cursor_trail { opts.show_cursor_trail = v; }
+    if let Some(v) = c.show_cursor_ripples { opts.show_cursor_ripples = v; }
     if let Some(v) = c.results { opts.results = v; }
     if let Some(true) = c.results_only {
         opts.results_only = true;
@@ -403,6 +419,10 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
         offset_heatmap: false,
         break_lighten: true,
         show_cursor: true,
+        snaking_in: true,
+        snaking_out: true,
+        show_cursor_trail: true,
+        show_cursor_ripples: false,
         results: 4.0,
         results_only: false,
         avatar: None,
@@ -607,6 +627,18 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
             }
             "--cursor" => {
                 opts.show_cursor = parse_on_off(&args, &mut i, "cursor")?;
+            }
+            "--snaking-in" => {
+                opts.snaking_in = parse_on_off(&args, &mut i, "snaking-in")?;
+            }
+            "--snaking-out" => {
+                opts.snaking_out = parse_on_off(&args, &mut i, "snaking-out")?;
+            }
+            "--cursor-trail" => {
+                opts.show_cursor_trail = parse_on_off(&args, &mut i, "cursor-trail")?;
+            }
+            "--cursor-ripples" => {
+                opts.show_cursor_ripples = parse_on_off(&args, &mut i, "cursor-ripples")?;
             }
             "--results" => {
                 i += 1;
@@ -1060,6 +1092,10 @@ fn main() {
     state.has_avatar = opts.avatar.is_some();
     state.cursor_size = opts.cursor_size;
     state.show_cursor = opts.show_cursor;
+    state.snaking_in = opts.snaking_in;
+    state.snaking_out = opts.snaking_out;
+    state.show_cursor_trail = opts.show_cursor_trail;
+    state.show_cursor_ripples = opts.show_cursor_ripples;
     if opts.classic_score {
         state.hud.use_classic_score();
     }

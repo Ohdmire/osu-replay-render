@@ -49,8 +49,12 @@ const PLAYFIELD_SHIFT: f32 = 12.8; // 8 virtual px * 1.6
 const PLAYFIELD_SCALE: f32 = 1.6;
 
 const CURSOR_SIZE: f32 = 28.0;
-const TRAIL_SIZE: f32 = 5.0;
-const TRAIL_SPACING: f32 = 2.0;
+/// Argon trail sprite is 10px with container scale `0.8 / ScaleAdjust`
+/// (`ArgonCursorTrail`). In playfield units that is 8 across.
+const ARGON_TRAIL_UNITS: f32 = 8.0;
+/// `DisplayWidth * CursorScale / 2.5 * IntervalMultiplier(0.4)` at the
+/// default cursor scale: `10 / 2.5 * 0.4`.
+const ARGON_TRAIL_SPACING_UNITS: f32 = 1.6;
 const TRAIL_DURATION: f64 = 300.0;
 const TRAIL_ALPHA: f32 = 0.8;
 const TRAIL_FADE_EXPONENT: f32 = 4.0;
@@ -366,9 +370,48 @@ impl SpinnerAnim {
     }
 }
 
+#[derive(Clone, Copy)]
 struct TrailPart {
     pos: [f32; 2],
     time: f64,
+}
+
+/// One cursor ripple (`CursorRippleVisualiser`): born on a press edge,
+/// scales 0.1 → 1 and fades out over 700ms.
+struct CursorRipple {
+    pos: [f32; 2],
+    t0: f64,
+    cursor_scale: f32,
+}
+
+/// `SnakingSliderBody.UpdateProgress`. Snake-in covers `preempt/3` from
+/// the appear time. On the last span, snake-out tracks the ball; the
+/// forward span keeps the snake-in end (already 1 once the object has
+/// started) instead of forcing the body fully open.
+fn snaked_range(obj: &ObjView, t: f64, head_hit: bool, snaking_in: bool, snaking_out: bool) -> (f64, f64) {
+    let appear = obj.start_time - obj.preempt;
+    let completion = ((t - obj.start_time) / obj.duration.max(1e-9)).clamp(0.0, 1.0);
+    let body_completion = if head_hit { completion } else { 0.0 };
+    let raw = body_completion * obj.span_count as f64;
+    let span = (raw as usize).min(obj.span_count.saturating_sub(1));
+    let frac = (raw - span as f64).clamp(0.0, 1.0);
+    let path_progress = if span % 2 == 1 { 1.0 - frac } else { frac };
+
+    let mut p0 = 0.0;
+    let mut p1 = if snaking_in {
+        ((t - appear) / (obj.preempt / 3.0)).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    if span >= obj.span_count.saturating_sub(1) {
+        if span % 2 == 1 {
+            p0 = 0.0;
+            p1 = if snaking_out { path_progress } else { 1.0 };
+        } else if snaking_out {
+            p0 = path_progress;
+        }
+    }
+    (p0, p1)
 }
 
 pub struct Assets<'a> {
@@ -430,6 +473,9 @@ struct LegacyCache {
     /// top-left corner at the cursor position.
     cursor_centre: bool,
     cursortrail: Option<SkinTexture>,
+    /// `cursor-ripple` (`OsuSkinComponents.CursorRipple`). None = the
+    /// default 128-unit ring (`DefaultCursorRipple`).
+    cursor_ripple: Option<SkinTexture>,
     /// Stable picks the trail style from the cursor texture's provider:
     /// disjoint (no `cursormiddle`) vs continuous additive.
     disjoint_trail: bool,
@@ -571,6 +617,7 @@ impl LegacyCache {
             cursor_expand: generic_bool("CursorExpand", true),
             cursor_centre: generic_bool("CursorCentre", true),
             cursortrail: ltex("cursortrail"),
+            cursor_ripple: ltex("cursor-ripple"),
             disjoint_trail,
             followpoint: lanim("followpoint", true, true, "-"),
             judgement,
@@ -698,10 +745,20 @@ pub struct SceneState {
     /// mid-session doesn't dump the accumulated trail. Hosts (e.g. the
     /// wallpaper) use this for a clean, cursor-less look.
     pub show_cursor: bool,
+    /// `OsuRulesetSetting.SnakingInSliders`, default on.
+    pub snaking_in: bool,
+    /// `OsuRulesetSetting.SnakingOutSliders`, default on.
+    pub snaking_out: bool,
+    /// `OsuRulesetSetting.ShowCursorTrail`, default on. Independent of
+    /// [`Self::show_cursor`]: the cursor can stay while the trail is off.
+    pub show_cursor_trail: bool,
+    /// `OsuRulesetSetting.ShowCursorRipples`, default off.
+    pub show_cursor_ripples: bool,
     cursor_expand: f64,
     cursor_anim: Option<(f64, f64, f64, f64, Easing)>,
     was_pressed: bool,
     trail: Vec<TrailPart>,
+    ripples: Vec<CursorRipple>,
     slider_anims: Vec<SliderAnim>,
     spinner_anims: Vec<SpinnerAnim>,
     pub hud: hud::HudState,
@@ -764,10 +821,15 @@ impl SceneState {
             follow_points: true,
             cursor_size: 1.0,
             show_cursor: true,
+            snaking_in: true,
+            snaking_out: true,
+            show_cursor_trail: true,
+            show_cursor_ripples: false,
             cursor_expand: 1.0,
             cursor_anim: None,
             was_pressed: false,
             trail: Vec::new(),
+            ripples: Vec::new(),
             slider_anims: (0..game.objects.len()).map(|_| SliderAnim::new()).collect(),
             spinner_anims: (0..game.objects.len()).map(|_| SpinnerAnim::new()).collect(),
             hud: hud::HudState::new(),
@@ -856,7 +918,18 @@ impl SceneState {
         // entirely (`OsuCursor.Expand` early-returns). Legacy cursors pop
         // to 1.3 over 100ms Out both ways (`LegacyCursor`); argon to 1.2
         // with an elastic pop.
+        let cursor_screen = self.mapper.pf([snap.cursor.x, snap.cursor.y]);
         let pressed = snap.left || snap.right;
+        // `CursorRippleVisualiser.OnPressed`: a ripple on each press edge
+        // (not while held, not while rewinding — the host clock only moves
+        // forward here).
+        if self.show_cursor && self.show_cursor_ripples && pressed && !self.was_pressed {
+            self.ripples.push(CursorRipple {
+                pos: cursor_screen,
+                t0: t,
+                cursor_scale: self.cursor_size,
+            });
+        }
         let expand_enabled = self.legacy.as_ref().map(|l| l.cursor_expand).unwrap_or(true);
         if expand_enabled && pressed != self.was_pressed {
             let (target, dur, easing) = if self.legacy.is_some() {
@@ -875,11 +948,14 @@ impl SceneState {
             self.cursor_expand = value_at(t, a, b, from, to, e);
         }
 
-        // Cursor trail.
-        let cursor_screen = self.mapper.pf([snap.cursor.x, snap.cursor.y]);
-        if self.show_cursor {
+        // Cursor trail. Off (`ShowCursorTrail`) drops accumulation so
+        // turning it back on doesn't dump a stale streak.
+        if self.show_cursor && self.show_cursor_trail {
             self.update_trail(cursor_screen, t);
+        } else {
+            self.trail.clear();
         }
+        self.ripples.retain(|r| t - r.t0 < 700.0);
 
         // Tracking lookup for this frame.
         let tracking: Vec<bool> = {
@@ -1053,7 +1129,12 @@ impl SceneState {
         }
 
         if self.show_cursor {
-            self.draw_trail(list, assets);
+            if self.show_cursor_trail {
+                self.draw_trail(list, assets);
+            }
+            if self.show_cursor_ripples {
+                self.draw_ripples(list, assets);
+            }
             draw_cursor(self.legacy.as_ref(), assets, list, cursor_screen, self.cursor_expand as f32, self.cursor_size, self.mapper.virt, t);
         }
 
@@ -1075,47 +1156,75 @@ impl SceneState {
         self.last_t = t;
     }
 
+    /// Fade length and part spacing for the active trail.
+    /// Legacy: `FadeDuration` 500 (continuous) / 150 (disjoint), interval
+    /// `DisplayWidth * CursorScale / 2.5 * IntervalMultiplier`.
+    /// Argon glow: 300ms, exponent 4 (the constants below).
+    fn trail_metrics(&self) -> (f64, f32, bool) {
+        if let Some(lg) = &self.legacy
+            && let Some(tex) = lg.cursortrail
+        {
+            let mult = 1.0 / self.cursor_size.max(1.0);
+            let spacing = tex.display_width() * self.mapper.virt * self.cursor_size / 2.5 * mult;
+            let fade = if lg.disjoint_trail { 150.0 } else { 500.0 };
+            return (fade, spacing.max(1.0), lg.disjoint_trail);
+        }
+        (
+            TRAIL_DURATION,
+            (ARGON_TRAIL_SPACING_UNITS * self.mapper.pf * self.cursor_size).max(1.0),
+            false,
+        )
+    }
+
     fn update_trail(&mut self, cursor: [f32; 2], t: f64) {
         // 时间不连续(实时预览的 seek 跳变,含回退):拖尾是光标运动的
         // 时间连续性产物,跳变时旧轨迹整体作废且不做插值。否则回退后
         // 旧点年龄为负、永不 retire 且 draw 端 clamp 成全亮;前进大跳
         // 会在相距很远的两位置间插出一条贯穿屏幕的长尾,越拖越多。
+        let (fade, spacing, disjoint) = self.trail_metrics();
         let jumped = self
             .trail
             .last()
-            .map_or(true, |p| (t - p.time).abs() > TRAIL_DURATION);
+            .map_or(true, |p| (t - p.time).abs() > fade);
         if jumped {
             self.trail.clear();
         }
-        // Part spacing follows the cursor size like the interpolated adds
-        // of `CursorTrail.AddTrail` (interval ∝ `CursorScale`), with the
-        // legacy `IntervalMultiplier = 1/max(size,1)` clamping it above 1
-        // (bigger parts don't also densify).
-        let spacing = match self.legacy.as_ref().map(|l| l.cursortrail).flatten() {
-            Some(_) => TRAIL_SPACING * self.cursor_size / self.cursor_size.max(1.0),
-            None => TRAIL_SPACING * self.cursor_size,
-        };
-        let last_pos = if jumped { None } else { self.trail.last().map(|p| p.pos) };
-        if let Some(last) = last_pos {
-            let dx = cursor[0] - last[0];
-            let dy = cursor[1] - last[1];
+        if disjoint {
+            // `LegacyCursorTrail`: no path interpolation. A new part every
+            // 1000/60 ms at the current cursor.
+            let due = self.trail.last().map_or(true, |p| t - p.time >= 1000.0 / 60.0);
+            if due {
+                self.trail.push(TrailPart { pos: cursor, time: t });
+            }
+        } else if let Some(last) = self.trail.last().copied() {
+            let dx = cursor[0] - last.pos[0];
+            let dy = cursor[1] - last.pos[1];
             let dist = (dx * dx + dy * dy).sqrt();
-            if dist > spacing {
-                let steps = ((dist / spacing) as usize).min(600);
+            // `AvoidDrawingNearCursor` (continuous trails): stop one
+            // interval short of the cursor so the newest part isn't
+            // stacked on the cursor itself.
+            let stop = (dist - spacing).max(0.0);
+            if stop > spacing {
+                let steps = ((stop / spacing) as usize).min(600).max(1);
+                let dt = (t - last.time).max(0.0);
                 for s in 1..=steps {
-                    let f = s as f32 / steps as f32;
+                    let f = (s as f32 * spacing) / dist;
+                    if f >= 1.0 {
+                        break;
+                    }
                     self.trail.push(TrailPart {
-                        pos: [last[0] + dx * f, last[1] + dy * f],
-                        time: t,
+                        pos: [last.pos[0] + dx * f, last.pos[1] + dy * f],
+                        // Time is spread along the segment. Stamping every
+                        // point with `t` makes the whole streak one age,
+                        // so the fade looks flat.
+                        time: last.time + dt * f as f64,
                     });
                 }
-            } else if dist > 0.0 {
-                self.trail.push(TrailPart { pos: cursor, time: t });
             }
         } else {
             self.trail.push(TrailPart { pos: cursor, time: t });
         }
-        self.trail.retain(|p| (t - p.time).abs() < TRAIL_DURATION);
+        self.trail.retain(|p| (t - p.time).abs() < fade);
     }
 
     fn draw_trail(&mut self, list: &mut DrawList, assets: &Assets) {
@@ -1129,14 +1238,10 @@ impl SceneState {
         if let Some(lg) = &self.legacy
             && let Some(tex) = lg.cursortrail
         {
+            // `sh_CursorTrail.vs`: alpha *= pow(clamp(partTime - clock, 0, 1), exponent).
+            // Legacy exponent is 1 (linear). The clock is age / FadeDuration.
             let fade_duration = if lg.disjoint_trail { 150.0 } else { 500.0 };
-            let mut last_time = f64::NEG_INFINITY;
             for p in &self.trail {
-                let disjoint_part = lg.disjoint_trail && last_time >= p.time - 1e-9;
-                last_time = p.time;
-                if disjoint_part {
-                    continue;
-                }
                 let age = (t - p.time).clamp(0.0, fade_duration) / fade_duration;
                 let alpha = 1.0 - age as f32;
                 if alpha <= 0.004 {
@@ -1156,6 +1261,11 @@ impl SceneState {
                 } else {
                     [p.pos[0] + w * 0.5, p.pos[1] + h * 0.5]
                 };
+                // `sh_CursorTrail.vs` fades only the vertex alpha
+                // (`pow(1 - age, FadeExponent)`; legacy exponent is 1).
+                // The texture shader then does `v_Colour * texel`, and
+                // Additive's SrcAlpha multiplies RGB by that alpha once.
+                // Disjoint trails use Mixture instead of Additive.
                 list.image(
                     assets.atlas,
                     tex.region,
@@ -1173,7 +1283,46 @@ impl SceneState {
             let age = (t - p.time).clamp(0.0, TRAIL_DURATION) / TRAIL_DURATION;
             let alpha = (1.0 - age as f32).powf(TRAIL_FADE_EXPONENT) * TRAIL_ALPHA;
             if alpha > 0.004 {
-                list.glow(p.pos, TRAIL_SIZE * expand * self.cursor_size, Colour::WHITE.opacity(alpha));
+                let radius = ARGON_TRAIL_UNITS * 0.5 * self.mapper.pf * expand * self.cursor_size;
+                list.glow(p.pos, radius, Colour::WHITE.opacity(alpha));
+            }
+        }
+    }
+
+    /// `CursorRipple` + `DefaultCursorRipple`: 700ms scale 0.1→1 Out and
+    /// fade 1→0. A skin `cursor-ripple` sprite replaces the 128-unit ring
+    /// (`OsuLegacySkinTransformer`); the stable 50% scale / 20% opacity
+    /// hack stays commented out upstream, so it is not applied here.
+    fn draw_ripples(&self, list: &mut DrawList, assets: &Assets) {
+        let t = self.last_t;
+        for r in &self.ripples {
+            let age = t - r.t0;
+            if age < 0.0 || age >= 700.0 {
+                continue;
+            }
+            let grow = value_at(t, r.t0, r.t0 + 700.0, 0.1, 1.0, Easing::Out) as f32;
+            let fade = value_at(t, r.t0, r.t0 + 700.0, 1.0, 0.0, Easing::Linear) as f32;
+            if fade <= 0.004 {
+                continue;
+            }
+            if let Some(tex) = self.legacy.as_ref().and_then(|l| l.cursor_ripple) {
+                let w = tex.display_width() * self.mapper.virt * r.cursor_scale * grow;
+                let h = tex.display_height() * self.mapper.virt * r.cursor_scale * grow;
+                list.image(
+                    assets.atlas,
+                    tex.region,
+                    r.pos,
+                    [w, h],
+                    0.0,
+                    Colour::WHITE.opacity(fade),
+                    Blend::Additive,
+                );
+            } else {
+                // RingPiece(3) inside a 128 box, alpha 0.1, additive.
+                let radius = 64.0 * r.cursor_scale * grow * self.mapper.pf;
+                let thickness = 3.0 * r.cursor_scale * grow * self.mapper.pf;
+                let col = Colour::WHITE.opacity(0.1 * fade);
+                list.ring(r.pos, radius, thickness, col, col, Blend::Additive);
             }
         }
     }
@@ -1428,30 +1577,7 @@ impl SceneState {
         // spans), which is what SnakingSliderBody uses - NOT the time
         // fraction.
         let completion = ((t - obj.start_time) / obj.duration.max(1e-9)).clamp(0.0, 1.0);
-        let body_completion = if head_hit { completion } else { 0.0 };
-        let raw = body_completion * obj.span_count as f64;
-        let span = (raw as usize).min(obj.span_count.saturating_sub(1));
-        // Fraction within the (clamped) span; at completion = 1 this is 1.0,
-        // so the last odd span fully retracts instead of snapping back full.
-        let frac = (raw - span as f64).clamp(0.0, 1.0);
-        let path_progress = if span % 2 == 1 { 1.0 - frac } else { frac };
-
-        let mut p0 = 0.0f64;
-        let mut p1 = ((t - appear) / (obj.preempt / 3.0)).clamp(0.0, 1.0); // snaking in
-
-        if span >= obj.span_count.saturating_sub(1) {
-            if span % 2 == 1 {
-                // Returning on the last span: the body retracts from the far
-                // end behind the ball.
-                p0 = 0.0;
-                p1 = path_progress;
-            } else {
-                // Forward on the last span: the body retracts from the start
-                // behind the ball.
-                p0 = path_progress;
-                p1 = 1.0;
-            }
-        }
+        let (p0, p1) = snaked_range(obj, t, head_hit, self.snaking_in, self.snaking_out);
 
         // --- Body -------------------------------------------------------------
         // `PlaySliderBody`: `PathRadius = OsuHitObject.OBJECT_RADIUS * scale`
@@ -1682,7 +1808,11 @@ impl SceneState {
             } else {
                 value_at(t, obj.start_time, obj.start_time + 200.0, 0.0, 1.0, Easing::OutQuint)
             }) * alpha;
-            if body_judged {
+            // `body_judged` is filled at load for the whole playback, not
+            // "already judged at t". Hide only once the playhead reaches
+            // the tail (`t >= bt`); otherwise every legacy ball (a skin
+            // that ships `sliderb0`) stays at alpha 0 for the entire slider.
+            if body_judged && t >= bt {
                 // The end fade: ArgonSliderBall/DefaultSliderBall pile an
                 // extra FadeOut(duration/4 = 50ms, OutQuint); the legacy
                 // ball has no such override - it just rides the slider's
@@ -2443,7 +2573,16 @@ fn draw_circle_piece(
         // sprites OR the argon vector piece draws (`with_outer_fill` ==
         // false means this is a slider head, which prefers
         // `sliderstartcircle`).
-        let pair = if with_outer_fill { lg.hitcircle } else { lg.sliderstartcircle.or(lg.hitcircle) };
+        // 滑条头有自己的 `sliderstartcircle` 时,缺外圈就不要去借
+        // `hitcircleoverlay`(lazer LegacyMainCirclePiece 的前缀规则)。
+        // 普通圆圈缺 `hitcircleoverlay` 时,查找会落到经典默认皮的白环。
+        let (pair, classic_overlay) = if with_outer_fill {
+            (lg.hitcircle, true)
+        } else if lg.sliderstartcircle.is_some() {
+            (lg.sliderstartcircle, false)
+        } else {
+            (lg.hitcircle, true)
+        };
         if let Some((circle, overlay)) = pair {
             draw_circle_piece_legacy(
                 lg,
@@ -2461,6 +2600,7 @@ fn draw_circle_piece(
                 hit_animations,
                 circle,
                 overlay,
+                classic_overlay,
             );
             return;
         }
@@ -2491,6 +2631,7 @@ fn draw_circle_piece_legacy(
     hit_animations: bool,
     circle: SkinTexture,
     overlay: Option<SkinTexture>,
+    classic_overlay: bool,
 ) {
     let centre = m.pf(obj.position);
     let s = obj.scale * m.pf;
@@ -2516,12 +2657,15 @@ fn draw_circle_piece_legacy(
 
     draw_sprite(list, circle, tint);
 
-    // Number: digit sprites at their authored size, fading per the
-    // skin's legacy version on hit. Hit animations OFF bypasses the
-    // quick-fade hack (lazer #38371: the number rides the whole-piece
-    // 60ms fade instead — "slightly slower than other components, in
-    // practice not perceivable").
-    if let Some(digits) = &lg.hitcircle_digits && number > 0 {
+    // `HitCircleOverlayAboveNumber`: 1 = overlay covers the digits
+    // (default). 0 = digits are painted last and stay visible. Starter
+    // Light sets this to 0; drawing the overlay last was hiding the number
+    // on slider heads.
+    let draw_number = |list: &mut DrawList| {
+        let Some(digits) = &lg.hitcircle_digits else { return };
+        if number == 0 {
+            return;
+        }
         let number_alpha = if judged && hit && hit_animations {
             if lg.version > 1.0 {
                 value_at(x, 0.0, 240.0 / 4.0, 1.0, 0.0, Easing::Linear) as f32
@@ -2531,24 +2675,40 @@ fn draw_circle_piece_legacy(
         } else {
             1.0
         };
-        if number_alpha > 0.003 {
-            let text = number.to_string();
-            draw_legacy_number(
-                list,
-                assets.atlas,
-                digits,
-                &text,
-                centre,
-                s * sprite_scale,
-                Colour::WHITE.opacity(alpha * number_alpha),
-                Blend::Alpha,
-                NumAlign::Centre,
-            );
+        if number_alpha <= 0.003 {
+            return;
         }
-    }
-
-    if let Some(overlay) = overlay {
-        draw_sprite(list, overlay, Colour::WHITE);
+        draw_legacy_number(
+            list,
+            assets.atlas,
+            digits,
+            &number.to_string(),
+            centre,
+            s * sprite_scale,
+            Colour::WHITE.opacity(alpha * number_alpha),
+            Blend::Alpha,
+            NumAlign::Centre,
+        );
+    };
+    let draw_overlay = |list: &mut DrawList| {
+        if let Some(overlay) = overlay {
+            draw_sprite(list, overlay, Colour::WHITE);
+        } else if classic_overlay {
+            // `DefaultLegacySkin` 的 hitcircleoverlay:128 画布上外沿约 118、
+            // 环宽约 9 的白圈,不吃 combo 色。皮肤没给这张图时 osu 用它。
+            let d = circle.display_width() * s * sprite_scale;
+            let outer = d * (118.0 / 128.0) * 0.5;
+            let thickness = d * (9.0 / 128.0);
+            let col = Colour::WHITE.opacity(alpha);
+            list.ring(centre, outer, thickness, col, col, Blend::Alpha);
+        }
+    };
+    if lg.overlay_above_number {
+        draw_number(list);
+        draw_overlay(list);
+    } else {
+        draw_overlay(list);
+        draw_number(list);
     }
 }
 
@@ -2914,24 +3074,7 @@ pub fn slider_body_geometry(
         return None;
     }
     let alpha = ((t - appear) / obj.fade_in).clamp(0.0, 1.0) as f32;
-    let completion = ((t - obj.start_time) / obj.duration.max(1e-9)).clamp(0.0, 1.0);
-    let body_completion = if head_hit { completion } else { 0.0 };
-    let raw = body_completion * obj.span_count as f64;
-    let span = (raw as usize).min(obj.span_count.saturating_sub(1));
-    let frac = (raw - span as f64).clamp(0.0, 1.0);
-    let path_progress = if span % 2 == 1 { 1.0 - frac } else { frac };
-
-    let mut p0 = 0.0f64;
-    let mut p1 = ((t - appear) / (obj.preempt / 3.0)).clamp(0.0, 1.0);
-    if span >= obj.span_count.saturating_sub(1) {
-        if span % 2 == 1 {
-            p0 = 0.0;
-            p1 = path_progress;
-        } else {
-            p0 = path_progress;
-            p1 = 1.0;
-        }
-    }
+    let (p0, p1) = snaked_range(obj, t, head_hit, true, true);
     let sub = obj.sub_path(p0, p1);
     if sub.len() < 2 {
         return None;
@@ -3228,29 +3371,11 @@ impl SceneState {
             if obj.kind != ObjKind::Slider {
                 continue;
             }
-            // Snaked range identical to draw_slider.
-            let appear = obj.start_time - obj.preempt;
             let head_hit = obj
                 .head_judged
                 .map(|(jt, r)| jt <= t && hit_result_ext::is_hit(r))
                 .unwrap_or(false);
-            let completion = ((t - obj.start_time) / obj.duration.max(1e-9)).clamp(0.0, 1.0);
-            let body_completion = if head_hit { completion } else { 0.0 };
-            let raw = body_completion * obj.span_count as f64;
-            let span = (raw as usize).min(obj.span_count.saturating_sub(1));
-            let frac = (raw - span as f64).clamp(0.0, 1.0);
-            let path_progress = if span % 2 == 1 { 1.0 - frac } else { frac };
-            let mut p0 = 0.0f64;
-            let mut p1 = ((t - appear) / (obj.preempt / 3.0)).clamp(0.0, 1.0);
-            if span >= obj.span_count.saturating_sub(1) {
-                if span % 2 == 1 {
-                    p0 = 0.0;
-                    p1 = path_progress;
-                } else {
-                    p0 = path_progress;
-                    p1 = 1.0;
-                }
-            }
+            let (p0, p1) = snaked_range(obj, t, head_hit, self.snaking_in, self.snaking_out);
             let span_duration = obj.duration / obj.span_count.max(1) as f64;
             let mut ri = 0usize;
             for n in &obj.nested {
