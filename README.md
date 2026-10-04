@@ -58,6 +58,8 @@ osu_replay_render map.osu replay.osr --png-dir frames --size 1280x720 --fps 30 -
 osu_replay_render map.osu --autoplay --audio --out preview.mp4   # 谱面预览（无需回放文件）
 ```
 
+改完结算屏后跑 `scripts/check-stable-results.sh`：用固定回放把 argon 和几套 legacy 皮肤各渲一张 stable 结算 PNG 到 `testset/results-check/`（该目录在 gitignore 里）。
+
 帧时间轴与游戏内一致：60fps 时逐帧对应 lazer 的 FrameStability 游戏帧；
 DT/HT 等 rate mod 的回放按真实游戏速度输出。渲染速度约 240fps（1080p
 x264,瓶颈在 ffmpeg 编码；渲染管线本身约 0.6ms/帧,见下文「渲染流水线」）。
