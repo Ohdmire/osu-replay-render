@@ -27,8 +27,20 @@
 use crate::draw::{ttf_measure, draw_ttf_text, Atlas, Blend, Colour, DrawList, TtfFont};
 use crate::game::GameData;
 use crate::scene::{Assets, Mapper};
+use crate::skin::SkinTexture;
 use osu_replay_judge::mods::Mods;
 use osu_replay_judge::score::HitResult;
+
+/// Which results screen `scene` draws after gameplay.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ResultsStyle {
+    /// lazer `Screens/Ranking` expanded score panel. Historical default.
+    #[default]
+    Lazer,
+    /// osu!stable ranking screen: `ranking-panel` / grade sprites / hit
+    /// bursts laid out in the 768-tall skin coordinate space.
+    Stable,
+}
 
 // -- ScorePanel ---------------------------------------------------------------
 
@@ -2117,4 +2129,424 @@ pub(crate) fn find_relative_hit_position(
     let dist = (((hit[0] - next[0]).powi(2) + (hit[1] - next[1]).powi(2)).sqrt() as f64) / radius;
     let rotated = final_angle - rotation.to_radians() as f64;
     [-dist as f32 * rotated.cos() as f32, -dist as f32 * rotated.sin() as f32]
+}
+
+// -- osu!stable ranking screen ------------------------------------------------
+//
+// Skin-element positions are the v2 values from the osu! skinning spec,
+// in the same 768-tall virtual space the lazer results screen uses
+// (`Mapper::virt`: a 1080p frame is 1365.33 x 768). Sprites draw at their
+// authored display size (`@2x` already halved). Missing sprites fall back
+// to flat shapes and the embedded fonts so the screen still renders
+// without a legacy skin.
+
+fn vx(v: f32, s: f32) -> f32 {
+    v * s
+}
+
+fn solid(list: &mut DrawList, s: f32, x: f32, y: f32, w: f32, h: f32, colour: Colour) {
+    let p = |a, b| [vx(a, s), vx(b, s)];
+    list.quad_gradient(
+        &[p(x, y), p(x + w, y), p(x + w, y + h), p(x, y + h)],
+        [colour, colour, colour, colour],
+        Blend::Alpha,
+    );
+}
+
+fn text_left(
+    list: &mut DrawList,
+    assets: &Assets,
+    font: &TtfFont,
+    text: &str,
+    x: f32,
+    y: f32,
+    size: f32,
+    colour: Colour,
+    s: f32,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let (w, top, bot) = ttf_measure(font, text, size, 0.0);
+    let h = (bot - top).max(1.0);
+    draw_ttf_text(
+        list,
+        assets.atlas,
+        font,
+        false,
+        text,
+        [vx(x + w * 0.5, s), vx(y + h * 0.5, s)],
+        size * s,
+        colour,
+        0.0,
+        Blend::Alpha,
+    );
+}
+
+fn text_center(
+    list: &mut DrawList,
+    assets: &Assets,
+    font: &TtfFont,
+    text: &str,
+    cx: f32,
+    cy: f32,
+    size: f32,
+    colour: Colour,
+    s: f32,
+) {
+    draw_ttf_text(
+        list,
+        assets.atlas,
+        font,
+        false,
+        text,
+        [vx(cx, s), vx(cy, s)],
+        size * s,
+        colour,
+        0.0,
+        Blend::Alpha,
+    );
+}
+
+fn sprite(list: &mut DrawList, atlas: &Atlas, tex: SkinTexture, x: f32, y: f32, s: f32) -> [f32; 2] {
+    let (w, h) = (tex.display_width(), tex.display_height());
+    list.image(
+        atlas,
+        tex.region,
+        [vx(x + w * 0.5, s), vx(y + h * 0.5, s)],
+        [w * s, h * s],
+        0.0,
+        Colour::WHITE,
+        Blend::Alpha,
+    );
+    [w, h]
+}
+
+fn sprite_center(list: &mut DrawList, atlas: &Atlas, tex: SkinTexture, cx: f32, cy: f32, s: f32) -> [f32; 2] {
+    let (w, h) = (tex.display_width(), tex.display_height());
+    list.image(
+        atlas,
+        tex.region,
+        [vx(cx, s), vx(cy, s)],
+        [w * s, h * s],
+        0.0,
+        Colour::WHITE,
+        Blend::Alpha,
+    );
+    [w, h]
+}
+
+/// Score-font run (`score-0`..`score-9`, skin `ScoreOverlap`). `None` when
+/// the skin has no score font — the caller draws TTF instead.
+fn draw_score_font(
+    list: &mut DrawList,
+    assets: &Assets,
+    text: &str,
+    x: f32,
+    cy: f32,
+    s: f32,
+    digit_h: f32,
+) -> Option<f32> {
+    let skin = assets.skin;
+    let prefix = crate::skin::get_font_prefix(skin, crate::skin::texture::LegacyFont::Score);
+    let overlap = crate::skin::get_font_overlap(skin, crate::skin::texture::LegacyFont::Score);
+    let mut glyphs = Vec::with_capacity(text.len());
+    for c in text.chars() {
+        let name = match c {
+            '0'..='9' => format!("{prefix}-{c}"),
+            '.' => format!("{prefix}-dot"),
+            '%' => format!("{prefix}-percent"),
+            'x' | 'X' => format!("{prefix}-x"),
+            ',' => continue,
+            _ => return None,
+        };
+        glyphs.push(skin.legacy_texture(&name)?);
+    }
+    if glyphs.is_empty() {
+        return Some(0.0);
+    }
+    let native_h = glyphs[0].display_height().max(1.0);
+    let scale = if digit_h > 0.0 { digit_h / native_h } else { 1.0 };
+    let mut pen = x;
+    for (i, tex) in glyphs.iter().enumerate() {
+        let w = tex.display_width() * scale;
+        let h = tex.display_height() * scale;
+        list.image(
+            assets.atlas,
+            tex.region,
+            [vx(pen + w * 0.5, s), vx(cy, s)],
+            [w * s, h * s],
+            0.0,
+            Colour::WHITE,
+            Blend::Alpha,
+        );
+        pen += w;
+        if i + 1 != glyphs.len() {
+            pen -= overlap * scale;
+        }
+    }
+    Some(pen - x)
+}
+
+
+/// osu!stable ranking screen.
+///
+/// Positions follow stable's 640×480 osu!pixels scaled by g0v0
+/// `LegacySkin.STABLE_MAGIC_SCALE_FACTOR` (1.6) into this renderer's
+/// 768-tall virtual space, matching the skinning-wiki anchors
+/// (panel at y=102, grade 192px from the right edge, graph at
+/// (256, 608)). Sprites are the user skin's `ranking-*` / `hit*` /
+/// `score-*` / `selection-mod-*` elements; a missing sprite is drawn
+/// in place.
+pub fn draw_stable(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut DrawList) {
+    /// stable osu!pixel → virtual unit (`STABLE_MAGIC_SCALE_FACTOR`).
+    const K: f32 = 1.6;
+    let game = view.game;
+    let s = m.virt;
+    let cw = m.screen_w / s;
+    let skin = assets.skin;
+    let v2 = crate::skin::Skin::configuration(skin).effective_legacy_version() > 1.0;
+    let score_scale = if v2 { 1.3 } else { 1.05 };
+    let big_h = 20.0 * score_scale * K;
+    let small_h = 17.0 * score_scale * K;
+    let misses = stat_count(&game.final_statistics, HitResult::Miss) as i64;
+    let rank = Rank::from_score(game.final_accuracy, misses, game.mods.hidden);
+    let score = game.final_classic_score;
+    let great = stat_count(&game.final_statistics, HitResult::Great);
+    let ok = stat_count(&game.final_statistics, HitResult::Ok);
+    let meh = stat_count(&game.final_statistics, HitResult::Meh);
+    let miss = stat_count(&game.final_statistics, HitResult::Miss);
+
+    if view.has_bg {
+        let rect = assets.atlas.region_rect(crate::draw::Region::Background);
+        let (rw, rh) = (rect.x1 - rect.x0, rect.y1 - rect.y0);
+        let k = (m.screen_w / rw).max(m.screen_h / rh);
+        list.image(
+            assets.atlas,
+            crate::draw::Region::Background,
+            [m.screen_w * 0.5, m.screen_h * 0.5],
+            [rw * k, rh * k],
+            0.0,
+            Colour::WHITE,
+            Blend::Alpha,
+        );
+    }
+
+    let fit = |list: &mut DrawList, tex: SkinTexture, x: f32, y: f32, target_h: f32, centre: bool| {
+        let nh = tex.display_height().max(1.0);
+        let h = if target_h > 0.0 { target_h } else { nh };
+        let w = tex.display_width() * (h / nh);
+        let (cx, cy) = if centre {
+            (x, y)
+        } else {
+            (x + w * 0.5, y + h * 0.5)
+        };
+        list.image(
+            assets.atlas,
+            tex.region,
+            [vx(cx, s), vx(cy, s)],
+            [w * s, h * s],
+            0.0,
+            Colour::WHITE,
+            Blend::Alpha,
+        );
+        [w, h]
+    };
+
+    // Top black bar, then the "ranking" wordmark (height 75 osu!px,
+    // 20 osu!px in from the right).
+    let title_h = 75.0 * K;
+    let bar_h = title_h * 0.785;
+    solid(list, s, 0.0, 0.0, cw, bar_h, Colour::from_hex(0x000000));
+    if let Some(tex) = skin.legacy_texture("ranking-title") {
+        let nh = tex.display_height().max(1.0);
+        let w = tex.display_width() * (title_h / nh);
+        fit(list, tex, cw - 20.0 * K - w, 0.0, title_h, false);
+    } else {
+        let (w, _, _) = ttf_measure(assets.semibold, "ranking", 32.0, 0.0);
+        text_left(list, assets, assets.semibold, "ranking", cw - 32.0 - w, 16.0, 32.0, Colour::WHITE, s);
+    }
+
+    let title = trunc(assets.semibold, &game.map_meta.title, 22.0, 0.0, cw * 0.55);
+    text_left(list, assets, assets.semibold, &title, 12.0, 6.0, 22.0, Colour::WHITE, s);
+    let artist = trunc(assets.regular, &game.map_meta.artist, 14.0, 0.0, cw * 0.55);
+    text_left(list, assets, assets.regular, &artist, 12.0, 32.0, 14.0, Colour::WHITE.opacity(0.92), s);
+    let by = if game.map_meta.creator.is_empty() {
+        String::new()
+    } else {
+        format!("Beatmap by {}", game.map_meta.creator)
+    };
+    let diff = if game.map_meta.version.is_empty() { String::new() } else { format!("[{}]", game.map_meta.version) };
+    let sub = if by.is_empty() { diff.clone() } else if diff.is_empty() { by.clone() } else { format!("{by}  {diff}") };
+    text_left(list, assets, assets.regular, &sub, 12.0, 50.0, 13.0, Colour::WHITE.opacity(0.85), s);
+    if let Some(ticks) = game.played_at_ticks {
+        text_left(list, assets, assets.regular, &format_played_on(ticks), 12.0, 68.0, 12.0, Colour::WHITE.opacity(0.7), s);
+    }
+
+    // Panel: top-left (0, 102), height 317 osu!px.
+    let panel = [0.0_f32, 102.0];
+    let panel_h = 317.0 * K;
+    if let Some(tex) = skin.legacy_texture("ranking-panel") {
+        fit(list, tex, panel[0], panel[1], panel_h, false);
+    } else {
+        solid(list, s, panel[0], panel[1], 622.0 * K * 317.0 / 505.0, panel_h, Colour::from_hex(0x1C2430).opacity(0.9));
+    }
+
+    let y_off = -1.0;
+    let score_cy = panel[1] + big_h * 0.5 + (11.0 + y_off) * K;
+    let score_text = score.abs().to_string();
+    if draw_score_font(list, assets, &score_text, panel[0] + 111.0 * K, score_cy, s, big_h).is_none() {
+        text_left(list, assets, assets.light, &fmt_thousands(score), panel[0] + 40.0, panel[1] + 16.0, big_h, Colour::WHITE, s);
+    }
+
+    let rows = [
+        ("hit300", great, 0i32, 0i32),
+        ("hit100", ok, 0, 1),
+        ("hit50", meh, 0, 2),
+        ("hit300g", 0, 1, 0),
+        ("hit100k", 0, 1, 1),
+        ("hit0", miss, 1, 2),
+    ];
+    let num_dy = if v2 { -16.0 } else { -25.0 };
+    for (name, count, col, row) in rows {
+        let x = panel[0] + (40.0 + col as f32 * 200.0) * K;
+        let y = panel[1] + (100.0 + y_off + row as f32 * 60.0) * K;
+        if let Some(tex) = skin.legacy_texture(name) {
+            let cap = 52.0;
+            let nh = tex.display_height().max(1.0);
+            let h = nh.min(cap);
+            fit(list, tex, x, y, h, false);
+        } else {
+            solid(list, s, x, y, 40.0, 28.0, Colour::from_hex(0xFFFFFF).opacity(0.15));
+            text_left(list, assets, assets.semibold, name.trim_start_matches("hit"), x + 2.0, y + 4.0, 12.0, Colour::WHITE, s);
+        }
+        let nx = panel[0] + (40.0 + 40.0 + col as f32 * 200.0) * K;
+        let ncy = panel[1] + small_h * 0.5 + (100.0 + y_off + num_dy + row as f32 * 60.0) * K;
+        let digits = count.to_string();
+        if draw_score_font(list, assets, &digits, nx, ncy, s, small_h).is_none() {
+            text_left(list, assets, assets.semibold, &digits, nx, ncy - small_h * 0.5, small_h * 0.7, Colour::WHITE, s);
+        }
+    }
+
+    let row4 = 260.0;
+    let row4_off = if v2 { 0.0 } else { -12.0 };
+    let combo_cy = panel[1] + small_h * 0.5 + (row4 + 10.0 + y_off) * K;
+    let combo_num = format!("{}x", game.final_max_combo);
+    if draw_score_font(list, assets, &combo_num, panel[0] + 15.0 * K, combo_cy, s, small_h).is_none() {
+        text_left(list, assets, assets.semibold, &combo_num, panel[0] + 15.0 * K, combo_cy - small_h * 0.5, small_h, Colour::WHITE, s);
+    }
+    if let Some(tex) = skin.legacy_texture("ranking-maxcombo") {
+        let h = 32.0 * K;
+        let w = tex.display_width() * (h / tex.display_height().max(1.0));
+        let cx = panel[0] + 4.0 * K + w * 0.5;
+        let cy = panel[1] + (row4 - 5.0 - row4_off + y_off) * K;
+        fit(list, tex, cx, cy, h, true);
+    } else {
+        text_left(list, assets, assets.regular, "max combo", 8.0, 478.0, 14.0, Colour::WHITE, s);
+    }
+
+    let acc = fmt_accuracy(game.final_accuracy);
+    let acc_x = panel[0] + 195.0 * K;
+    if draw_score_font(list, assets, &acc, acc_x, combo_cy, s, small_h).is_none()
+        && draw_score_font(list, assets, acc.trim_end_matches('%'), acc_x, combo_cy, s, small_h).is_none()
+    {
+        text_left(list, assets, assets.semibold, &acc, acc_x, combo_cy - small_h * 0.5, small_h, Colour::WHITE, s);
+    }
+    if let Some(tex) = skin.legacy_texture("ranking-accuracy") {
+        let h = 36.0 * K;
+        let w = tex.display_width() * (h / tex.display_height().max(1.0));
+        let cx = panel[0] + 183.0 * K + w * 0.5;
+        let cy = panel[1] + (row4 - 3.0 - row4_off + y_off) * K;
+        fit(list, tex, cx, cy, h, true);
+    } else {
+        text_left(list, assets, assets.regular, "accuracy", 291.0, 478.0, 14.0, Colour::WHITE, s);
+    }
+
+    let (gx, gy) = (256.0, 608.0);
+    let (gw, gh) = if let Some(tex) = skin.legacy_texture("ranking-graph") {
+        let size = fit(list, tex, gx, gy, 0.0, false);
+        (size[0], size[1])
+    } else {
+        solid(list, s, gx, gy, 308.0, 148.0, Colour::from_hex(0x101418).opacity(0.85));
+        (308.0, 148.0)
+    };
+    let (ix, iy) = (gx + 7.0, gy + 7.0);
+    let (iw, ih) = ((gw - 14.0).max(8.0), (gh - 14.0).max(8.0));
+    let window = game.hit_windows.2.max(1.0);
+    for (i, ev) in game.results_hit_events.iter().filter(|e| e.result != HitResult::Miss && e.offset.is_finite()).enumerate() {
+        let t = ((ev.offset / window) * 0.5 + 0.5).clamp(0.02, 0.98);
+        let px = ix + t as f32 * iw;
+        let py = iy + 4.0 + ((i * 37) % (ih as usize).saturating_sub(8).max(1)) as f32;
+        let col = if ev.offset < -8.0 {
+            Colour::from_hex(0x66CCFF)
+        } else if ev.offset > 8.0 {
+            Colour::from_hex(0xFF6666)
+        } else {
+            Colour::from_hex(0xB2FF66)
+        };
+        list.disc([vx(px, s), vx(py, s)], 2.2 * s, col, col, Blend::Alpha);
+    }
+    solid(list, s, ix + iw * 0.5 - 0.5, iy, 1.0, ih, Colour::WHITE.opacity(0.35));
+
+    if misses == 0 {
+        if let Some(tex) = skin.legacy_texture("ranking-perfect") {
+            fit(list, tex, 416.0, 688.0, 94.0 * K, true);
+        }
+    }
+
+    let rank_name = match rank {
+        Rank::XH => "ranking-XH",
+        Rank::SH => "ranking-SH",
+        Rank::X => "ranking-X",
+        Rank::S => "ranking-S",
+        Rank::A => "ranking-A",
+        Rank::B => "ranking-B",
+        Rank::C => "ranking-C",
+        Rank::D => "ranking-D",
+    };
+    let (rcx, rcy) = (cw - 120.0 * K, 320.0);
+    let rank_h = if let Some(tex) = skin.legacy_texture(rank_name) {
+        fit(list, tex, rcx, rcy, 230.0 * K, true)[1]
+    } else {
+        text_center(list, assets, assets.venera, rank.letter(), rcx, rcy, 140.0, rank.colour(), s);
+        140.0
+    };
+
+    // Mods overlap in a row grown leftward from the right edge
+    // (stable draws each icon then steps 20 osu!px left).
+    let mut mx = cw - 20.0 * K;
+    let my = 260.0 * K;
+    let mod_names: &[(&str, bool)] = &[
+        ("selection-mod-touchdevice", game.mods.touch_device),
+        ("selection-mod-perfect", game.mods.perfect),
+        ("selection-mod-suddendeath", game.mods.sudden_death && !game.mods.perfect),
+        ("selection-mod-easy", game.mods.easy),
+        ("selection-mod-hidden", game.mods.hidden),
+        ("selection-mod-hardrock", game.mods.hard_rock),
+        ("selection-mod-nightcore", game.mods.nightcore),
+        ("selection-mod-doubletime", game.mods.double_time && !game.mods.nightcore),
+        ("selection-mod-flashlight", game.mods.flashlight),
+        ("selection-mod-spunout", game.mods.spun_out),
+        ("selection-mod-scorev2", game.mods.score_v2),
+        ("selection-mod-nofail", game.mods.no_fail),
+        ("selection-mod-halftime", game.mods.half_time),
+    ];
+    let mut drew_mod = false;
+    for (name, on) in mod_names {
+        if !on {
+            continue;
+        }
+        drew_mod = true;
+        if let Some(tex) = skin.legacy_texture(name) {
+            let nh = tex.display_height().max(1.0);
+            let h = nh.min(46.0);
+            let w = tex.display_width() * (h / nh);
+            fit(list, tex, mx, my + h * 0.5, h, true);
+            mx -= 20.0 * K;
+            let _ = w;
+        }
+    }
+    if !drew_mod {
+        let _ = rank_h;
+    }
 }

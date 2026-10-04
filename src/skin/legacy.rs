@@ -565,8 +565,51 @@ const CONSUMED_TEXTURE_NAMES: &[&str] = &[
     "followpoint",
     "hit0",
     "hit50",
+    "hit50k",
     "hit100",
+    "hit100k",
     "hit300",
+    "hit300g",
+    "hit300k",
+    // osu!stable ranking screen (`--results-style stable`). g0v0
+    // `LegacySkin.GetTexture` loads these on demand; the atlas only
+    // decodes names listed here, so the results screen must name them.
+    "ranking-panel",
+    "ranking-title",
+    "ranking-graph",
+    "ranking-perfect",
+    "ranking-maxcombo",
+    "ranking-accuracy",
+    "ranking-X",
+    "ranking-XH",
+    "ranking-S",
+    "ranking-SH",
+    "ranking-A",
+    "ranking-B",
+    "ranking-C",
+    "ranking-D",
+    "selection-mod-easy",
+    "selection-mod-nofail",
+    "selection-mod-halftime",
+    "selection-mod-hidden",
+    "selection-mod-hardrock",
+    "selection-mod-suddendeath",
+    "selection-mod-perfect",
+    "selection-mod-nightcore",
+    "selection-mod-doubletime",
+    "selection-mod-flashlight",
+    "selection-mod-spunout",
+    "selection-mod-relax",
+    "selection-mod-relax2",
+    "selection-mod-autoplay",
+    "selection-mod-autopilot",
+    "selection-mod-scorev2",
+    "selection-mod-target",
+    "selection-mod-fadein",
+    "selection-mod-random",
+    "selection-mod-cinema",
+    "selection-mod-keycoop",
+    "selection-mod-touchdevice",
     "spinner-glow",
     "spinner-background",
     "spinner-circle",
@@ -618,6 +661,10 @@ impl LegacySkin {
     fn consumed_names(&self) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
         let mut push = |name: String, names: &mut Vec<String>| {
+            // File keys and `GetTexture` lookups are lowercased
+            // (`RealmBackedResourceStore`). Mixed-case element names
+            // (`ranking-A`) must be stored in that form or they never pack.
+            let name = name.to_lowercase();
             names.push(format!("{}@2x", name));
             names.push(name);
         };
@@ -882,6 +929,24 @@ mod tests {
         let tex = skin.get_texture("hitcircle@2x").unwrap();
         assert_eq!(tex.scale_adjust, 2.0);
         assert!(skin.get_texture("nonexistent").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ranking-screen elements must be decoded, same as a g0v0
+    /// `GetTexture("ranking-panel")` call. `@2x` wins.
+    #[test]
+    fn ranking_screen_elements_are_packed() {
+        let dir = skin_dir("ranking");
+        write_png(&dir.join("ranking-panel.png"), 2, 2, &[255; 4 * 4]);
+        write_png(&dir.join("ranking-A@2x.png"), 4, 4, &[255; 4 * 16]);
+        write_png(&dir.join("hit300g.png"), 2, 2, &[255; 4 * 4]);
+        write_png(&dir.join("selection-mod-hidden.png"), 2, 2, &[255; 4 * 4]);
+        let mut skin = LegacySkin::from_directory(&dir).unwrap();
+        assign_atlas(&mut skin);
+        assert!(skin.get_texture("ranking-panel").is_some());
+        assert_eq!(skin.get_texture("ranking-A").unwrap().scale_adjust, 2.0);
+        assert!(skin.get_texture("hit300g").is_some());
+        assert!(skin.get_texture("selection-mod-hidden").is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

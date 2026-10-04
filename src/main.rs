@@ -53,6 +53,9 @@
 //!   --video [on|off]       Storyboard video layer (default off; frames are
 //!                          decoded through an ffmpeg rawvideo pipe)
 //!   --results <secs|off>   Results screen seconds appended after gameplay
+//!   --results-style <lazer|stable>
+//!                          Results screen look (default lazer). stable is
+//!                          the osu!stable ranking panel (skin ranking-*)
 //!                          (default 4; `off` disables)
 //!   --results-only         Render ONLY the results screen (poster mode:
 //!                          no gameplay frames; pair with --png-dir for a
@@ -196,6 +199,8 @@ struct Options {
     /// Render ONLY the results screen, no gameplay frames
     /// (`--results-only`; duration still set by `--results`).
     results_only: bool,
+    /// `lazer` (default) or `stable` ranking screen (`--results-style`).
+    results_style: osu_replay_render::results::ResultsStyle,
     /// Custom results-screen avatar image (`--avatar <image>` / config
     /// `avatar`): cover-cropped square with rounded corners.
     avatar: Option<String>,
@@ -246,12 +251,21 @@ struct ConfigJson {
     show_cursor_ripples: Option<bool>,
     results: Option<f64>,
     results_only: Option<bool>,
+    results_style: Option<String>,
     avatar: Option<String>,
     ffmpeg_extra: Option<Vec<String>>,
 }
 
 /// `--hud <value>` / `--guides` / `--pp` / `--bg` / ...: `on`/`off`, with
 /// `true`/`false`/`1`/`0` aliases (config mirrors them as JSON booleans).
+fn parse_results_style(v: &str) -> Result<osu_replay_render::results::ResultsStyle, String> {
+    match v {
+        "lazer" => Ok(osu_replay_render::results::ResultsStyle::Lazer),
+        "stable" => Ok(osu_replay_render::results::ResultsStyle::Stable),
+        other => Err(format!("--results-style must be lazer or stable (got {other})")),
+    }
+}
+
 fn parse_hud_value(v: &str) -> Result<bool, String> {
     match v {
         "on" | "true" | "1" => Ok(true),
@@ -365,6 +379,9 @@ fn apply_config(opts: &mut Options, c: ConfigJson) -> Result<(), String> {
         }
     }
     if c.avatar.is_some() { opts.avatar = c.avatar; }
+    if let Some(v) = c.results_style {
+        opts.results_style = parse_results_style(&v)?;
+    }
     if let Some(v) = c.ffmpeg_extra { opts.ffmpeg_extra = v; }
     Ok(())
 }
@@ -376,7 +393,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
     let autoplay = args.iter().any(|a| a == "--autoplay");
     let min_args = if autoplay { 2 } else { 3 };
     if args.len() < min_args {
-        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--hud on|off] [--hd auto|on|off] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro|dir] [--argon-hud] [--guides on|off] [--pp on|off] [--audio [file.mp3]] [--audio-offset ms] [--bg on|off] [--bg-opacity 0..1] [--storyboard on|off] [--video on|off] [--cursor-size 0.1..=2] [--hitsounds] [--skin-colours] [--upscale off|fsr|anime4k] [--results secs|off] [--results-only] [--avatar image] [--config file.json] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
+        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--hud on|off] [--hd auto|on|off] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro|dir] [--argon-hud] [--guides on|off] [--pp on|off] [--audio [file.mp3]] [--audio-offset ms] [--bg on|off] [--bg-opacity 0..1] [--storyboard on|off] [--video on|off] [--cursor-size 0.1..=2] [--hitsounds] [--skin-colours] [--upscale off|fsr|anime4k] [--results secs|off] [--results-style lazer|stable] [--results-only] [--avatar image] [--config file.json] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
     }
     let map_path = args[1].clone();
     let replay_path = if autoplay { None } else { Some(args[2].clone()) };
@@ -425,6 +442,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
         show_cursor_ripples: false,
         results: 4.0,
         results_only: false,
+        results_style: osu_replay_render::results::ResultsStyle::Lazer,
         avatar: None,
     };
     // `--config <file.json>` pre-pass: the JSON provides base values;
@@ -657,6 +675,11 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
                 if opts.results <= 0.0 {
                     opts.results = 4.0;
                 }
+            }
+            "--results-style" => {
+                i += 1;
+                let v = args.get(i).cloned().ok_or("--results-style needs lazer or stable")?;
+                opts.results_style = parse_results_style(&v)?;
             }
             "--avatar" => {
                 i += 1;
@@ -1155,18 +1178,26 @@ fn main() {
             frame_times.push(last);
         }
         state.results_at = Some(last);
-        eprintln!("results-only: {} frames ({:.1}s)", n, opts.results);
+        state.results_style = opts.results_style;
+        eprintln!(
+            "results-only: {} frames ({:.1}s, {:?})",
+            n, opts.results, opts.results_style
+        );
     } else if results_frames > 0 {
         let last = *frame_times.last().unwrap();
         for _ in 0..results_frames {
             frame_times.push(last);
         }
         state.results_at = Some(last);
+        state.results_style = opts.results_style;
         // Sequential handover: the gameplay fades out (0.35s), then the
         // results screen appears instantly after the fade-out.
         state.results_fade_frames = (0.35 * opts.fps).round() as u32;
         state.results_fadein_frames = 0;
-        eprintln!("results: +{} frames ({:.1}s, expanded panel, gameplay fade-out 0.35s)", results_frames, opts.results);
+        eprintln!(
+            "results: +{} frames ({:.1}s, {:?}, gameplay fade-out 0.35s)",
+            results_frames, opts.results, opts.results_style
+        );
     }
 
     if opts.hitsounds && opts.out.is_none() {

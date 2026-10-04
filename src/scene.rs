@@ -791,9 +791,11 @@ pub struct SceneState {
     /// 只渲染背景 + storyboard(音频/判定照常):跳过 note/滑条/转盘/
     /// 跟随点/判定动画/光标等全部 gameplay 元素(壁纸"纯画面"模式)。
     pub gameplay_hidden: bool,
-    /// Results-screen cutoff: at times >= this the frame draws the (static,
-    /// expanded) lazer results screen instead of gameplay. `None` = never.
+    /// Results-screen cutoff: at times >= this the frame draws the results
+    /// screen instead of gameplay. `None` = never.
     pub results_at: Option<f64>,
+    /// `lazer` expanded panel or the osu!stable ranking screen.
+    pub results_style: crate::results::ResultsStyle,
     /// Gameplay FADE-OUT length in frames at the results handover.
     pub results_fade_frames: u32,
     /// Results screen FADE-IN length in frames (starts once the fade-out
@@ -839,6 +841,7 @@ impl SceneState {
             break_lighten: true,
             letterbox_in_breaks: game.letterbox_in_breaks,
             results_at: None,
+            results_style: crate::results::ResultsStyle::Lazer,
             results_fade_frames: 0,
             results_fadein_frames: 0,
             results_frame: 0,
@@ -1149,7 +1152,11 @@ impl SceneState {
                 has_avatar: self.has_avatar,
             };
             list.global_alpha = results_alpha;
-            crate::results::draw(&view, assets, &self.mapper, list);
+            if self.results_style == crate::results::ResultsStyle::Stable {
+                crate::results::draw_stable(&view, assets, &self.mapper, list);
+            } else {
+                crate::results::draw(&view, assets, &self.mapper, list);
+            }
             list.global_alpha = prev_alpha;
         }
 
