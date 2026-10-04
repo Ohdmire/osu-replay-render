@@ -2370,20 +2370,41 @@ pub fn draw_stable(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut D
         text_left(list, assets, assets.semibold, "ranking", cw - 32.0 - w, 16.0, 32.0, Colour::WHITE, s);
     }
 
-    let title = trunc(assets.semibold, &game.map_meta.title, 22.0, 0.0, cw * 0.55);
-    text_left(list, assets, assets.semibold, &title, 12.0, 6.0, 22.0, Colour::WHITE, s);
-    let artist = trunc(assets.regular, &game.map_meta.artist, 14.0, 0.0, cw * 0.55);
-    text_left(list, assets, assets.regular, &artist, 12.0, 32.0, 14.0, Colour::WHITE.opacity(0.92), s);
-    let by = if game.map_meta.creator.is_empty() {
+    // danser `ranking.go`: Ubuntu/SBFont sizes 30 / 22 / 22 at y = 27, 52, 74.
+    // Font family stays the renderer's Exo 2.
+    let header_w = (cw - 420.0).max(200.0);
+    let beatmap_name = {
+        let diff = if game.map_meta.version.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", game.map_meta.version)
+        };
+        let artist = game.map_meta.artist.as_str();
+        let title = game.map_meta.title.as_str();
+        let line = if artist.is_empty() {
+            format!("{title}{diff}")
+        } else if title.is_empty() {
+            format!("{artist}{diff}")
+        } else {
+            format!("{artist} - {title}{diff}")
+        };
+        trunc(assets.semibold, &line, 30.0, 0.0, header_w)
+    };
+    text_left(list, assets, assets.semibold, &beatmap_name, 5.0, 4.0, 30.0, Colour::WHITE, s);
+    if !game.map_meta.creator.is_empty() {
+        let by = trunc(assets.regular, &format!("Beatmap by {}", game.map_meta.creator), 22.0, 0.0, header_w);
+        text_left(list, assets, assets.regular, &by, 5.0, 36.0, 22.0, Colour::WHITE, s);
+    }
+    let played = if let Some(ticks) = game.played_at_ticks {
+        format!("Played by {} on {}", game.player, format_played_on(ticks).trim_start_matches("Played on "))
+    } else if game.player.is_empty() {
         String::new()
     } else {
-        format!("Beatmap by {}", game.map_meta.creator)
+        format!("Played by {}", game.player)
     };
-    let diff = if game.map_meta.version.is_empty() { String::new() } else { format!("[{}]", game.map_meta.version) };
-    let sub = if by.is_empty() { diff.clone() } else if diff.is_empty() { by.clone() } else { format!("{by}  {diff}") };
-    text_left(list, assets, assets.regular, &sub, 12.0, 50.0, 13.0, Colour::WHITE.opacity(0.85), s);
-    if let Some(ticks) = game.played_at_ticks {
-        text_left(list, assets, assets.regular, &format_played_on(ticks), 12.0, 68.0, 12.0, Colour::WHITE.opacity(0.7), s);
+    if !played.is_empty() {
+        let played = trunc(assets.regular, &played, 22.0, 0.0, header_w);
+        text_left(list, assets, assets.regular, &played, 5.0, 60.0, 22.0, Colour::WHITE, s);
     }
 
     // Panel at authored display size. Wiki anchor (0, 102); a 667px-tall
@@ -2477,23 +2498,54 @@ pub fn draw_stable(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut D
         solid(list, s, gx, gy, 308.0, 148.0, Colour::from_hex(0x101418).opacity(0.85));
         (308.0, 148.0)
     };
-    let (ix, iy) = (gx + 7.0, gy + 7.0);
-    let (iw, ih) = ((gw - 14.0).max(8.0), (gh - 14.0).max(8.0));
-    let window = game.hit_windows.2.max(1.0);
-    for (i, ev) in game.results_hit_events.iter().filter(|e| e.result != HitResult::Miss && e.offset.is_finite()).enumerate() {
-        let t = ((ev.offset / window) * 0.5 + 0.5).clamp(0.02, 0.98);
-        let px = ix + t as f32 * iw;
-        let py = iy + 4.0 + ((i * 37) % (ih as usize).saturating_sub(8).max(1)) as f32;
-        let col = if ev.offset < -8.0 {
-            Colour::from_hex(0x66CCFF)
-        } else if ev.offset > 8.0 {
-            Colour::from_hex(0xFF6666)
-        } else {
-            Colour::from_hex(0xB2FF66)
-        };
-        list.disc([vx(px, s), vx(py, s)], 2.2 * s, col, col, Blend::Alpha);
+    // danser draws the HP curve inside ranking-graph (green above 50%,
+    // red below). The previous cyan/green/red scatter was hit-error, not
+    // this graph.
+    let _ = (gw, gh);
+    let t0 = game.objects.first().map(|o| o.start_time).unwrap_or(0.0);
+    let t1 = game.objects.iter().map(|o| o.end_time).fold(t0, f64::max);
+    if t1 > t0 {
+        let n = 80;
+        let mut pts = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = t0 + (t1 - t0) * (i as f64) / (n as f64 - 1.0);
+            let hp = crate::game::health_at(game, t).clamp(0.0, 1.0);
+            let x = 256.0 + 8.0 + 298.0 * (i as f32) / (n as f32 - 1.0);
+            let y = 608.0 + 8.0 + 137.6 * (1.0 - hp as f32);
+            pts.push((x, y, hp));
+        }
+        for w in pts.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let mean = (a.2 + b.2) * 0.5;
+            let col = if mean > 0.5 {
+                Colour::from_hex(0x33FF33)
+            } else {
+                Colour::from_hex(0xFF3333)
+            };
+            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+            let len = (dx * dx + dy * dy).sqrt().max(0.001);
+            let (nx, ny) = (-dy / len * 1.0, dx / len * 1.0);
+            let p = |x: f32, y: f32| [vx(x, s), vx(y, s)];
+            list.quad_gradient(
+                &[
+                    p(a.0 + nx, a.1 + ny),
+                    p(b.0 + nx, b.1 + ny),
+                    p(b.0 - nx, b.1 - ny),
+                    p(a.0 - nx, a.1 - ny),
+                ],
+                [col, col, col, col],
+                Blend::Alpha,
+            );
+        }
     }
-    solid(list, s, ix + iw * 0.5 - 0.5, iy, 1.0, ih, Colour::WHITE.opacity(0.35));
+
+    // danser PP: centred at (screenWidth - 204, 638), size 61, with a
+    // 1px shadow. Bottom-right of the results screen.
+    if game.pp.is_finite() {
+        let pp = format!("{}pp", game.pp.round() as i64);
+        text_center(list, assets, assets.semibold, &pp, cw - 203.0, 639.0, 61.0, Colour::from_hex(0x000000).opacity(0.5), s);
+        text_center(list, assets, assets.semibold, &pp, cw - 204.0, 638.0, 61.0, Colour::WHITE, s);
+    }
 
     if misses == 0 {
         if let Some(tex) = skin.legacy_texture("ranking-perfect") {
