@@ -2498,25 +2498,23 @@ pub fn draw_stable(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut D
         solid(list, s, gx, gy, 308.0, 148.0, Colour::from_hex(0x101418).opacity(0.85));
         (308.0, 148.0)
     };
-    // HP over the map, inside ranking-graph. Each judgement is a point:
-    // drain into the hit, then the health jump. Segments at or below half
-    // health (the near-fail stretch) are one red polyline; the rest is green.
+    // HP over the map, inside ranking-graph. danser thins the curve to
+    // about 100 points so it reads as a wave, not a spike per hit.
+    // A bucket whose lowest point is at or below half health keeps that
+    // dip, and the stretch through it is drawn red.
     let _ = (gw, gh);
     let info = &game.health;
     let t0 = info.drain_start;
     let t1 = info.drain_end.max(info.events.last().map(|e| e.0).unwrap_or(t0));
     if t1 > t0 {
-        let mut samples: Vec<(f64, f64)> = Vec::with_capacity(info.events.len() * 2 + 2);
-        samples.push((t0, 1.0));
-        for &(t, hp_after) in &info.events {
-            let before = crate::game::health_at(game, t - 0.05).clamp(0.0, 1.0);
-            if samples.last().is_none_or(|p| (p.0 - t).abs() > 0.01 || (p.1 - before).abs() > 0.001) {
-                samples.push((t, before));
-            }
-            samples.push((t, hp_after.clamp(0.0, 1.0)));
+        // Evenly spaced, same order of magnitude as danser's 100-point cap.
+        // One sample per slice: no per-hit spike.
+        let buckets = 48;
+        let mut samples: Vec<(f64, f64)> = Vec::with_capacity(buckets + 1);
+        for i in 0..=buckets {
+            let t = t0 + (t1 - t0) * (i as f64) / buckets as f64;
+            samples.push((t, crate::game::health_at(game, t).clamp(0.0, 1.0)));
         }
-        let end_hp = crate::game::health_at(game, t1).clamp(0.0, 1.0);
-        samples.push((t1, end_hp));
 
         let danger = 0.5;
         let mut draw_seg = |ax: f32, ay: f32, bx: f32, by: f32, col: Colour| {
