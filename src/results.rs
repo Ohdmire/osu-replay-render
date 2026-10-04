@@ -2353,15 +2353,18 @@ pub fn draw_stable(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut D
         [w, h]
     };
 
-    // Top black bar, then the "ranking" wordmark (height 75 osu!px,
-    // 20 osu!px in from the right).
-    let title_h = 75.0 * K;
+    // Top black bar, then the "ranking" wordmark at its authored size
+    // (SD pixels = virtual pixels; @2x is already halved). 20 osu!px
+    // in from the right.
+    let title_h = skin
+        .legacy_texture("ranking-title")
+        .map(|t| t.display_height())
+        .unwrap_or(75.0 * K);
     let bar_h = title_h * 0.785;
     solid(list, s, 0.0, 0.0, cw, bar_h, Colour::from_hex(0x000000));
     if let Some(tex) = skin.legacy_texture("ranking-title") {
-        let nh = tex.display_height().max(1.0);
-        let w = tex.display_width() * (title_h / nh);
-        fit(list, tex, cw - 20.0 * K - w, 0.0, title_h, false);
+        let w = tex.display_width();
+        fit(list, tex, cw - 20.0 * K - w, 0.0, 0.0, false);
     } else {
         let (w, _, _) = ttf_measure(assets.semibold, "ranking", 32.0, 0.0);
         text_left(list, assets, assets.semibold, "ranking", cw - 32.0 - w, 16.0, 32.0, Colour::WHITE, s);
@@ -2383,19 +2386,22 @@ pub fn draw_stable(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut D
         text_left(list, assets, assets.regular, &format_played_on(ticks), 12.0, 68.0, 12.0, Colour::WHITE.opacity(0.7), s);
     }
 
-    // Panel: top-left (0, 102), height 317 osu!px.
+    // Panel at authored display size. Wiki anchor (0, 102); a 667px-tall
+    // panel then ends on the 768 line. Forcing it to 317 osu!px shrinks
+    // custom panels and slides every number out of its box.
     let panel = [0.0_f32, 102.0];
-    let panel_h = 317.0 * K;
     if let Some(tex) = skin.legacy_texture("ranking-panel") {
-        fit(list, tex, panel[0], panel[1], panel_h, false);
+        fit(list, tex, panel[0], panel[1], 0.0, false);
     } else {
-        solid(list, s, panel[0], panel[1], 622.0 * K * 317.0 / 505.0, panel_h, Colour::from_hex(0x1C2430).opacity(0.9));
+        solid(list, s, panel[0], panel[1], 622.0, 505.0, Colour::from_hex(0x1C2430).opacity(0.9));
     }
 
     let y_off = -1.0;
-    let score_cy = panel[1] + big_h * 0.5 + (11.0 + y_off) * K;
+    // Score digits keep their skin size (score-0 is authored for the
+    // score box). `big_h` is only the vertical-centre fudge.
+    let score_cy = panel[1] + (11.0 + y_off) * K + big_h * 0.5;
     let score_text = score.abs().to_string();
-    if draw_score_font(list, assets, &score_text, panel[0] + 111.0 * K, score_cy, s, big_h).is_none() {
+    if draw_score_font(list, assets, &score_text, panel[0] + 111.0 * K, score_cy, s, 0.0).is_none() {
         text_left(list, assets, assets.light, &fmt_thousands(score), panel[0] + 40.0, panel[1] + 16.0, big_h, Colour::WHITE, s);
     }
 
@@ -2409,21 +2415,19 @@ pub fn draw_stable(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut D
     ];
     let num_dy = if v2 { -16.0 } else { -25.0 };
     for (name, count, col, row) in rows {
+        // Hit sprite is centred on the stable anchor (drawImage origin).
         let x = panel[0] + (40.0 + col as f32 * 200.0) * K;
         let y = panel[1] + (100.0 + y_off + row as f32 * 60.0) * K;
         if let Some(tex) = skin.legacy_texture(name) {
-            let cap = 52.0;
-            let nh = tex.display_height().max(1.0);
-            let h = nh.min(cap);
-            fit(list, tex, x, y, h, false);
+            fit(list, tex, x, y, 0.0, true);
         } else {
-            solid(list, s, x, y, 40.0, 28.0, Colour::from_hex(0xFFFFFF).opacity(0.15));
-            text_left(list, assets, assets.semibold, name.trim_start_matches("hit"), x + 2.0, y + 4.0, 12.0, Colour::WHITE, s);
+            solid(list, s, x - 20.0, y - 14.0, 40.0, 28.0, Colour::from_hex(0xFFFFFF).opacity(0.15));
+            text_left(list, assets, assets.semibold, name.trim_start_matches("hit"), x - 18.0, y - 8.0, 12.0, Colour::WHITE, s);
         }
-        let nx = panel[0] + (40.0 + 40.0 + col as f32 * 200.0) * K;
-        let ncy = panel[1] + small_h * 0.5 + (100.0 + y_off + num_dy + row as f32 * 60.0) * K;
+        let nx = panel[0] + (80.0 + col as f32 * 200.0) * K;
+        let ncy = panel[1] + (100.0 + y_off + num_dy + row as f32 * 60.0) * K + small_h * 0.5;
         let digits = count.to_string();
-        if draw_score_font(list, assets, &digits, nx, ncy, s, small_h).is_none() {
+        if draw_score_font(list, assets, &digits, nx, ncy, s, 0.0).is_none() {
             text_left(list, assets, assets.semibold, &digits, nx, ncy - small_h * 0.5, small_h * 0.7, Colour::WHITE, s);
         }
     }
@@ -2432,39 +2436,42 @@ pub fn draw_stable(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut D
     let row4_off = if v2 { 0.0 } else { -12.0 };
     let combo_cy = panel[1] + small_h * 0.5 + (row4 + 10.0 + y_off) * K;
     let combo_num = format!("{}x", game.final_max_combo);
-    if draw_score_font(list, assets, &combo_num, panel[0] + 15.0 * K, combo_cy, s, small_h).is_none() {
+    if draw_score_font(list, assets, &combo_num, panel[0] + 15.0 * K, combo_cy, s, 0.0).is_none() {
         text_left(list, assets, assets.semibold, &combo_num, panel[0] + 15.0 * K, combo_cy - small_h * 0.5, small_h, Colour::WHITE, s);
     }
     if let Some(tex) = skin.legacy_texture("ranking-maxcombo") {
-        let h = 32.0 * K;
-        let w = tex.display_width() * (h / tex.display_height().max(1.0));
-        let cx = panel[0] + 4.0 * K + w * 0.5;
-        let cy = panel[1] + (row4 - 5.0 - row4_off + y_off) * K;
-        fit(list, tex, cx, cy, h, true);
+        // 1×1 placeholders (skins that blank the label) are skipped.
+        if tex.display_width() > 2.0 && tex.display_height() > 2.0 {
+            let w = tex.display_width();
+            let cx = panel[0] + 4.0 * K + w * 0.5;
+            let cy = panel[1] + (row4 - 5.0 - row4_off + y_off) * K;
+            fit(list, tex, cx, cy, 0.0, true);
+        }
     } else {
         text_left(list, assets, assets.regular, "max combo", 8.0, 478.0, 14.0, Colour::WHITE, s);
     }
 
     let acc = fmt_accuracy(game.final_accuracy);
     let acc_x = panel[0] + 195.0 * K;
-    if draw_score_font(list, assets, &acc, acc_x, combo_cy, s, small_h).is_none()
-        && draw_score_font(list, assets, acc.trim_end_matches('%'), acc_x, combo_cy, s, small_h).is_none()
+    if draw_score_font(list, assets, &acc, acc_x, combo_cy, s, 0.0).is_none()
+        && draw_score_font(list, assets, acc.trim_end_matches('%'), acc_x, combo_cy, s, 0.0).is_none()
     {
         text_left(list, assets, assets.semibold, &acc, acc_x, combo_cy - small_h * 0.5, small_h, Colour::WHITE, s);
     }
     if let Some(tex) = skin.legacy_texture("ranking-accuracy") {
-        let h = 36.0 * K;
-        let w = tex.display_width() * (h / tex.display_height().max(1.0));
-        let cx = panel[0] + 183.0 * K + w * 0.5;
-        let cy = panel[1] + (row4 - 3.0 - row4_off + y_off) * K;
-        fit(list, tex, cx, cy, h, true);
+        if tex.display_width() > 2.0 && tex.display_height() > 2.0 {
+            let w = tex.display_width();
+            let cx = panel[0] + 183.0 * K + w * 0.5;
+            let cy = panel[1] + (row4 - 3.0 - row4_off + y_off) * K;
+            fit(list, tex, cx, cy, 0.0, true);
+        }
     } else {
         text_left(list, assets, assets.regular, "accuracy", 291.0, 478.0, 14.0, Colour::WHITE, s);
     }
 
     let (gx, gy) = (256.0, 608.0);
     let (gw, gh) = if let Some(tex) = skin.legacy_texture("ranking-graph") {
-        let size = fit(list, tex, gx, gy, 0.0, false);
+        let size = fit(list, tex, gx, gy, 0.0, false); // authored size
         (size[0], size[1])
     } else {
         solid(list, s, gx, gy, 308.0, 148.0, Colour::from_hex(0x101418).opacity(0.85));
@@ -2490,7 +2497,7 @@ pub fn draw_stable(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut D
 
     if misses == 0 {
         if let Some(tex) = skin.legacy_texture("ranking-perfect") {
-            fit(list, tex, 416.0, 688.0, 94.0 * K, true);
+            fit(list, tex, 416.0, 688.0, 0.0, true);
         }
     }
 
@@ -2506,7 +2513,7 @@ pub fn draw_stable(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut D
     };
     let (rcx, rcy) = (cw - 120.0 * K, 320.0);
     let rank_h = if let Some(tex) = skin.legacy_texture(rank_name) {
-        fit(list, tex, rcx, rcy, 230.0 * K, true)[1]
+        fit(list, tex, rcx, rcy, 0.0, true)[1]
     } else {
         text_center(list, assets, assets.venera, rank.letter(), rcx, rcy, 140.0, rank.colour(), s);
         140.0
@@ -2538,10 +2545,9 @@ pub fn draw_stable(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut D
         }
         drew_mod = true;
         if let Some(tex) = skin.legacy_texture(name) {
-            let nh = tex.display_height().max(1.0);
-            let h = nh.min(46.0);
-            let w = tex.display_width() * (h / nh);
-            fit(list, tex, mx, my + h * 0.5, h, true);
+            let h = tex.display_height();
+            let w = tex.display_width();
+            fit(list, tex, mx, my + h * 0.5, 0.0, true);
             mx -= 20.0 * K;
             let _ = w;
         }
