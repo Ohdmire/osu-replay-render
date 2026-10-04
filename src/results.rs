@@ -2498,44 +2498,75 @@ pub fn draw_stable(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut D
         solid(list, s, gx, gy, 308.0, 148.0, Colour::from_hex(0x101418).opacity(0.85));
         (308.0, 148.0)
     };
-    // danser draws the HP curve inside ranking-graph (green above 50%,
-    // red below). The previous cyan/green/red scatter was hit-error, not
-    // this graph.
+    // HP over the map, inside ranking-graph. Each judgement is a point:
+    // drain into the hit, then the health jump. Segments at or below half
+    // health (the near-fail stretch) are one red polyline; the rest is green.
     let _ = (gw, gh);
-    let t0 = game.objects.first().map(|o| o.start_time).unwrap_or(0.0);
-    let t1 = game.objects.iter().map(|o| o.end_time).fold(t0, f64::max);
+    let info = &game.health;
+    let t0 = info.drain_start;
+    let t1 = info.drain_end.max(info.events.last().map(|e| e.0).unwrap_or(t0));
     if t1 > t0 {
-        let n = 80;
-        let mut pts = Vec::with_capacity(n);
-        for i in 0..n {
-            let t = t0 + (t1 - t0) * (i as f64) / (n as f64 - 1.0);
-            let hp = crate::game::health_at(game, t).clamp(0.0, 1.0);
-            let x = 256.0 + 8.0 + 298.0 * (i as f32) / (n as f32 - 1.0);
-            let y = 608.0 + 8.0 + 137.6 * (1.0 - hp as f32);
-            pts.push((x, y, hp));
+        let mut samples: Vec<(f64, f64)> = Vec::with_capacity(info.events.len() * 2 + 2);
+        samples.push((t0, 1.0));
+        for &(t, hp_after) in &info.events {
+            let before = crate::game::health_at(game, t - 0.05).clamp(0.0, 1.0);
+            if samples.last().is_none_or(|p| (p.0 - t).abs() > 0.01 || (p.1 - before).abs() > 0.001) {
+                samples.push((t, before));
+            }
+            samples.push((t, hp_after.clamp(0.0, 1.0)));
         }
-        for w in pts.windows(2) {
-            let (a, b) = (w[0], w[1]);
-            let mean = (a.2 + b.2) * 0.5;
-            let col = if mean > 0.5 {
-                Colour::from_hex(0x33FF33)
-            } else {
-                Colour::from_hex(0xFF3333)
-            };
-            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let end_hp = crate::game::health_at(game, t1).clamp(0.0, 1.0);
+        samples.push((t1, end_hp));
+
+        let danger = 0.5;
+        let mut draw_seg = |ax: f32, ay: f32, bx: f32, by: f32, col: Colour| {
+            let (dx, dy) = (bx - ax, by - ay);
             let len = (dx * dx + dy * dy).sqrt().max(0.001);
-            let (nx, ny) = (-dy / len * 1.0, dx / len * 1.0);
+            let (nx, ny) = (-dy / len * 1.4, dx / len * 1.4);
             let p = |x: f32, y: f32| [vx(x, s), vx(y, s)];
             list.quad_gradient(
                 &[
-                    p(a.0 + nx, a.1 + ny),
-                    p(b.0 + nx, b.1 + ny),
-                    p(b.0 - nx, b.1 - ny),
-                    p(a.0 - nx, a.1 - ny),
+                    p(ax + nx, ay + ny),
+                    p(bx + nx, by + ny),
+                    p(bx - nx, by - ny),
+                    p(ax - nx, ay - ny),
                 ],
                 [col, col, col, col],
                 Blend::Alpha,
             );
+        };
+        let xy = |t: f64, hp: f64| -> (f32, f32) {
+            let u = ((t - t0) / (t1 - t0)).clamp(0.0, 1.0) as f32;
+            let x = 256.0 + 8.0 + 298.0 * u;
+            let y = 608.0 + 8.0 + 137.6 * (1.0 - hp.clamp(0.0, 1.0) as f32);
+            (x, y)
+        };
+        let green = Colour::from_hex(0x33FF33);
+        let red = Colour::from_hex(0xFF3333);
+        for w in samples.windows(2) {
+            let (t_a, hp_a) = w[0];
+            let (t_b, hp_b) = w[1];
+            let (ax, ay) = xy(t_a, hp_a);
+            let (bx, by) = xy(t_b, hp_b);
+            let low_a = hp_a <= danger;
+            let low_b = hp_b <= danger;
+            if low_a == low_b {
+                draw_seg(ax, ay, bx, by, if low_a { red } else { green });
+            } else {
+                // Crosses the danger line: split so the low side stays one red segment.
+                let denom = hp_b - hp_a;
+                let f = if denom.abs() < 1e-6 { 0.5 } else { (danger - hp_a) / denom };
+                let f = f.clamp(0.0, 1.0) as f32;
+                let mx = ax + (bx - ax) * f;
+                let my = ay + (by - ay) * f;
+                if low_a {
+                    draw_seg(ax, ay, mx, my, red);
+                    draw_seg(mx, my, bx, by, green);
+                } else {
+                    draw_seg(ax, ay, mx, my, green);
+                    draw_seg(mx, my, bx, by, red);
+                }
+            }
         }
     }
 
