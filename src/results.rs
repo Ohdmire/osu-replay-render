@@ -2238,18 +2238,25 @@ fn sprite_center(list: &mut DrawList, atlas: &Atlas, tex: SkinTexture, cx: f32, 
 
 /// Score-font run (`score-0`..`score-9`, skin `ScoreOverlap`). `None` when
 /// the skin has no score font — the caller draws TTF instead.
+/// Skin `score` digits. `glyph_scale` is 1 at the sprite's authored
+/// size. `x`/`y` is the centre of the run when `center` is set, otherwise
+/// the left edge and, if `y_is_top`, the top of the glyphs.
 fn draw_score_font(
     list: &mut DrawList,
     assets: &Assets,
     text: &str,
     x: f32,
-    cy: f32,
+    y: f32,
     s: f32,
-    digit_h: f32,
+    glyph_scale: f32,
+    overlap_override: Option<f32>,
+    center: bool,
+    y_is_top: bool,
 ) -> Option<f32> {
     let skin = assets.skin;
     let prefix = crate::skin::get_font_prefix(skin, crate::skin::texture::LegacyFont::Score);
-    let overlap = crate::skin::get_font_overlap(skin, crate::skin::texture::LegacyFont::Score);
+    let overlap = overlap_override
+        .unwrap_or_else(|| crate::skin::get_font_overlap(skin, crate::skin::texture::LegacyFont::Score));
     let mut glyphs = Vec::with_capacity(text.len());
     for c in text.chars() {
         let name = match c {
@@ -2265,9 +2272,17 @@ fn draw_score_font(
     if glyphs.is_empty() {
         return Some(0.0);
     }
-    let native_h = glyphs[0].display_height().max(1.0);
-    let scale = if digit_h > 0.0 { digit_h / native_h } else { 1.0 };
-    let mut pen = x;
+    let scale = glyph_scale.max(0.01);
+    let mut width = 0.0;
+    for (i, tex) in glyphs.iter().enumerate() {
+        width += tex.display_width() * scale;
+        if i + 1 != glyphs.len() {
+            width -= overlap * scale;
+        }
+    }
+    let mut pen = if center { x - width * 0.5 } else { x };
+    let h0 = glyphs[0].display_height() * scale;
+    let cy = if y_is_top { y + h0 * 0.5 } else { y };
     for (i, tex) in glyphs.iter().enumerate() {
         let w = tex.display_width() * scale;
         let h = tex.display_height() * scale;
@@ -2285,7 +2300,7 @@ fn draw_score_font(
             pen -= overlap * scale;
         }
     }
-    Some(pen - x)
+    Some(width)
 }
 
 
@@ -2417,77 +2432,73 @@ pub fn draw_stable(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut D
         solid(list, s, panel[0], panel[1], 622.0, 505.0, Colour::from_hex(0x1C2430).opacity(0.9));
     }
 
-    let y_off = -1.0;
-    // Score digits keep their skin size (score-0 is authored for the
-    // score box). `big_h` is only the vertical-centre fudge.
-    let score_cy = panel[1] + (11.0 + y_off) * K + big_h * 0.5;
-    let score_text = score.abs().to_string();
-    if draw_score_font(list, assets, &score_text, panel[0] + 111.0 * K, score_cy, s, 0.0).is_none() {
-        text_left(list, assets, assets.light, &fmt_thousands(score), panel[0] + 40.0, panel[1] + 16.0, big_h, Colour::WHITE, s);
+    // danser ranking.go: score is centred, skin digits at 1.3×, overlap forced to -2.
+    let score_text = format!("{:08}", score.abs());
+    if draw_score_font(list, assets, &score_text, 220.0 / 0.625, 94.0 / 0.625, s, 1.3, Some(-2.0), true, false).is_none() {
+        text_center(list, assets, assets.light, &score_text, 220.0 / 0.625, 94.0 / 0.625, big_h, Colour::WHITE, s);
     }
 
+    // Hit icons at half authored size, centred. Counts use the skin score
+    // font at 1.12×, top-left, 64px to the right of the icon.
+    let img1 = 40.0 / 0.625;
+    let img2 = 240.0 / 0.625;
+    let row_y = [160.0 / 0.625, 220.0 / 0.625, 280.0 / 0.625];
+    let num_dx = 40.0 / 0.625;
+    let num_dy = if v2 { -16.0 / 0.625 } else { -25.0 / 0.625 };
     let rows = [
-        ("hit300", great, 0i32, 0i32),
-        ("hit100", ok, 0, 1),
-        ("hit50", meh, 0, 2),
-        ("hit300g", 0, 1, 0),
-        ("hit100k", 0, 1, 1),
-        ("hit0", miss, 1, 2),
+        ("hit300", great, img1, row_y[0]),
+        ("hit100", ok, img1, row_y[1]),
+        ("hit50", meh, img1, row_y[2]),
+        ("hit300g", 0, img2, row_y[0]),
+        ("hit100k", 0, img2, row_y[1]),
+        ("hit0", miss, img2, row_y[2]),
     ];
-    let num_dy = if v2 { -16.0 } else { -25.0 };
-    for (name, count, col, row) in rows {
-        // Hit sprite is centred on the stable anchor (drawImage origin).
-        let x = panel[0] + (40.0 + col as f32 * 200.0) * K;
-        let y = panel[1] + (100.0 + y_off + row as f32 * 60.0) * K;
+    for (name, count, x, y) in rows {
         if let Some(tex) = skin.legacy_texture(name) {
-            fit(list, tex, x, y, 0.0, true);
+            let h = tex.display_height() * 0.5;
+            fit(list, tex, x, y, h, true);
         } else {
-            solid(list, s, x - 20.0, y - 14.0, 40.0, 28.0, Colour::from_hex(0xFFFFFF).opacity(0.15));
-            text_left(list, assets, assets.semibold, name.trim_start_matches("hit"), x - 18.0, y - 8.0, 12.0, Colour::WHITE, s);
+            solid(list, s, x - 16.0, y - 12.0, 32.0, 24.0, Colour::from_hex(0xFFFFFF).opacity(0.15));
         }
-        let nx = panel[0] + (80.0 + col as f32 * 200.0) * K;
-        let ncy = panel[1] + (100.0 + y_off + num_dy + row as f32 * 60.0) * K + small_h * 0.5;
+        // Hit counts are bare skin digits. `score-x` is the combo mark
+        // (this skin draws it as コンボ) and belongs on the combo line only.
         let digits = count.to_string();
-        if draw_score_font(list, assets, &digits, nx, ncy, s, 0.0).is_none() {
-            text_left(list, assets, assets.semibold, &digits, nx, ncy - small_h * 0.5, small_h * 0.7, Colour::WHITE, s);
+        let nx = x + num_dx;
+        let ny = y + num_dy;
+        if draw_score_font(list, assets, &digits, nx, ny, s, 1.12, None, false, true).is_none() {
+            text_left(list, assets, assets.semibold, &digits, nx, ny, small_h, Colour::WHITE, s);
         }
     }
 
-    let row4 = 260.0;
-    let row4_off = if v2 { 0.0 } else { -12.0 };
-    let combo_cy = panel[1] + small_h * 0.5 + (row4 + 10.0 + y_off) * K;
+    let row4 = 320.0 / 0.625;
+    let combo_x = 80.0 / 0.625 - 65.0 / 0.625;
+    let combo_y = row4 + 10.0 / 0.625;
     let combo_num = format!("{}x", game.final_max_combo);
-    if draw_score_font(list, assets, &combo_num, panel[0] + 15.0 * K, combo_cy, s, 0.0).is_none() {
-        text_left(list, assets, assets.semibold, &combo_num, panel[0] + 15.0 * K, combo_cy - small_h * 0.5, small_h, Colour::WHITE, s);
+    if draw_score_font(list, assets, &combo_num, combo_x, combo_y, s, 1.12, None, false, true).is_none() {
+        text_left(list, assets, assets.semibold, &combo_num, combo_x, combo_y, small_h, Colour::WHITE, s);
     }
+    let (combo_label, acc_label) = if v2 { ((8.0, 480.0), (291.0, 480.0)) } else { ((8.0, 500.0), (291.0, 500.0)) };
     if let Some(tex) = skin.legacy_texture("ranking-maxcombo") {
-        // 1×1 placeholders (skins that blank the label) are skipped.
         if tex.display_width() > 2.0 && tex.display_height() > 2.0 {
-            let w = tex.display_width();
-            let cx = panel[0] + 4.0 * K + w * 0.5;
-            let cy = panel[1] + (row4 - 5.0 - row4_off + y_off) * K;
-            fit(list, tex, cx, cy, 0.0, true);
+            fit(list, tex, combo_label.0, combo_label.1, 0.0, false);
         }
     } else {
-        text_left(list, assets, assets.regular, "max combo", 8.0, 478.0, 14.0, Colour::WHITE, s);
+        text_left(list, assets, assets.regular, "max combo", combo_label.0, combo_label.1, 14.0, Colour::WHITE, s);
     }
 
     let acc = fmt_accuracy(game.final_accuracy);
-    let acc_x = panel[0] + 195.0 * K;
-    if draw_score_font(list, assets, &acc, acc_x, combo_cy, s, 0.0).is_none()
-        && draw_score_font(list, assets, acc.trim_end_matches('%'), acc_x, combo_cy, s, 0.0).is_none()
+    let acc_x = 280.0 / 0.625 - 86.0 / 0.625;
+    if draw_score_font(list, assets, &acc, acc_x, combo_y, s, 1.12, None, false, true).is_none()
+        && draw_score_font(list, assets, acc.trim_end_matches('%'), acc_x, combo_y, s, 1.12, None, false, true).is_none()
     {
-        text_left(list, assets, assets.semibold, &acc, acc_x, combo_cy - small_h * 0.5, small_h, Colour::WHITE, s);
+        text_left(list, assets, assets.semibold, &acc, acc_x, combo_y, small_h, Colour::WHITE, s);
     }
     if let Some(tex) = skin.legacy_texture("ranking-accuracy") {
         if tex.display_width() > 2.0 && tex.display_height() > 2.0 {
-            let w = tex.display_width();
-            let cx = panel[0] + 183.0 * K + w * 0.5;
-            let cy = panel[1] + (row4 - 3.0 - row4_off + y_off) * K;
-            fit(list, tex, cx, cy, 0.0, true);
+            fit(list, tex, acc_label.0, acc_label.1, 0.0, false);
         }
     } else {
-        text_left(list, assets, assets.regular, "accuracy", 291.0, 478.0, 14.0, Colour::WHITE, s);
+        text_left(list, assets, assets.regular, "accuracy", acc_label.0, acc_label.1, 14.0, Colour::WHITE, s);
     }
 
     let (gx, gy) = (256.0, 608.0);
