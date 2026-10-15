@@ -237,62 +237,150 @@ fn sample_gradient(stops: &[(f64, u32)], stars: f64) -> Colour {
 
 // -- ModDisplay ----------------------------------------------------------------
 
-/// One mod chip: acronym + `OsuColour.ForModType` colour + the built-in
-/// icon's index into `MOD_ICON_NAMES`.
-fn mod_list(mods: &Mods) -> Vec<(&'static str, u32, u16)> {
-    let mut v: Vec<(&'static str, u32, u16)> = Vec::new();
-    // DifficultyReduction (Lime1).
+/// `ModIcon.MOD_ICON_SIZE` (80) times `ModDisplay.MOD_ICON_SCALE` (0.6):
+/// the gameplay HUD chip (`HUDOverlay`'s top-right `ModDisplay`).
+pub const GAMEPLAY_MOD_BOX: f32 = 48.0;
+/// Expanded `ModDisplay` spacing (`TransformSpacingTo(5, -10)`).
+pub const GAMEPLAY_MOD_GAP: f32 = 5.0;
+
+/// One active mod, in lazer `Mods.AsOrdered` order (`ModType`, then acronym).
+pub struct ModChip {
+    /// Shown in tests and available to callers. The badge itself is a sprite.
+    #[allow(dead_code)]
+    pub acronym: &'static str,
+    /// `OsuColour.ForModType`.
+    pub colour: u32,
+    /// Index into `MOD_ICON_NAMES` / `Region::ModIcon`.
+    pub icon: u16,
+    /// Stable skin element. `None` for mods a legacy skin has no sprite
+    /// for (Classic). A present name is used only when the user skin
+    /// actually ships the file.
+    pub legacy: Option<&'static str>,
+}
+
+/// Mods that should draw an icon. NC replaces DT and PF replaces SD, matching
+/// `OsuRuleset.ConvertFromLegacyMods`.
+pub fn active_mods(mods: &Mods) -> Vec<ModChip> {
+    let mut v = Vec::new();
+    // DifficultyReduction (Lime1): EZ, HT, NF.
     let lime = 0xB2FF66;
-    // DifficultyIncrease (Red1).
+    // DifficultyIncrease (Red1): DT, FL, HD, HR, NC, PF, SD.
     let red = 0xFF6666;
     // Automation (Blue1).
     let blue = 0x66CCFF;
     // Conversion (Purple1).
     let purple = 0x8C66FF;
-    // System (Yellow).
+    // System (Yellow): SV2, TD.
     let yellow = 0xFFCC22;
+    let push = |v: &mut Vec<ModChip>, acronym, colour, icon, legacy: Option<&'static str>| {
+        v.push(ModChip { acronym, colour, icon, legacy });
+    };
     if mods.easy {
-        v.push(("EZ", lime, 0));
-    }
-    if mods.no_fail {
-        v.push(("NF", lime, 1));
+        push(&mut v, "EZ", lime, 0, Some("selection-mod-easy"));
     }
     if mods.half_time {
-        v.push(("HT", lime, 8));
+        push(&mut v, "HT", lime, 8, Some("selection-mod-halftime"));
     }
-    if mods.hidden {
-        v.push(("HD", red, 2));
-    }
-    if mods.hard_rock {
-        v.push(("HR", red, 3));
-    }
-    if mods.sudden_death {
-        v.push(("SD", red, 4));
-    }
-    if mods.perfect {
-        v.push(("PF", red, 5));
+    if mods.no_fail {
+        push(&mut v, "NF", lime, 1, Some("selection-mod-nofail"));
     }
     if mods.nightcore {
-        v.push(("NC", red, 7));
+        push(&mut v, "NC", red, 7, Some("selection-mod-nightcore"));
     } else if mods.double_time {
-        v.push(("DT", red, 6));
+        push(&mut v, "DT", red, 6, Some("selection-mod-doubletime"));
     }
     if mods.flashlight {
-        v.push(("FL", red, 9));
+        push(&mut v, "FL", red, 9, Some("selection-mod-flashlight"));
     }
-    if mods.spun_out {
-        v.push(("SO", blue, 10));
+    if mods.hidden {
+        push(&mut v, "HD", red, 2, Some("selection-mod-hidden"));
+    }
+    if mods.hard_rock {
+        push(&mut v, "HR", red, 3, Some("selection-mod-hardrock"));
+    }
+    if mods.perfect {
+        push(&mut v, "PF", red, 5, Some("selection-mod-perfect"));
+    } else if mods.sudden_death {
+        push(&mut v, "SD", red, 4, Some("selection-mod-suddendeath"));
     }
     if mods.classic {
-        v.push(("CL", purple, 11));
+        push(&mut v, "CL", purple, 11, None);
+    }
+    if mods.spun_out {
+        push(&mut v, "SO", blue, 10, Some("selection-mod-spunout"));
     }
     if mods.score_v2 {
-        v.push(("SV2", yellow, 12));
+        push(&mut v, "SV2", yellow, 12, Some("selection-mod-scorev2"));
     }
     if mods.touch_device {
-        v.push(("TD", yellow, 13));
+        push(&mut v, "TD", yellow, 13, Some("selection-mod-touchdevice"));
     }
     v
+}
+
+/// Sizing for [`draw_mod_icon`]. Lengths are virtual units; `scale` is
+/// `Mapper::virt` (virtual unit to screen px).
+pub enum ModIconFit {
+    /// Lazer `ModIcon`: the hex (or a user `selection-mod-*`) fits in a
+    /// square of side `box`.
+    Box { side: f32, scale: f32 },
+    /// Stable ranking: a user `selection-mod-*` at its authored display
+    /// size. A skin that omits the element falls back to the osu-resources
+    /// hex of side `fallback`.
+    Native { scale: f32, fallback: f32 },
+}
+
+/// Draw one mod.
+///
+/// The user skin wins when it has the matching `selection-mod-*` (stable
+/// skins ship these as full-colour badges). Otherwise the chip is lazer's
+/// `ModIcon`: `Icons/BeatmapDetails/mod-icon` tinted with the mod-type
+/// colour, and the `Icons/Mods/mod-*` glyph at
+/// `Interpolation.ValueAt(0.1, Black, backgroundColour)`.
+pub fn draw_mod_icon(list: &mut DrawList, assets: &Assets, center_virtual: [f32; 2], fit: ModIconFit, chip: &ModChip) {
+    let scale = match fit {
+        ModIconFit::Box { scale, .. } | ModIconFit::Native { scale, .. } => scale,
+    };
+    let center = [center_virtual[0] * scale, center_virtual[1] * scale];
+    if let Some(name) = chip.legacy {
+        if let Some(tex) = assets.skin.legacy_texture(name) {
+            let (dw, dh) = (tex.display_width().max(1.0), tex.display_height().max(1.0));
+            let (w, h) = match fit {
+                ModIconFit::Box { side, scale } => {
+                    let k = side / dw.max(dh);
+                    (dw * k * scale, dh * k * scale)
+                }
+                ModIconFit::Native { scale, .. } => (dw * scale, dh * scale),
+            };
+            list.image(assets.atlas, tex.region, center, [w, h], 0.0, Colour::WHITE, Blend::Alpha);
+            return;
+        }
+    }
+    let side = match fit {
+        ModIconFit::Box { side, .. } => side,
+        ModIconFit::Native { fallback, .. } => fallback,
+    };
+    let col = Colour::from_hex(chip.colour);
+    // Glyph sits flush with the hex: the 135-wide asset's hex is 131×92,
+    // and the component is square so the height ratio uses 135 too.
+    list.image(
+        assets.atlas,
+        crate::draw::Region::ModIconBg,
+        center,
+        [side * scale, side * (100.0 / 135.0) * scale],
+        0.0,
+        col,
+        Blend::Alpha,
+    );
+    list.image(
+        assets.atlas,
+        crate::draw::Region::ModIcon(chip.icon),
+        center,
+        [side * (131.0 / 135.0) * scale, side * (92.0 / 135.0) * scale],
+        0.0,
+        Colour::lerp(Colour::from_hex(0x000000), col, 0.1),
+        Blend::Alpha,
+    );
 }
 
 // -- Formatting -----------------------------------------------------------------
@@ -888,7 +976,7 @@ pub fn draw(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut DrawList
     };
     let creator_name = if creator_line.is_empty() { String::new() } else { game.map_meta.creator.clone() };
     let creator_h = if creator_line.is_empty() { 0.0 } else { line_h(assets.regular, &creator_line, 12.0) };
-    let mods = mod_list(&game.mods);
+    let mods = active_mods(&game.mods);
     let mods_row_h = if mods.is_empty() { 22.0 } else { 40.0 };
 
     let (row1, row2) = HitStat::rows(&game.final_statistics, &game.final_maximum_statistics);
@@ -1121,32 +1209,14 @@ pub fn draw(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut DrawList
         Blend::Alpha,
     );
     rx += pill_w + 5.0;
-    // Mod chips (`ModIcon` at ModDisplay scale 0.5 -> 40px wide): the
-    // white hexagonal background tinted with the mod type colour, and
-    // the icon glyph in the near-black lerp lazer derives from it
-    // (`Interpolation.ValueAt(0.1, Black, backgroundColour)`).
+    // Mod chips. Lazer sizes `ModIcon` (80) by `ModDisplay.MOD_ICON_SCALE`
+    // (0.6) and then by this row's `Scale = 0.5`, which is 24. The row
+    // here uses 40 so the badges stay readable next to the 22-tall star
+    // pill. A user skin's `selection-mod-*` replaces the hex for that mod.
     if !mods.is_empty() {
         rx += 5.0;
-        for (_, col, icon) in &mods {
-            let mc = px([rx + 20.0, row_c]);
-            list.image(
-                assets.atlas,
-                crate::draw::Region::ModIconBg,
-                mc,
-                [40.0 * s, 40.0 * (100.0 / 135.0) * s],
-                0.0,
-                Colour::from_hex(*col),
-                Blend::Alpha,
-            );
-            list.image(
-                assets.atlas,
-                crate::draw::Region::ModIcon(*icon),
-                mc,
-                [40.0 * (131.0 / 135.0) * s, 40.0 * (92.0 / 135.0) * s],
-                0.0,
-                Colour::lerp(Colour::from_hex(0x000000), Colour::from_hex(*col), 0.1),
-                Blend::Alpha,
-            );
+        for chip in &mods {
+            draw_mod_icon(list, assets, [rx + 20.0, row_c], ModIconFit::Box { side: 40.0, scale: s }, chip);
             rx += 45.0;
         }
     }
@@ -2312,7 +2382,8 @@ fn draw_score_font(
 /// (panel at y=102, grade 192px from the right edge, graph at
 /// (256, 608)). Sprites are the user skin's `ranking-*` / `hit*` /
 /// `score-*` / `selection-mod-*` elements; a missing sprite is drawn
-/// in place.
+/// in place. Mod badges use the user skin's `selection-mod-*` when that
+/// file exists, and the osu-resources hex glyph otherwise.
 pub fn draw_stable(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut DrawList) {
     /// stable osu!pixel → virtual unit (`STABLE_MAGIC_SCALE_FACTOR`).
     const K: f32 = 1.6;
@@ -2611,40 +2682,52 @@ pub fn draw_stable(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut D
         140.0
     };
 
-    // Mods overlap in a row grown leftward from the right edge
-    // (stable draws each icon then steps 20 osu!px left).
-    let mut mx = cw - 20.0 * K;
-    let my = 260.0 * K;
-    let mod_names: &[(&str, bool)] = &[
-        ("selection-mod-touchdevice", game.mods.touch_device),
-        ("selection-mod-perfect", game.mods.perfect),
-        ("selection-mod-suddendeath", game.mods.sudden_death && !game.mods.perfect),
-        ("selection-mod-easy", game.mods.easy),
-        ("selection-mod-hidden", game.mods.hidden),
-        ("selection-mod-hardrock", game.mods.hard_rock),
-        ("selection-mod-nightcore", game.mods.nightcore),
-        ("selection-mod-doubletime", game.mods.double_time && !game.mods.nightcore),
-        ("selection-mod-flashlight", game.mods.flashlight),
-        ("selection-mod-spunout", game.mods.spun_out),
-        ("selection-mod-scorev2", game.mods.score_v2),
-        ("selection-mod-nofail", game.mods.no_fail),
-        ("selection-mod-halftime", game.mods.half_time),
-    ];
-    let mut drew_mod = false;
-    for (name, on) in mod_names {
-        if !on {
-            continue;
-        }
-        drew_mod = true;
-        if let Some(tex) = skin.legacy_texture(name) {
-            let h = tex.display_height();
-            let w = tex.display_width();
-            fit(list, tex, mx, my + h * 0.5, 0.0, true);
-            mx -= 20.0 * K;
-            let _ = w;
-        }
+    // Mods overlap in a row grown leftward from the right edge.
+    // danser `RankingPanel.loadMods`: centre of the first icon at
+    // (screenWidth - 64, 416), then 32 virtual units (20 osu!px) left.
+    // The first mod in lazer order sits on the right, same as danser's
+    // first `StringFull` entry. A skin sprite draws at its authored
+    // size; anything the skin omits (including Classic) uses the
+    // osu-resources hex at a similar 80-unit box.
+    let mut mx = cw - 64.0;
+    let my = 416.0;
+    for chip in active_mods(&game.mods) {
+        draw_mod_icon(list, assets, [mx, my], ModIconFit::Native { scale: s, fallback: 80.0 }, &chip);
+        mx -= 32.0;
     }
-    if !drew_mod {
-        let _ = rank_h;
+    let _ = rank_h;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::active_mods;
+    use osu_replay_judge::mods::legacy_bits;
+    use osu_replay_judge::mods::Mods;
+
+    #[test]
+    fn active_mods_follow_lazer_type_then_acronym_order() {
+        // EZ+NF (reduction), HD+HR+DT (increase), plus Classic on a stable score.
+        let bits = legacy_bits::EASY
+            | legacy_bits::NOFAIL
+            | legacy_bits::HIDDEN
+            | legacy_bits::HARDROCK
+            | legacy_bits::DOUBLETIME;
+        let mods = Mods::from_legacy(bits, true).unwrap();
+        let names: Vec<_> = active_mods(&mods).iter().map(|m| m.acronym).collect();
+        assert_eq!(names, ["EZ", "NF", "DT", "HD", "HR", "CL"]);
+    }
+
+    #[test]
+    fn nightcore_and_perfect_replace_their_base_mods() {
+        let bits = legacy_bits::NIGHTCORE | legacy_bits::DOUBLETIME | legacy_bits::PERFECT | legacy_bits::SUDDENDEATH;
+        let mods = Mods::from_legacy(bits, false).unwrap();
+        let names: Vec<_> = active_mods(&mods).iter().map(|m| m.acronym).collect();
+        assert_eq!(names, ["NC", "PF"]);
+        assert!(active_mods(&mods).iter().all(|m| m.legacy.is_some()));
+        let classic = Mods::from_legacy(0, true).unwrap();
+        let cl = active_mods(&classic);
+        assert_eq!(cl.len(), 1);
+        assert_eq!(cl[0].acronym, "CL");
+        assert!(cl[0].legacy.is_none());
     }
 }

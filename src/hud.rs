@@ -6,7 +6,9 @@
 //! `LegacyScoreCounter` / `LegacyAccuracyCounter` /
 //! `LegacyDefaultComboCounter` / `LegacyHealthDisplay` /
 //! `LegacyKeyCounterDisplay` (see `LegacyHud` below). The UR bar has no
-//! legacy equivalent and always uses the argon implementation.
+//! legacy equivalent and always uses the argon implementation. Active
+//! mods draw as lazer `ModDisplay` chips under the accuracy column
+//! (osu-resources icons, or the user skin's `selection-mod-*`).
 
 use crate::draw::{draw_ttf_text, ttf_measure, value_at, Atlas, Blend, Colour, DrawList, Easing, Region};
 use crate::game::{health_at, key_counts_at, key_state_at, GameData, KEY_ACTIONS};
@@ -679,6 +681,13 @@ impl HudState {
                 }
             }
         }
+        // --- Mods (`HUDOverlay.ModDisplay`, top-right, under the counters) --
+        // Replay playback keeps the row up (`replayLoaded` fades it in and
+        // leaves it). Expanded spacing: a video cannot hover to un-stack
+        // the contracted (-25) rest pose. User `selection-mod-*` replaces
+        // the osu-resources hex per mod.
+        self.draw_mods(game, assets, list, m);
+
         // --- Health bar ------------------------------------------------------------
         let health = health_at(game, t);
         if legacy_health {
@@ -848,18 +857,9 @@ impl HudState {
         }
         // The top-right column's current bottom: the accuracy counter
         // (legacy: below the score run; argon: 20+30), plus the PP
-        // counter's 10-unit gap and 0.8-scale digit boxes (24) when shown.
-        let legacy_acc = !self.argon_hud
-            && assets.skin.is_legacy()
-            && self.legacy.as_ref().is_some_and(|l| l.score.is_some());
-        let mut bottom = if legacy_acc {
-            self.l_score_h + 9.0 + self.l_acc_h
-        } else {
-            20.0 + COUNTER_BOX
-        };
-        if self.pp_display && !game.pp_events.is_empty() {
-            bottom += 10.0 + COUNTER_BOX * 0.8;
-        }
+        // counter's 10-unit gap and 0.8-scale digit boxes (24) when shown,
+        // plus the mod row when the play has mods.
+        let bottom = self.top_right_column_bottom(game, assets) + self.mod_row_span(game);
         let side = 150.0;
         let cx = m.screen_w / m.virt - 20.0 - side * 0.5;
         let cy = bottom + 12.0 + side * 0.5;
@@ -1688,6 +1688,59 @@ fn legacy_fill_colour(hp: f64) -> Colour {
 }
 
 impl HudState {
+    /// Bottom of the top-right score / accuracy / PP stack, in virtual
+    /// units. The mod row and the hit-offset heatmap hang under this.
+    fn top_right_column_bottom(&self, game: &GameData, assets: &Assets) -> f32 {
+        let legacy_acc = !self.argon_hud
+            && assets.skin.is_legacy()
+            && self.legacy.as_ref().is_some_and(|l| l.score.is_some());
+        let mut bottom = if legacy_acc {
+            self.l_score_h + 9.0 + self.l_acc_h
+        } else {
+            20.0 + COUNTER_BOX
+        };
+        if self.pp_display && !game.pp_events.is_empty() {
+            bottom += 10.0 + COUNTER_BOX * 0.8;
+        }
+        bottom
+    }
+
+    /// Vertical space the mod row occupies under the counters (gap + chip).
+    fn mod_row_span(&self, game: &GameData) -> f32 {
+        if crate::results::active_mods(&game.mods).is_empty() {
+            0.0
+        } else {
+            10.0 + crate::results::GAMEPLAY_MOD_BOX
+        }
+    }
+
+    /// `HUDOverlay` top-right `ModDisplay`. Right edge inset 10, sitting
+    /// one margin below the accuracy/PP column. Chips are
+    /// `MOD_ICON_SIZE * MOD_ICON_SCALE` (48) with expanded spacing 5.
+    fn draw_mods(&self, game: &GameData, assets: &Assets, list: &mut DrawList, m: &Mapper) {
+        let mods = crate::results::active_mods(&game.mods);
+        if mods.is_empty() {
+            return;
+        }
+        let box_v = crate::results::GAMEPLAY_MOD_BOX;
+        let gap = crate::results::GAMEPLAY_MOD_GAP;
+        let n = mods.len() as f32;
+        let row_w = n * box_v + (n - 1.0) * gap;
+        let right = m.screen_w / m.virt - 10.0;
+        let mut x = right - row_w + box_v * 0.5;
+        let cy = self.top_right_column_bottom(game, assets) + 10.0 + box_v * 0.5;
+        for chip in &mods {
+            crate::results::draw_mod_icon(
+                list,
+                assets,
+                [x, cy],
+                crate::results::ModIconFit::Box { side: box_v, scale: m.virt },
+                chip,
+            );
+            x += box_v + gap;
+        }
+    }
+
     /// `LegacyScoreCounter`: TopRight origin TopRight, Scale 0.96, margin
     /// horizontal 10; score digits, FixedWidth, zero-padded to 6
     /// (standardised) / 8 (classic) digits (`GameplayScoreCounter`).
