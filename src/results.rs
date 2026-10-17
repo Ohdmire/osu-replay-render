@@ -777,6 +777,31 @@ fn draw_gradient_arc(
     }
 }
 
+/// Full-screen beatmap background for the results screen. Lazer blurs it
+/// and tints `Gray(0.5)`; stable draws the raw cover. The beatmap image
+/// alone — not the last gameplay frame.
+pub fn draw_backdrop(style: ResultsStyle, view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut DrawList) {
+    if !view.has_bg {
+        return;
+    }
+    let (region, colour) = match style {
+        ResultsStyle::Lazer => (crate::draw::Region::BackgroundBlurred, Colour::rgb(0.5, 0.5, 0.5)),
+        ResultsStyle::Stable => (crate::draw::Region::Background, Colour::WHITE),
+    };
+    let rect = assets.atlas.region_rect(region);
+    let (rw, rh) = (rect.x1 - rect.x0, rect.y1 - rect.y0);
+    let k = (m.screen_w / rw).max(m.screen_h / rh);
+    list.image(
+        assets.atlas,
+        region,
+        [m.screen_w * 0.5, m.screen_h * 0.5],
+        [rw * k, rh * k],
+        0.0,
+        colour,
+        Blend::Alpha,
+    );
+}
+
 /// The full results screen. `mapper` supplies the virtual-unit scale.
 pub fn draw(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut DrawList) {
     let game = view.game;
@@ -789,28 +814,10 @@ pub fn draw(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut DrawList
     let failed_s = game.final_accuracy >= ACC_S && rank == Rank::A;
     let score = if view.classic_score { game.final_classic_score } else { game.final_score };
 
-    // ------------------------------------------------------------------
-    // Background: the beatmap image, pre-blurred in the atlas
-    // (`ResultsScreen` entering: `BlurAmount = BACKGROUND_BLUR = 10`,
-    // the framework blur sigma) and faded to 50% grey
-    // (`ApplyToBackground(b => b.FadeColour(OsuColour.Gray(0.5)))`),
-    // cover-fitted to the screen. Without a beatmap background: the
-    // clear colour.
-    // ------------------------------------------------------------------
-    if view.has_bg {
-        let rect = assets.atlas.region_rect(crate::draw::Region::BackgroundBlurred);
-        let (rw, rh) = (rect.x1 - rect.x0, rect.y1 - rect.y0);
-        let k = (m.screen_w / rw).max(m.screen_h / rh);
-        list.image(
-            assets.atlas,
-            crate::draw::Region::BackgroundBlurred,
-            [m.screen_w * 0.5, m.screen_h * 0.5],
-            [rw * k, rh * k],
-            0.0,
-            Colour::rgb(0.5, 0.5, 0.5),
-            Blend::Alpha,
-        );
-    }
+    // Blurred beatmap image at Gray(0.5). Painted again at full opacity
+    // by `draw_backdrop` before this fade, so the plate does not reveal
+    // the playfield underneath.
+    draw_backdrop(ResultsStyle::Lazer, view, assets, m, list);
 
     // ------------------------------------------------------------------
     // Bottom bar (`ResultsScreen`'s bottom grid row: #333 box).
@@ -2403,20 +2410,7 @@ pub fn draw_stable(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut D
     let meh = stat_count(&game.final_statistics, HitResult::Meh);
     let miss = stat_count(&game.final_statistics, HitResult::Miss);
 
-    if view.has_bg {
-        let rect = assets.atlas.region_rect(crate::draw::Region::Background);
-        let (rw, rh) = (rect.x1 - rect.x0, rect.y1 - rect.y0);
-        let k = (m.screen_w / rw).max(m.screen_h / rh);
-        list.image(
-            assets.atlas,
-            crate::draw::Region::Background,
-            [m.screen_w * 0.5, m.screen_h * 0.5],
-            [rw * k, rh * k],
-            0.0,
-            Colour::WHITE,
-            Blend::Alpha,
-        );
-    }
+    draw_backdrop(ResultsStyle::Stable, view, assets, m, list);
 
     let fit = |list: &mut DrawList, tex: SkinTexture, x: f32, y: f32, target_h: f32, centre: bool| {
         let nh = tex.display_height().max(1.0);

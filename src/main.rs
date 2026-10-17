@@ -952,33 +952,29 @@ fn main() {
     // Resolve the beatmap background: the `[Events]` background image,
     // decoded into the atlas (raw + pre-blurred copy). Gameplay draws it
     // full-screen at `--bg-opacity` when `--bg` is on (default
-    // 1 - DimLevel 0.7, matching lazer); the results screen always draws
-    // the blurred copy (lazer `ResultsScreen`). 背景被故事板接管时不解码
-    // 不上传——由故事板自己绘制那张背景(随故事板暗度衰减)。
-    let bg_image: Option<Image> = if sb_replaces {
-        eprintln!("background: skipped (replaced by the storyboard)");
-        None
-    } else {
-        match game.map_background.clone() {
-            Some(name) => {
-                let p = map_dir.join(&name);
-                match decode_image_file(&p) {
-                    Ok(img) => {
-                        eprintln!("background: {} ({}x{})", p.display(), img.width, img.height);
-                        Some(img)
-                    }
-                    Err(e) => {
-                        eprintln!("warning: {} - rendering without background", e);
-                        None
-                    }
+    // 1 - DimLevel 0.7, matching lazer). The results screen always uses
+    // this image — lazer the blurred copy — even when a storyboard
+    // replaces the background during play. The storyboard frame and the
+    // cursor on it are not the results backdrop.
+    let bg_image: Option<Image> = match game.map_background.clone() {
+        Some(name) => {
+            let p = map_dir.join(&name);
+            match decode_image_file(&p) {
+                Ok(img) => {
+                    eprintln!("background: {} ({}x{})", p.display(), img.width, img.height);
+                    Some(img)
+                }
+                Err(e) => {
+                    eprintln!("warning: {} - rendering without background", e);
+                    None
                 }
             }
-            None => {
-                if opts.bg {
-                    eprintln!("warning: beatmap has no background image - rendering without background");
-                }
-                None
+        }
+        None => {
+            if opts.bg {
+                eprintln!("warning: beatmap has no background image - rendering without background");
             }
+            None
         }
     };
 
@@ -1096,7 +1092,9 @@ fn main() {
     state.hit_animations = opts.hit_anim;
     state.hud.offset_heatmap = opts.offset_heatmap;
     state.break_lighten = opts.break_lighten;
-    state.bg_opacity = if has_bg && opts.bg { Some(opts.bg_opacity) } else { None };
+    // Storyboard `ReplacesBackground`: gameplay does not also paint the
+    // raw image (the storyboard draws it). Results still has `has_bg`.
+    state.bg_opacity = if has_bg && opts.bg && !sb_replaces { Some(opts.bg_opacity) } else { None };
     // 任一层(元素/视频)激活即画故事板合成槽位;亮度跟随背景(--bg off
     // 时全亮 1.0)。
     let sb_active = sb_layer.as_ref().is_some_and(|l| l.elements_enabled() || l.video_enabled());
@@ -1191,11 +1189,12 @@ fn main() {
         state.results_at = Some(last);
         state.results_style = opts.results_style;
         // Sequential handover: the gameplay fades out (0.35s), then the
-        // results screen appears instantly after the fade-out.
+        // results screen fades in (0.45s). `--results-only` leaves both
+        // counts at 0, so the poster frame is already fully visible.
         state.results_fade_frames = (0.35 * opts.fps).round() as u32;
-        state.results_fadein_frames = 0;
+        state.results_fadein_frames = (0.45 * opts.fps).round() as u32;
         eprintln!(
-            "results: +{} frames ({:.1}s, {:?}, gameplay fade-out 0.35s)",
+            "results: +{} frames ({:.1}s, {:?}, fade-out 0.35s + fade-in 0.45s)",
             results_frames, opts.results, opts.results_style
         );
     }

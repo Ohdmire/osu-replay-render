@@ -809,6 +809,20 @@ pub struct SceneState {
     last_t: f64,
 }
 
+/// `(gameplay alpha, results alpha)` on results frame `n` (0-based).
+/// Gameplay fades out over `fade_out` frames, then stays hidden while the
+/// results screen fades in over `fade_in` frames. Either length of 0 skips
+/// that stage (a 0 fade-in appears at full opacity the frame fade-out ends).
+fn results_handover_alpha(n: u32, fade_out: u32, fade_in: u32) -> (f32, f32) {
+    if n < fade_out {
+        (1.0 - n as f32 / fade_out as f32, 0.0)
+    } else if fade_in == 0 {
+        (0.0, 1.0)
+    } else {
+        (0.0, ((n - fade_out) as f32 / fade_in as f32).min(1.0))
+    }
+}
+
 impl SceneState {
     pub fn new(game: &GameData, width: u32, height: u32) -> SceneState {
         SceneState {
@@ -885,23 +899,18 @@ impl SceneState {
         let t = snap.time;
 
         // Sequential handover: the gameplay FADES OUT first, then the
-        // results screen FADES IN over the background.
+        // results screen FADES IN over the beatmap background. Once the
+        // fade-out finishes, gameplay stays at 0 so the last playfield
+        // frame (cursor included) is not the results backdrop.
         let is_results = self.results_at.is_some_and(|ra| t >= ra);
-        let (mut gameplay_alpha, mut results_alpha) = (1.0f32, 0.0f32);
-        if is_results {
+        let (gameplay_alpha, results_alpha) = if is_results {
             let n = self.results_frame;
             self.results_frame += 1;
-            let (fo, fi) = (self.results_fade_frames, self.results_fadein_frames);
-            if n < fo {
-                gameplay_alpha = 1.0 - n as f32 / fo as f32;
-            } else if fi == 0 {
-                results_alpha = 1.0;
-            } else {
-                results_alpha = ((n - fo) as f32 / fi as f32).min(1.0);
-            }
+            results_handover_alpha(n, self.results_fade_frames, self.results_fadein_frames)
         } else {
             self.results_frame = 0;
-        }
+            (1.0, 0.0)
+        };
         let prev_alpha = list.global_alpha;
         list.global_alpha = gameplay_alpha;
 
@@ -971,6 +980,10 @@ impl SceneState {
             v
         };
 
+        // Playfield only while it is still visible. After the fade-out the
+        // results screen owns the frame; drawing this would put the cursor
+        // back under the beatmap background.
+        if gameplay_alpha > 0.001 {
         // 0. Beatmap background (`--bg`): full-screen behind everything at
         // the configured opacity (lazer's BackgroundScreen sprite fills the
         // screen cover-cropped — the atlas texture is pre-cropped to the
@@ -1140,22 +1153,27 @@ impl SceneState {
             }
             draw_cursor(self.legacy.as_ref(), assets, list, cursor_screen, self.cursor_expand as f32, self.cursor_size, self.mapper.virt, t);
         }
+        }
 
         // 9. Results screen: fades in once the gameplay has fully faded
-        // out (sequential, not a cross-fade).
+        // out (sequential, not a cross-fade). The backdrop is the beatmap
+        // image at full opacity; only the panel fades over it.
         list.global_alpha = prev_alpha;
+        let results_view = crate::results::ResultsView {
+            game,
+            classic_score: self.hud.is_classic_score(),
+            has_bg: self.has_bg,
+            has_avatar: self.has_avatar,
+        };
+        if is_results && gameplay_alpha <= 0.001 {
+            crate::results::draw_backdrop(self.results_style, &results_view, assets, &self.mapper, list);
+        }
         if results_alpha > 0.0 {
-            let view = crate::results::ResultsView {
-                game,
-                classic_score: self.hud.is_classic_score(),
-                has_bg: self.has_bg,
-                has_avatar: self.has_avatar,
-            };
             list.global_alpha = results_alpha;
             if self.results_style == crate::results::ResultsStyle::Stable {
-                crate::results::draw_stable(&view, assets, &self.mapper, list);
+                crate::results::draw_stable(&results_view, assets, &self.mapper, list);
             } else {
-                crate::results::draw(&view, assets, &self.mapper, list);
+                crate::results::draw(&results_view, assets, &self.mapper, list);
             }
             list.global_alpha = prev_alpha;
         }
@@ -3174,6 +3192,19 @@ fn repeat_anchor(obj: &ObjView, p0: f64, p1: f64, at_end: bool, frozen: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn results_fade_in_starts_only_after_gameplay_is_gone() {
+        let (fo, fi) = (21, 27);
+        assert_eq!(results_handover_alpha(0, fo, fi), (1.0, 0.0));
+        let (g, r) = results_handover_alpha(fo - 1, fo, fi);
+        assert!(g > 0.0 && g < 0.1 && r == 0.0);
+        assert_eq!(results_handover_alpha(fo, fo, fi), (0.0, 0.0));
+        let (g, r) = results_handover_alpha(fo + fi, fo, fi);
+        assert_eq!(g, 0.0);
+        assert!((r - 1.0).abs() < 1e-5);
+        assert_eq!(results_handover_alpha(0, 0, 0), (0.0, 1.0));
+    }
 
     /// break_lighten_at:前奏常亮 → gameplay 起点淡回 → break 淡入 →
     /// break 尾(end-325)淡出 → 曲末再淡入;边沿 800ms OutQuint。
