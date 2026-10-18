@@ -178,8 +178,10 @@ fn colour_for_hit_result(result: HitResult) -> Colour {
     }
 }
 
-/// Star-rating spectrum (`OsuColour.STAR_DIFFICULTY_SPECTRUM`,
-/// `ColourUtils.SampleFromLinearGradient`).
+/// Star-rating spectrum (`OsuColour.STAR_DIFFICULTY_SPECTRUM`).
+/// The pill background and the difficulty name use this. The two stops
+/// at 0.1 are intentional: below 0.1 is grey, 0.1 itself is already blue
+/// (`SampleFromLinearGradient` skips a zero-width segment).
 fn star_colour(stars: f64) -> Colour {
     const STOPS: [(f64, u32); 13] = [
         (0.1, 0xAAAAAA),
@@ -199,8 +201,11 @@ fn star_colour(stars: f64) -> Colour {
     sample_gradient(&STOPS, stars)
 }
 
-/// Star-rating pill text colour (`OsuColour.ForStarDifficultyText`): black 75%
-/// below 6.5, `Orange1` until the 9.0 gradient cutoff, then the text spectrum.
+/// Star-rating text (`OsuColour.ForStarDifficultyText`), the colour of the
+/// number and the star icon — not the pill. Below 6.5 the text is black at
+/// 75%; from 6.5 up to 9 it is `Orange1`; at 9 and above it walks
+/// `STAR_DIFFICULTY_TEXT_SPECTRUM`. The value is rounded to 2 decimals
+/// first, the same way the other ports compare the cutoffs.
 fn star_text_colour(stars: f64) -> Colour {
     const TEXT_STOPS: [(f64, u32); 5] = [
         (9.0, 0xF6F05C),
@@ -209,6 +214,7 @@ fn star_text_colour(stars: f64) -> Colour {
         (11.5, 0xC645B8),
         (12.4, 0x6563DE),
     ];
+    let stars = (stars * 100.0).round() / 100.0;
     if stars < 6.5 {
         return Colour::from_hex(0x000000).opacity(0.75);
     }
@@ -218,19 +224,23 @@ fn star_text_colour(stars: f64) -> Colour {
     sample_gradient(&TEXT_STOPS, stars)
 }
 
-/// `ColourUtils.SampleFromLinearGradient`: piecewise-linear sample over `stops`.
+/// `ColourUtils.SampleFromLinearGradient` plus framework `Color4` interpolation
+/// (sRGB → linear → lerp → sRGB). A stop is used only while `stars` is still
+/// below the next stop, so two stops that share a position collapse to the
+/// later colour.
 fn sample_gradient(stops: &[(f64, u32)], stars: f64) -> Colour {
     let stars = (stars * 100.0).round() / 100.0;
-    if stars <= stops[0].0 {
+    if stars < stops[0].0 {
         return Colour::from_hex(stops[0].1);
     }
     for w in stops.windows(2) {
         let (p0, c0) = w[0];
         let (p1, c1) = w[1];
-        if stars <= p1 {
-            let t = if p1 - p0 <= 0.0 { 0.0 } else { ((stars - p0) / (p1 - p0)).clamp(0.0, 1.0) };
-            return Colour::lerp(Colour::from_hex(c0), Colour::from_hex(c1), t as f32);
+        if stars >= p1 {
+            continue;
         }
+        let t = if p1 <= p0 { 0.0 } else { ((stars - p0) / (p1 - p0)) as f32 };
+        return Colour::lerp_linear(Colour::from_hex(c0), Colour::from_hex(c1), t.clamp(0.0, 1.0));
     }
     Colour::from_hex(stops[stops.len() - 1].1)
 }
@@ -1238,7 +1248,7 @@ pub fn draw(view: &ResultsView, assets: &Assets, m: &Mapper, list: &mut DrawList
         &diff,
         px([c[0], y + diff_h * 0.5]),
         16.0 * s,
-        Colour::WHITE,
+        star_colour(game.stars),
         0.0,
         Blend::Alpha,
     );
@@ -2723,5 +2733,29 @@ mod tests {
         assert_eq!(cl.len(), 1);
         assert_eq!(cl[0].acronym, "CL");
         assert!(cl[0].legacy.is_none());
+    }
+
+    fn near(c: super::Colour, hex: u32, alpha: f32) {
+        let e = super::Colour::from_hex(hex).opacity(alpha);
+        assert!((c.r - e.r).abs() < 0.02, "r {} vs {}", c.r, e.r);
+        assert!((c.g - e.g).abs() < 0.02, "g {} vs {}", c.g, e.g);
+        assert!((c.b - e.b).abs() < 0.02, "b {} vs {}", c.b, e.b);
+        assert!((c.a - e.a).abs() < 0.02, "a {} vs {}", c.a, e.a);
+    }
+
+    #[test]
+    fn star_pill_and_text_use_different_curves() {
+        // Below 0.1 is grey; 0.1 itself is the blue stop (zero-width segment).
+        near(super::star_colour(0.05), 0xAAAAAA, 1.0);
+        near(super::star_colour(0.1), 0x4290FB, 1.0);
+        near(super::star_colour(2.5), 0x7CFF4F, 1.0);
+        // Text: black 75% under 6.5, Orange1 until 9, then the text spectrum.
+        near(super::star_text_colour(5.0), 0x000000, 0.75);
+        near(super::star_text_colour(6.51), 0xFFD966, 1.0);
+        near(super::star_text_colour(9.0), 0xF6F05C, 1.0);
+        // 6.51 pill is between magenta and purple, not the text orange.
+        let pill = super::star_colour(6.51);
+        let text = super::star_text_colour(6.51);
+        assert!((pill.r - text.r).abs() + (pill.g - text.g).abs() + (pill.b - text.b).abs() > 0.4);
     }
 }
