@@ -9,7 +9,10 @@ use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
 pub struct SurfaceRenderer {
     renderer: Renderer,
-    surface: wgpu::Surface<'static>,
+    /// Kept across SurfaceView destroy/create so the device, atlas and
+    /// storyboard layers are not rebuilt for every new native window.
+    instance: wgpu::Instance,
+    surface: Option<wgpu::Surface<'static>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     blit_pipeline: wgpu::RenderPipeline,
@@ -23,6 +26,9 @@ pub struct SurfaceRenderer {
     /// (surface_w, surface_h); 0x0 means "not yet usable, skip frames".
     surface_size: (u32, u32),
     frame_aspect: f32,
+    /// Scene+blit of the frame currently on the GPU. The next frame waits
+    /// for this before the storyboard writes the shared atlas.
+    inflight: Option<wgpu::SubmissionIndex>,
 }
 
 const BLIT_SHADER: &str = r#"
@@ -84,6 +90,46 @@ impl SurfaceRenderer {
         (self.renderer.width, self.renderer.height)
     }
 
+    /// Whether a native surface of a real size is currently configured.
+    pub fn has_surface(&self) -> bool {
+        self.surface.is_some() && self.surface_size.0 > 0 && self.surface_size.1 > 0
+    }
+
+    /// Drop only the native swapchain, keeping the wgpu device, atlas and
+    /// storyboard layers alive for the next SurfaceView.
+    pub fn detach_surface(&mut self) {
+        // Drain the last presented submit before releasing the swapchain.
+        if let Some(index) = self.inflight.take() {
+            let _ = self.device.poll(wgpu::PollType::wait_for(index));
+        }
+        self.surface = None;
+        self.surface_size = (0, 0);
+    }
+
+    /// Bind a new native window to the existing device/atlas. This is the
+    /// HCPP SurfaceView recreate path: no adapter/device/texture rebuild.
+    pub fn rebind_surface(
+        &mut self,
+        raw_display: RawDisplayHandle,
+        raw_window: RawWindowHandle,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        // Drop/poll any previous swapchain before replacing it.
+        self.detach_surface();
+        let surface = unsafe {
+            self.instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle: raw_display,
+                raw_window_handle: raw_window,
+            })
+        }
+        .map_err(|e| format!("rebind surface: {e:?}"))?;
+        self.surface = Some(surface);
+        self.surface_size = (0, 0);
+        self.resize(width.max(1), height.max(1));
+        Ok(())
+    }
+
     pub fn device(&self) -> &wgpu::Device {
         &self.device
     }
@@ -131,7 +177,7 @@ impl SurfaceRenderer {
         }))
         .map_err(|e| format!("没有支持该窗口的 GPU 适配器({e})"))?;
 
-        let renderer = Renderer::from_adapter(adapter, width, height, atlas);
+        let renderer = Renderer::from_adapter_with_readback(adapter, width, height, atlas, false);
         eprintln!(
             "wgpu surface: backend={:?} adapter='{}'",
             renderer.adapter().get_info().backend,
@@ -273,7 +319,8 @@ impl SurfaceRenderer {
 
         Ok(SurfaceRenderer {
             renderer,
-            surface,
+            instance,
+            surface: Some(surface),
             device,
             queue,
             blit_pipeline,
@@ -284,7 +331,16 @@ impl SurfaceRenderer {
             alpha_mode,
             surface_size: (0, 0),
             frame_aspect,
+            inflight: None,
         })
+    }
+
+    /// Block until the previous presented frame has finished reading the
+    /// atlas and the scene texture. Call before drawing the storyboard.
+    pub fn begin_frame(&mut self) {
+        if let Some(index) = self.inflight.take() {
+            let _ = self.device.poll(wgpu::PollType::wait_for(index));
+        }
     }
 
     /// 热替换图集(透传给内部离屏 Renderer)。
@@ -303,19 +359,21 @@ impl SurfaceRenderer {
         if width == 0 || height == 0 {
             return;
         }
-        self.surface.configure(
-            &self.device,
-            &wgpu::SurfaceConfiguration {
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                format: self.surface_format,
-                width,
-                height,
-                present_mode: wgpu::PresentMode::Fifo,
-                alpha_mode: self.alpha_mode,
-                view_formats: vec![],
-                desired_maximum_frame_latency: 2,
-            },
-        );
+        if let Some(surface) = &self.surface {
+            surface.configure(
+                &self.device,
+                &wgpu::SurfaceConfiguration {
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    format: self.surface_format,
+                    width,
+                    height,
+                    present_mode: wgpu::PresentMode::Fifo,
+                    alpha_mode: self.alpha_mode,
+                    view_formats: vec![],
+                    desired_maximum_frame_latency: 1,
+                },
+            );
+        }
         let params: [f32; 2] = [self.frame_aspect, width as f32 / height as f32];
         self.queue.write_buffer(&self.params_buf, 0, f32_bytes(&params));
     }
@@ -327,8 +385,10 @@ impl SurfaceRenderer {
         if w == 0 || h == 0 {
             return false;
         }
-        let mut encoder = self.renderer.encode_scene(list, clear);
-        let frame = match self.surface.get_current_texture() {
+        let Some(surface) = &self.surface else {
+            return false;
+        };
+        let frame = match surface.get_current_texture() {
             Ok(frame) => frame,
             // 嵌入式宿主(OPP 的原生子窗口等)在 WebView 缩放/移动/跨屏
             // 时会短暂使交换链失效:静默丢帧会让画面冻结而音频照播 ——
@@ -341,7 +401,16 @@ impl SurfaceRenderer {
             Err(_) => return false,
         };
         let view = frame.texture.create_view(&Default::default());
-        {
+        // Full-window preview at scene resolution: render the scene straight
+        // into the swapchain (no offscreen target, no full-screen blit).
+        let direct = self.surface_format == wgpu::TextureFormat::Bgra8Unorm
+            && (w, h) == (self.renderer.width, self.renderer.height);
+        let mut encoder = if direct {
+            self.renderer.encode_scene_into(list, clear, &view)
+        } else {
+            self.renderer.encode_scene(list, clear)
+        };
+        if !direct {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("blit pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -361,11 +430,8 @@ impl SurfaceRenderer {
             pass.set_bind_group(1, &self.blit_bind, &[]);
             pass.draw(0..6, 0..1);
         }
-        self.queue.submit(Some(encoder.finish()));
+        self.inflight = Some(self.queue.submit(Some(encoder.finish())));
         frame.present();
-        // No device.poll here: window presentation provides the needed
-        // synchronization, and Maintain::Poll busy-syncs against the driver
-        // on some Android GPUs, eating CPU and stalling the frame loop.
         true
     }
 }

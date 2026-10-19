@@ -11,6 +11,18 @@
 //!                          PP counter (`--hud` alone = on)
 //!   --out <file.mp4>       Pipe frames to ffmpeg and encode (default if given)
 //!   --png-dir <dir>        Write PNG frames to a directory instead
+//!   --encoder <name>       auto (default) | x264 | x265 | nvenc | hevc-nvenc
+//!   --preset <name>        x264/x265 preset or NVENC p1..p7 (auto default:
+//!                          veryfast / fast / p4)
+//!   --tune <name>          x264 tune or NVENC hq/ll/ull (NVENC default hq)
+//!   --crf <n>              x264/x265 quality (default 18)
+//!   --cq <n>               NVENC quality (default 22)
+//!   --rc vbr|constqp|cbr   NVENC rate control (default vbr)
+//!   --qp <n>               NVENC QP for --rc constqp
+//!   --gop <n>              keyframe interval
+//!   --ffmpeg-extra <arg>   extra ffmpeg argument (repeatable, applied last)
+//!   --render-only          Benchmark: render+submit only (no readback/encode)
+//!   --no-gpu-yuv           Force BGRA readback (A/B validation of NV12)
 //!   --size <WxH>           Output size (default 1920x1080)
 //!   --fps <n>              Output fps (default 60; frames are sampled from
 //!                          the 60fps game-frame snapshots)
@@ -65,10 +77,9 @@
 //!   --cursor [on|off]      Cursor rendering (default on; off = no cursor
 //!                          and no trail at all)
 
-use osu_replay_render::{build_atlas, decode_image_file, draw, draw::Image, game, hitsound, render::Renderer, scene, skin};
+use osu_replay_render::{build_atlas, decode_image_file, draw, draw::Image, game, hitsound, render::{ReadbackFrame, ReadbackKind, Renderer}, scene, skin};
 
 use scene::{Assets, SceneState};
-use std::io::Write;
 
 /// Hidden mod visual override.
 enum HdMode {
@@ -92,14 +103,33 @@ struct Options {
     skin: String,
     /// User skin directory (`--skin <dir>`): legacy skin rendering.
     skin_dir: Option<std::path::PathBuf>,
-    /// auto (default: probe NVENC, fall back to x264) | x264 | x265 | nvenc.
+    /// auto (default: probe NVENC, fall back to x264) | x264 | x265 |
+    /// nvenc | hevc-nvenc.
     encoder: String,
-    /// crf; 18 by default.
+    /// Backward-compatible `--quality`: sets both `crf` and `cq`.
     quality: u32,
+    /// Encoder speed preset (x264/x265: medium/veryfast/...; NVENC: p1..p7).
+    preset: Option<String>,
+    /// Encoder tune (x264: animation/film/...; NVENC: hq/ll/ull).
+    tune: Option<String>,
+    /// x264/x265 CRF.
+    crf: Option<u32>,
+    /// NVENC CQ.
+    cq: Option<u32>,
+    /// NVENC rate control: vbr (default) | constqp | cbr.
+    rc: Option<String>,
+    /// NVENC QP for `--rc constqp`.
+    qp: Option<u32>,
+    /// Keyframe interval.
+    gop: Option<u32>,
     /// When set: render a single frame at this time and dump geometry JSON.
     probe: Option<f64>,
     limit: Option<usize>,
     ffmpeg_extra: Vec<String>,
+    /// Benchmark: render + submit only, no readback/encode.
+    render_only: bool,
+    /// Force the BGRA readback path (A/B validation of the NV12 path).
+    no_gpu_yuv: bool,
     /// Whether the UR bar's window guide lines (colour axis) render.
     /// Default on; `--guides off` disables them.
     guides: bool,
@@ -221,6 +251,13 @@ struct ConfigJson {
     skin: Option<String>,
     encoder: Option<String>,
     quality: Option<u32>,
+    preset: Option<String>,
+    tune: Option<String>,
+    crf: Option<u32>,
+    cq: Option<u32>,
+    rc: Option<String>,
+    qp: Option<u32>,
+    gop: Option<u32>,
     limit: Option<usize>,
     guides: Option<bool>,
     hud: Option<bool>,
@@ -331,12 +368,23 @@ fn apply_config(opts: &mut Options, c: ConfigJson) -> Result<(), String> {
         set_skin(opts, &v)?;
     }
     if let Some(v) = c.encoder {
-        if !matches!(v.as_str(), "auto" | "x264" | "x265" | "nvenc") {
-            return Err("config encoder must be auto, x264, x265 or nvenc".into());
+        if !matches!(v.as_str(), "auto" | "x264" | "x265" | "nvenc" | "hevc-nvenc") {
+            return Err("config encoder must be auto, x264, x265, nvenc or hevc-nvenc".into());
         }
         opts.encoder = v;
     }
-    if let Some(v) = c.quality { opts.quality = v; }
+    if let Some(v) = c.quality {
+        opts.quality = v;
+        opts.crf = Some(v);
+        opts.cq = Some(v);
+    }
+    if let Some(v) = c.preset { opts.preset = Some(v); }
+    if let Some(v) = c.tune { opts.tune = Some(v); }
+    if let Some(v) = c.crf { opts.crf = Some(v); }
+    if let Some(v) = c.cq { opts.cq = Some(v); }
+    if let Some(v) = c.rc { opts.rc = Some(v); }
+    if let Some(v) = c.qp { opts.qp = Some(v); }
+    if let Some(v) = c.gop { opts.gop = Some(v); }
     if let Some(v) = c.limit { opts.limit = Some(v); }
     if let Some(v) = c.guides { opts.guides = v; }
     if let Some(v) = c.hud { opts.hud = v; }
@@ -393,7 +441,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
     let autoplay = args.iter().any(|a| a == "--autoplay");
     let min_args = if autoplay { 2 } else { 3 };
     if args.len() < min_args {
-        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--hud on|off] [--hd auto|on|off] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro|dir] [--argon-hud] [--guides on|off] [--pp on|off] [--audio [file.mp3]] [--audio-offset ms] [--bg on|off] [--bg-opacity 0..1] [--storyboard on|off] [--video on|off] [--cursor-size 0.1..=2] [--hitsounds] [--skin-colours] [--upscale off|fsr|anime4k] [--results secs|off] [--results-style lazer|stable] [--results-only] [--avatar image] [--config file.json] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
+        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--hud on|off] [--hd auto|on|off] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro|dir] [--argon-hud] [--guides on|off] [--pp on|off] [--audio [file.mp3]] [--audio-offset ms] [--bg on|off] [--bg-opacity 0..1] [--storyboard on|off] [--video on|off] [--cursor-size 0.1..=2] [--hitsounds] [--skin-colours] [--upscale off|fsr|anime4k] [--results secs|off] [--results-style lazer|stable] [--results-only] [--avatar image] [--encoder auto|x264|x265|nvenc|hevc-nvenc] [--preset name] [--tune name] [--crf n] [--cq n] [--rc vbr|constqp|cbr] [--qp n] [--gop n] [--ffmpeg-extra arg] [--render-only] [--no-gpu-yuv] [--config file.json] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
     }
     let map_path = args[1].clone();
     let replay_path = if autoplay { None } else { Some(args[2].clone()) };
@@ -410,9 +458,18 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
         skin_dir: None,
         encoder: "auto".to_string(),
         quality: 18,
+        preset: None,
+        tune: None,
+        crf: None,
+        cq: None,
+        rc: None,
+        qp: None,
+        gop: None,
         probe: None,
         limit: None,
         ffmpeg_extra: Vec::new(),
+        render_only: false,
+        no_gpu_yuv: false,
         guides: true,
         hud: true,
         pp: true,
@@ -471,7 +528,6 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
         i += 1;
     }
     let mut i = min_args;
-    let mut i = min_args;
     while i < args.len() {
         match args[i].as_str() {
             "--out" => {
@@ -518,15 +574,56 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
             "--encoder" => {
                 i += 1;
                 let enc = args.get(i).cloned().ok_or("--encoder needs a value")?;
-                if !matches!(enc.as_str(), "auto" | "x264" | "x265" | "nvenc") {
-                    return Err("--encoder must be auto, x264, x265 or nvenc".into());
+                if !matches!(enc.as_str(), "auto" | "x264" | "x265" | "nvenc" | "hevc-nvenc") {
+                    return Err("--encoder must be auto, x264, x265, nvenc or hevc-nvenc".into());
                 }
                 opts.encoder = enc;
             }
             "--quality" => {
                 i += 1;
-                opts.quality = args.get(i).and_then(|v| v.parse().ok()).ok_or("bad --quality")?;
+                let q = args.get(i).and_then(|v| v.parse().ok()).ok_or("bad --quality")?;
+                opts.quality = q;
+                opts.crf = Some(q);
+                opts.cq = Some(q);
             }
+            "--preset" => {
+                i += 1;
+                opts.preset = Some(args.get(i).cloned().ok_or("--preset needs a value")?);
+            }
+            "--tune" => {
+                i += 1;
+                opts.tune = Some(args.get(i).cloned().ok_or("--tune needs a value")?);
+            }
+            "--crf" => {
+                i += 1;
+                opts.crf = Some(args.get(i).and_then(|v| v.parse().ok()).ok_or("bad --crf")?);
+            }
+            "--cq" => {
+                i += 1;
+                opts.cq = Some(args.get(i).and_then(|v| v.parse().ok()).ok_or("bad --cq")?);
+            }
+            "--rc" => {
+                i += 1;
+                let rc = args.get(i).cloned().ok_or("--rc needs a value")?;
+                if !matches!(rc.as_str(), "vbr" | "constqp" | "cbr") {
+                    return Err("--rc must be vbr, constqp or cbr".into());
+                }
+                opts.rc = Some(rc);
+            }
+            "--qp" => {
+                i += 1;
+                opts.qp = Some(args.get(i).and_then(|v| v.parse().ok()).ok_or("bad --qp")?);
+            }
+            "--gop" => {
+                i += 1;
+                opts.gop = Some(args.get(i).and_then(|v| v.parse().ok()).ok_or("bad --gop")?);
+            }
+            "--ffmpeg-extra" => {
+                i += 1;
+                opts.ffmpeg_extra.push(args.get(i).cloned().ok_or("--ffmpeg-extra needs a value")?);
+            }
+            "--render-only" => opts.render_only = true,
+            "--no-gpu-yuv" => opts.no_gpu_yuv = true,
             "--probe" => {
                 i += 1;
                 opts.probe = args.get(i).and_then(|v| v.parse().ok());
@@ -727,99 +824,142 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
 }
 
 enum Output {
-    /// Frames are sent to a dedicated writer thread through a bounded
-    /// channel (backpressure); the thread owns the ffmpeg child, writes
-    /// each frame with ONE write (contiguous at typical widths, else a
-    /// single repack), and joins at `finish`. Spent frame buffers are
-    /// recycled back through `ret` so the render thread never reallocates
-    /// the ~8MB readback payload per frame.
+    /// GPU frames go to a dedicated writer thread through a bounded
+    /// channel. The thread maps each frame's buffer, waits only for the
+    /// submission that filled it, writes to ffmpeg, unmaps, and returns the
+    /// ring slot. No full-frame CPU staging copy.
     Ffmpeg {
-        tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
-        ret: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
+        tx: Option<std::sync::mpsc::SyncSender<ReadbackFrame>>,
         handle: Option<std::thread::JoinHandle<std::io::Result<()>>>,
     },
     PngDir(String),
-    None,
+    /// `--render-only`: no readback and no encoder (benchmark/diagnostic).
+    Null,
+}
+
+/// Map one readback frame, write it to ffmpeg, unmap. BGRA rows may be
+/// 256-byte padded; YUV is already packed.
+fn write_readback_frame(
+    frame: &ReadbackFrame,
+    stdin: &mut impl std::io::Write,
+    device: &wgpu::Device,
+    scratch: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    let slice = frame.buffer.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    let _ = device.poll(wgpu::PollType::WaitForSubmissionIndex(frame.submission.clone()));
+    let data = slice.get_mapped_range();
+    let result = match frame.kind {
+        ReadbackKind::Bgra => {
+            let row_bytes = frame.width as usize * 4;
+            if frame.stride as usize == row_bytes {
+                stdin.write_all(&data[..frame.bytes])
+            } else {
+                scratch.clear();
+                scratch.reserve(frame.bytes);
+                for row in 0..frame.height as usize {
+                    let start = row * frame.stride as usize;
+                    scratch.extend_from_slice(&data[start..start + row_bytes]);
+                }
+                stdin.write_all(scratch)
+            }
+        }
+        ReadbackKind::Yuv => {
+            let (w, h, stride) = (
+                frame.width as usize,
+                frame.height as usize,
+                frame.stride as usize,
+            );
+            if stride == w {
+                stdin.write_all(&data[..frame.bytes])
+            } else {
+                scratch.clear();
+                scratch.reserve(frame.bytes);
+                for row in 0..h {
+                    let s = row * stride;
+                    scratch.extend_from_slice(&data[s..s + w]);
+                }
+                let uv_off = stride * h;
+                if frame.interleaved {
+                    for row in 0..h / 2 {
+                        let s = uv_off + row * stride;
+                        scratch.extend_from_slice(&data[s..s + w]);
+                    }
+                } else {
+                    let cw = w / 2;
+                    for row in 0..h / 2 {
+                        let s = uv_off + row * (stride / 2);
+                        scratch.extend_from_slice(&data[s..s + cw]);
+                    }
+                    let v_off = uv_off + (stride / 2) * (h / 2);
+                    for row in 0..h / 2 {
+                        let s = v_off + row * (stride / 2);
+                        scratch.extend_from_slice(&data[s..s + cw]);
+                    }
+                }
+                stdin.write_all(scratch)
+            }
+        }
+    };
+    drop(data);
+    frame.buffer.unmap();
+    result
 }
 
 impl Output {
-    /// Returns a buffer to fill the next frame into: a recycled one from
-    /// the writer thread when available, a fresh allocation otherwise.
-    fn take_buf(&mut self, frame_bytes: usize) -> Vec<u8> {
-        match self {
-            Output::Ffmpeg { ret, .. } => {
-                if let Some(rx) = ret {
-                    if let Ok(mut buf) = rx.try_recv() {
-                        buf.clear();
-                        buf.reserve(frame_bytes);
-                        return buf;
-                    }
-                }
-                Vec::with_capacity(frame_bytes)
-            }
-            _ => Vec::with_capacity(frame_bytes),
-        }
+    fn is_async(&self) -> bool {
+        matches!(self, Output::Ffmpeg { .. })
     }
 
-    /// Takes ownership of `buf` (frame data, padded rows) and queues it to
-    /// the writer thread. Cheap unless the writer is more than
-    /// `WRITER_QUEUE` frames behind (natural backpressure).
-    fn write_frame(&mut self, mut buf: Vec<u8>, width: u32, height: u32, stride: u32, index: usize) -> std::io::Result<()> {
-        match self {
-            Output::Ffmpeg { tx, .. } => {
-                let tx = tx.as_ref().expect("writer channel");
-                if stride != width * 4 {
-                    // Repack padded rows into one contiguous buffer so the
-                    // writer thread does a single write per frame.
-                    let mut tight = Vec::with_capacity((width * height * 4) as usize);
-                    for row in 0..height as usize {
-                        let start = row * stride as usize;
-                        tight.extend_from_slice(&buf[start..start + width as usize * 4]);
-                    }
-                    buf = tight;
-                }
-                let _ = index;
-                tx.send(buf).map_err(|_| std::io::Error::other("ffmpeg writer exited"))
+    /// BGRA (padded rows) -> PNG. Only used by `--png-dir`.
+    fn write_png(
+        &mut self,
+        buf: &[u8],
+        width: u32,
+        height: u32,
+        stride: u32,
+        index: usize,
+    ) -> std::io::Result<()> {
+        let Output::PngDir(dir) = self else {
+            return Ok(());
+        };
+        let path = format!("{}/frame_{:06}.png", dir, index);
+        let file = std::fs::File::create(&path)?;
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header()?;
+        // Convert BGRA -> RGBA rows.
+        let mut rgba = vec![0u8; (width * height * 4) as usize];
+        for row in 0..height {
+            let src = (row * stride) as usize;
+            for x in 0..width {
+                let s = src + (x * 4) as usize;
+                let d = ((row * width + x) * 4) as usize;
+                rgba[d] = buf[s + 2];
+                rgba[d + 1] = buf[s + 1];
+                rgba[d + 2] = buf[s];
+                rgba[d + 3] = buf[s + 3];
             }
-            Output::PngDir(dir) => {
-                let data: &[u8] = &buf;
-                let path = format!("{}/frame_{:06}.png", dir, index);
-                let file = std::fs::File::create(&path)?;
-                let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width, height);
-                enc.set_color(png::ColorType::Rgba);
-                enc.set_depth(png::BitDepth::Eight);
-                let mut writer = enc.write_header()?;
-                // Convert BGRA -> RGBA rows.
-                let mut rgba = vec![0u8; (width * height * 4) as usize];
-                for row in 0..height {
-                    let src = (row * stride) as usize;
-                    for x in 0..width {
-                        let s = src + (x * 4) as usize;
-                        let d = ((row * width + x) * 4) as usize;
-                        rgba[d] = data[s + 2];
-                        rgba[d + 1] = data[s + 1];
-                        rgba[d + 2] = data[s];
-                        rgba[d + 3] = data[s + 3];
-                    }
-                }
-                writer.write_image_data(&rgba)?;
-                Ok(())
-            }
-            Output::None => Ok(()),
         }
+        writer.write_image_data(&rgba)?;
+        Ok(())
     }
 
-    /// Drops the sender (EOF for the writer thread), then joins it: the
-    /// thread drains the queue, closes ffmpeg's stdin and waits for the
-    /// encode to finish.
+    /// Drops the sender (EOF for the writer thread), then joins it.
     fn finish(mut self) {
-        if let Output::Ffmpeg { tx, ret, handle } = &mut self {
+        if let Output::Ffmpeg { tx, handle } = &mut self {
             drop(tx.take());
-            drop(ret.take());
             match handle.take().unwrap().join() {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => eprintln!("ffmpeg writer error: {}", e),
-                Err(_) => eprintln!("ffmpeg writer panicked"),
+                Ok(Err(e)) => {
+                    eprintln!("ffmpeg writer error: {}", e);
+                    std::process::exit(1);
+                }
+                Err(_) => {
+                    eprintln!("ffmpeg writer panicked");
+                    std::process::exit(1);
+                }
             }
         }
     }
@@ -1069,7 +1209,7 @@ fn main() {
             }
         }
     }
-    let mut sb_layer = sb_parsed.map(|mut p| {
+    let mut sb_layer = sb_parsed.map(|p| {
         let events = osu_replay_render::storyboard::gameplay_trigger_events(&game);
         let mut layer = p.into_layer(renderer.device(), renderer.queue(), sb_slot.0, sb_slot.1);
         layer.arm_triggers(&events);
@@ -1237,38 +1377,112 @@ fn main() {
     } else {
         opts.encoder.as_str()
     };
-    eprintln!("encoder: {}", encoder);
+    // Encoder strategy: hardware NVENC by default, software x264 fallback.
+    // Defaults were picked from measured speed/quality/size (see README):
+    // NVENC p4 + CQ22, x264 veryfast + CRF18.
+    let is_hw = matches!(encoder, "nvenc" | "hevc-nvenc");
+    let codec = match encoder {
+        "nvenc" => "h264_nvenc",
+        "hevc-nvenc" => "hevc_nvenc",
+        "x265" => "libx265",
+        _ => "libx264",
+    };
+    let preset = opts.preset.clone().unwrap_or_else(|| {
+        if is_hw {
+            "p4".to_string()
+        } else if encoder == "x265" {
+            "fast".to_string()
+        } else {
+            "veryfast".to_string()
+        }
+    });
+    let tune = opts
+        .tune
+        .clone()
+        .or_else(|| if is_hw { Some("hq".to_string()) } else { None });
+    // GPU YUV is only valid for the ffmpeg path and word-aligned dimensions.
+    let use_yuv = opts.out.is_some()
+        && opts.png_dir.is_none()
+        && !opts.no_gpu_yuv
+        && renderer.yuv_ready();
+    if opts.out.is_some() && opts.png_dir.is_none() && !renderer.yuv_ready() {
+        eprintln!(
+            "note: {}x{} is not %8/even; GPU YUV disabled, using BGRA readback",
+            opts.width, opts.height
+        );
+    }
 
-    // Output setup.
-    let mut output = if let Some(dir) = &opts.png_dir {
+    let mut output = if opts.render_only {
+        Output::Null
+    } else if let Some(dir) = &opts.png_dir {
         std::fs::create_dir_all(dir).expect("create png dir");
         Output::PngDir(dir.clone())
     } else if let Some(out) = &opts.out {
-        // Input side: frames are piped BGRA. NVENC accepts bgr0 natively and
-        // converts in hardware (fastest end-to-end: ~1.7x x264); the x264 /
-        // x265 software paths go through CPU swscale to yuv420p.
-        let (in_pix_fmt, encode_args): (&str, Vec<String>) = if encoder == "nvenc" {
-            (
-                "bgr0",
-                vec![
-                    "-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
-                    "-rc", "vbr", "-cq", &opts.quality.to_string(), "-b:v", "0",
-                    "-movflags", "+faststart",
-                ]
-                .iter().map(|s| s.to_string()).collect(),
-            )
+        let in_pix_fmt = if use_yuv {
+            "nv12"
+        } else if is_hw {
+            "bgr0"
         } else {
-            let codec = if encoder == "x265" { "libx265" } else { "libx264" };
-            (
-                "bgra",
-                vec![
-                    "-c:v", codec, "-preset", "medium",
-                    "-crf", &opts.quality.to_string(),
-                    "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-                ]
-                .iter().map(|s| s.to_string()).collect(),
-            )
+            "bgra"
         };
+        let mut encode_args: Vec<String> = vec![
+            "-c:v".into(), codec.into(),
+            "-preset".into(), preset.clone(),
+        ];
+        if let Some(t) = &tune {
+            encode_args.push("-tune".into());
+            encode_args.push(t.clone());
+        }
+        if is_hw {
+            let rc = opts.rc.clone().unwrap_or_else(|| "vbr".to_string());
+            encode_args.push("-rc".into());
+            encode_args.push(rc.clone());
+            match rc.as_str() {
+                "constqp" => {
+                    let qp = opts.qp.or(opts.cq).unwrap_or(20);
+                    encode_args.push("-qp".into());
+                    encode_args.push(qp.to_string());
+                }
+                "cbr" => {
+                    // Bitrate must come from --ffmpeg-extra (-b:v ...).
+                    if let Some(cq) = opts.cq {
+                        encode_args.push("-cq".into());
+                        encode_args.push(cq.to_string());
+                    }
+                }
+                _ => {
+                    let cq = opts.cq.unwrap_or(22);
+                    encode_args.push("-cq".into());
+                    encode_args.push(cq.to_string());
+                    encode_args.push("-b:v".into());
+                    encode_args.push("0".into());
+                }
+            }
+            if codec == "hevc_nvenc" {
+                encode_args.push("-pix_fmt".into());
+                encode_args.push("yuv420p".into());
+            }
+        } else {
+            let crf = opts.crf.unwrap_or(18);
+            encode_args.push("-crf".into());
+            encode_args.push(crf.to_string());
+            encode_args.push("-pix_fmt".into());
+            encode_args.push("yuv420p".into());
+        }
+        if let Some(g) = opts.gop {
+            encode_args.push("-g".into());
+            encode_args.push(g.to_string());
+        }
+        encode_args.push("-movflags".into());
+        encode_args.push("+faststart".into());
+        // User extras last so they can override any default above.
+        encode_args.extend(opts.ffmpeg_extra.iter().cloned());
+
+        eprintln!(
+            "encoder: {} (codec {codec}, preset {preset}, input {in_pix_fmt}, yuv {use_yuv})",
+            encoder
+        );
+
         let mut cmd = std::process::Command::new("ffmpeg");
         cmd.arg("-y")
             .arg("-f").arg("rawvideo")
@@ -1293,16 +1507,22 @@ fn main() {
             .stderr(std::fs::File::create("ffmpeg_err.log").unwrap())
             .spawn()
             .expect("failed to spawn ffmpeg (is it on PATH? or use --png-dir)");
-        // Dedicated writer thread: owns ffmpeg's stdin, one write per
-        // frame, decoupled from the render loop by a bounded channel.
-        // Buffers are recycled back to the render thread after use.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(WRITER_QUEUE);
-        let (ret_tx, ret_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+
+        // Reader thread: owns ffmpeg stdin + the wgpu device handle. It maps
+        // each submitted frame, waits only for that frame's submission,
+        // writes, unmaps, and returns the ring slot.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<ReadbackFrame>(WRITER_QUEUE);
+        let (ret_tx, ret_rx) = std::sync::mpsc::channel::<(ReadbackKind, usize)>();
+        let device = renderer.device().clone();
         let handle = std::thread::spawn(move || {
             let mut stdin = child.stdin.take().expect("ffmpeg stdin");
+            let mut scratch = Vec::new();
             for frame in rx {
-                stdin.write_all(&frame)?;
-                let _ = ret_tx.send(frame);
+                let kind = frame.kind;
+                let slot = frame.slot;
+                let result = write_readback_frame(&frame, &mut stdin, &device, &mut scratch);
+                let _ = ret_tx.send((kind, slot));
+                result?;
             }
             drop(stdin); // EOF -> ffmpeg finishes the encode
             let status = child.wait()?;
@@ -1311,20 +1531,23 @@ fn main() {
             }
             Ok(())
         });
-        Output::Ffmpeg { tx: Some(tx), ret: Some(ret_rx), handle: Some(handle) }
+        renderer.enable_async_readback(tx.clone(), ret_rx);
+        Output::Ffmpeg { tx: Some(tx), handle: Some(handle) }
     } else {
         eprintln!("no output specified; use --out <file.mp4> or --png-dir <dir>");
         std::process::exit(2);
     };
+    if use_yuv && !opts.render_only {
+        renderer.release_bgra_readback();
+    }
+    let async_export = output.is_async();
 
     let total = frame_times.len();
     let t0 = std::time::Instant::now();
     let mut list = draw::DrawList::new();
     let assets = Assets { atlas: &atlas, bold: &fonts.bold, semibold: &fonts.semibold, light: &fonts.light, venera: &fonts.venera, regular: &fonts.regular, skin: &resolved_skin };
     let stats = std::env::var("RENDER_STATS").is_ok();
-    let (mut s_build, mut s_render, mut s_write) = (0.0f64, 0.0f64, 0.0f64);
-    // Index of the next frame to be written out; lags behind the frame
-    // being submitted while the pipeline is running ahead.
+    let (mut s_build, mut s_submit) = (0.0f64, 0.0f64);
     let mut written = 0usize;
 
     for (n, &ft) in frame_times.iter().enumerate() {
@@ -1347,26 +1570,34 @@ fn main() {
             sb.set_passing(game::health_at(&game, ft) >= 0.5);
             sb.render(ft as f32, &mut renderer, &atlas);
         }
-        // Pipelined: submit this frame WITHOUT waiting for the GPU, and
-        // only read back the OLDEST in-flight frame once the pipeline has
-        // reached depth 2. Until then the GPU renders ahead while the CPU
-        // keeps building the next frame; reading immediately after submit
-        // would serialize CPU and GPU again.
-        renderer.render_deferred(&list, osu_replay_render::CLEAR);
+        if opts.render_only {
+            renderer.render_submit_only(&list, osu_replay_render::CLEAR);
+        } else if use_yuv {
+            renderer.render_deferred_yuv(&list, osu_replay_render::CLEAR, true);
+        } else {
+            renderer.render_deferred(&list, osu_replay_render::CLEAR);
+        }
         let tc = std::time::Instant::now();
-        if renderer.pending_len() >= 2 {
-            let mut buf = output.take_buf((renderer.padded_row as usize) * opts.height as usize);
-            renderer.read_oldest_into(&mut buf);
-            if let Err(e) = output.write_frame(buf, opts.width, opts.height, renderer.padded_row, written) {
-                eprintln!("error writing frame {}: {}", written, e);
-                std::process::exit(1);
+        if opts.render_only {
+            // submit only; wait_idle() drains at the end.
+        } else if !async_export {
+            // PNG path: synchronous readback; PNG compression dominates.
+            if renderer.pending_len() >= 1 {
+                let mut buf = Vec::new();
+                renderer.read_oldest_into(&mut buf);
+                if let Err(e) = output.write_png(&buf, opts.width, opts.height, renderer.padded_row, written) {
+                    eprintln!("error writing frame {}: {}", written, e);
+                    std::process::exit(1);
+                }
+                written += 1;
             }
+        } else {
             written += 1;
         }
         let td = std::time::Instant::now();
         s_build += tb.duration_since(ta).as_secs_f64();
-        s_render += tc.duration_since(tb).as_secs_f64();
-        s_write += td.duration_since(tc).as_secs_f64();
+        s_submit += tc.duration_since(tb).as_secs_f64();
+        let _ = td;
         if n % 300 == 0 || n + 1 == total {
             eprintln!(
                 "frame {}/{} (t={:.0}ms) elapsed {:.1}s",
@@ -1379,25 +1610,33 @@ fn main() {
     }
     if stats {
         eprintln!(
-            "stats: build {:.2}s ({:.2}ms/f) | render+readback {:.2}s ({:.2}ms/f) | write {:.2}s ({:.2}ms/f) | total {:.2}s",
+            "stats: build {:.2}s ({:.2}ms/f) | submit {:.2}s ({:.2}ms/f) | total {:.2}s",
             s_build, s_build * 1000.0 / total as f64,
-            s_render, s_render * 1000.0 / total as f64,
-            s_write, s_write * 1000.0 / total as f64,
+            s_submit, s_submit * 1000.0 / total as f64,
             t0.elapsed().as_secs_f64()
         );
     }
 
-    // Drain the pipeline's last frame(s) into the writer before finishing.
-    while renderer.pending_len() > 0 {
-        let mut buf = output.take_buf((renderer.padded_row as usize) * opts.height as usize);
-        renderer.read_oldest_into(&mut buf);
-        if let Err(e) = output.write_frame(buf, opts.width, opts.height, renderer.padded_row, written) {
-            eprintln!("error writing final frame: {}", e);
-            std::process::exit(1);
-        }
-        written += 1;
-    }
+    if opts.render_only {
+        renderer.wait_idle();
         output.finish();
+    } else if async_export {
+        // Drop the render-thread sender, then let the writer drain and join.
+        renderer.disable_async_readback();
+        output.finish();
+    } else {
+        // Drain the last synchronous PNG frame(s).
+        while renderer.pending_len() > 0 {
+            let mut buf = Vec::new();
+            renderer.read_oldest_into(&mut buf);
+            if let Err(e) = output.write_png(&buf, opts.width, opts.height, renderer.padded_row, written) {
+                eprintln!("error writing final frame: {}", e);
+                std::process::exit(1);
+            }
+            written += 1;
+        }
+        output.finish();
+    }
 
     // Second pass: mux the audio into the video (stream copy + AAC).
     // Audio file position = replay_time - offset*rate (offset is a

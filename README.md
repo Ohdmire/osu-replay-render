@@ -20,7 +20,7 @@ osu_replay_render <beatmap.osu> [replay.osr] [options]
 | --- | --- |
 | `--autoplay` | **Autoplay mod**：不输入 .osr,由谱面直接生成回放（本地移植 lazer `OsuAutoGenerator`）。判定引擎照常判定生成帧（SS/满血/UR 0）;只负责生成回放,不对 HUD 做任何处理（玩家名显示 lazer 的 autoplay 署名 `osu!`） |
 | `--hd <auto\|on\|off>` | Hidden 视觉覆盖：**on** 强制开启（物件提前淡出、缩圈隐藏，首个物件保留），**off** 即使回放自带 HD 也以全可见渲染，缺省 **auto** 跟随回放自身 mods。纯视觉覆盖——判定/分数仍按回放真实 mods 计算（HD 本就不影响判定）。裸 `--hd` 等价 `on`；config 键 `"hd"` 接受 `"auto"/"on"/"off"` |
-| `--out <file.mp4>` | 管道输出到 ffmpeg 编码为 mp4 (h264, crf 18) |
+| `--out <file.mp4>` | 管道输出到 ffmpeg 编码为 mp4。默认 `auto`→NVENC H.264 p4/CQ22（无 NVENC 时 x264 veryfast/CRF18）；GPU NV12 直喂，编码慢时由有界队列自然背压 |
 | `--png-dir <dir>` | 输出 PNG 帧序列到目录 |
 | `--size <WxH>` | 输出分辨率，默认 1920x1080 |
 | `--fps <n>` | 输出帧率 1..480，默认 60（与游戏帧一一对应；其他帧率对光标做插值采样） |
@@ -29,8 +29,16 @@ osu_replay_render <beatmap.osu> [replay.osr] [options]
 | `--skin <argon\|argon-pro\|dir>` | 皮肤变体,默认 `argon-pro`(无 GREAT/PERFECT 判定文字、滑条身体透明度 0.92);传**皮肤目录**(解包的 .osk / 游戏 `Skins/<name>`)即启用该皮肤:玩法元素之外,**HUD 的分数/准确率/连击计数器、HP 血条(scorebar-\*,新旧两种样式)与按键计数(inputoverlay-\*)**也换用皮肤自己的贴图(lazer `LegacyScoreCounter`/`LegacyAccuracyCounter`/`LegacyDefaultComboCounter`/`LegacyHealthDisplay`/`LegacyKeyCounterDisplay` 的移植;皮肤缺哪块就回退哪块的 argon 实现,UR 条始终用本渲染器的实现) |
 | `--argon-hud` | 有皮肤目录时仍强制 Argon HUD(默认皮肤提供哪块 HUD 元素就用哪块) |
 | `--skin-colours` | **强制用皮肤 combo 色**覆盖谱面 `[Colours]`（stable 行为，= lazer 关闭「Beatmap skins」设定）。默认相反：谱面自带 `[Colours]` 时优先谱面色（lazer 默认行为，`LegacyBeatmapSkin` 先应答查找），皮肤 combo 色仅在谱面未配色时生效 |
-| `--encoder <auto\|x264\|x265\|nvenc>` | 视频编码器：默认 `auto`（探测 NVENC 可用则用之，否则回退 x264）；NVENC 硬件编码（bgr0 直喂 + p5/hq/vbr/cq，**端到端约比 x264 快 1.7×、比 x265 快 3.2×**）；libx264 / libx265（preset medium + crf） |
-| `--quality <n>` | crf（软件）/ cq（nvenc），默认 18 |
+| `--encoder <auto\|x264\|x265\|nvenc\|hevc-nvenc>` | 视频编码器。默认 `auto`：探测 NVENC 可用则用 **h264_nvenc p4 + CQ22 + NV12**，否则 **libx264 veryfast + CRF18**。`hevc-nvenc` 是 HEVC 硬件编码（同档更快、文件更小，但需播放器支持 HEVC）。所有路径都优先 GPU NV12 直喂，省掉 CPU swscale |
+| `--preset <name>` | 编码速度档：x264/x265 用 `medium/veryfast/superfast/...`，NVENC 用 `p1..p7`。默认 x264 `veryfast`、x265 `fast`、NVENC `p4` |
+| `--tune <name>` | x264 tune（`animation/film/...`）或 NVENC `hq/ll/ull`；NVENC 默认 `hq` |
+| `--crf <n>` | x264/x265 质量，默认 **18**（越大越快、体积越小） |
+| `--cq <n>` | NVENC 质量，默认 **22**（与 x264 的 CRF 不等价；越大越快、体积越小） |
+| `--rc <vbr\|constqp\|cbr>` | NVENC 码率控制，默认 `vbr`；`cbr` 的码率需经 `--ffmpeg-extra -b:v ...` 传入 |
+| `--qp <n>` | `--rc constqp` 时的固定 QP |
+| `--gop <n>` | 关键帧间隔（默认交给编码器） |
+| `--ffmpeg-extra <arg>` | 追加任意 ffmpeg 参数，可重复；**最后应用**，可覆盖上面的默认 |
+| `--quality <n>` | 旧参数，等价于同时设置 `--crf n` 和 `--cq n` |
 | `--hud <on\|off>` | 玩法 HUD 显隐（分数/准确率/连击/血条/UR 条/按键显示/PP 计数器），默认 **on**;`off` 时玩法物件与光标照常渲染。裸 `--hud` 等价 `on`;真值别名 `true/false/1/0`。与 `--autoplay` 互相独立（autoplay 不再隐含关 HUD）。config 键为 JSON 布尔 `"hud"`;库嵌入方用 `HudState.visible` |
 | `--guides <on\|off>` | UR 条的窗口引导线（判定色色轴），默认 **on**。裸 `--guides` 等价 `on`；config 键 `"guides"` |
 | `--pp <on\|off>` | 实时 PP 计数器（lazer 的 legacy HUD 本没有 PP，渲染器默认给所有皮肤额外显示），默认 **on**。裸 `--pp` 等价 `on`；config 键 `"pp"`；库嵌入方用 `HudState.pp_display` |
@@ -49,6 +57,8 @@ osu_replay_render <beatmap.osu> [replay.osr] [options]
 | `--avatar <image>` | 结算屏头像图片（jpg/png）：居中裁方 + 预圆角（与占位框同为 20/80 圆角），画在头像框里；不传时沿用玩家首字母占位。等价 config 键 `"avatar"` |
 | `--config <file.json>` | JSON 配置文件：键与 CLI 长参数一一对应（snake_case），如 `{"avatar": "a.png", "out": "x.mp4", "results": 5, "results_only": true, "bg": true, "bg_opacity": 0.3, "skin": "dir", "size": "1920x1080", "fps": 60, "hd": "on", "hitsounds": true, "master_volume": 0.8, "ffmpeg_extra": ["-movflags", "+faststart"]}`。config 先应用，**显式 CLI 参数始终覆盖 config**（与出现顺序无关） |
 | `--limit <n>` | 最多渲染 n 帧（测试用） |
+| `--render-only` | 只渲染+提交，不回读、不编码；用于测 GPU 渲染时长（配合 `--limit`） |
+| `--no-gpu-yuv` | 强制走 BGRA 回读（A/B 对比/验证 NV12 用） |
 
 示例：
 
@@ -61,8 +71,8 @@ osu_replay_render map.osu --autoplay --audio --out preview.mp4   # 谱面预览�
 改完结算屏后跑 `scripts/check-stable-results.sh`：用固定回放把 argon 和几套 legacy 皮肤各渲一张 stable 结算 PNG 到 `testset/results-check/`（该目录在 gitignore 里）。
 
 帧时间轴与游戏内一致：60fps 时逐帧对应 lazer 的 FrameStability 游戏帧；
-DT/HT 等 rate mod 的回放按真实游戏速度输出。渲染速度约 240fps（1080p
-x264,瓶颈在 ffmpeg 编码；渲染管线本身约 0.6ms/帧,见下文「渲染流水线」）。
+DT/HT 等 rate mod 的回放按真实游戏速度输出。渲染速度取决于编码器档位（1080p NVENC p4/CQ22 约 180–200fps，x264
+veryfast/CRF18 约 170–180fps；瓶颈在编码器，渲染+回读约 1ms/帧）。详见「渲染流水线」。
 
 ## 作为库使用（实时预览）
 
@@ -258,38 +268,160 @@ if renderer.pending_len() > 0 {
 
 ## 渲染架构
 
-- wgpu 离屏（无窗口），DX12/Vulkan，4x MSAA；BGRA8 读回后喂给
-  ffmpeg rawvideo 管道或写成 PNG;或经 `SurfaceRenderer` letterbox
-  blit 到窗口 surface 直渲（present Fifo vsync）。
-- 编码：BGRA 管道喂 ffmpeg。`nvenc` 以 bgr0 直喂 NVENC（硬件色彩转换，
-  无 CPU swscale）；`x264`/`x265` 走 CPU swscale 转 yuv420p。
+- wgpu 离屏，**无 MSAA（1x）**：圆环/圆盘/胶囊/圆弧等 SDF 图元自带
+  解析式 0.75px 抗锯齿；滑条 body 用 **每体一张 R16Float SDF layer**
+  预通道，再在**单个场景 pass** 里按绘制顺序合成（不再每个 body 做两次
+  全屏 MSAA load/store）。纹理精灵的边缘靠图集自带的 alpha。
+- 帧输出三条路：
+  1. **CLI 视频**：GPU 直接把 Bgra8 场景转成 **NV12**（BT.601 limited），
+     3 个 readback ring 交给 writer 线程。**任意偶宽/偶高都走 NV12**：
+     宽度向上补齐到 8 的倍数做 compute，writer 按行裁回真实宽度；
+     奇宽/奇高才回退 BGRA。NV12 模式下 BGRA ring 会被释放。
+  2. **CLI PNG**：同步 BGRA 回读 + PNG 编码。
+  3. **窗口预览**：`SurfaceRenderer` 在窗口尺寸等于场景尺寸且 surface 为
+     `Bgra8Unorm` 时**直接渲进 swapchain**，跳过离屏 target + 全屏 blit；
+     其他尺寸/格式保留 letterbox blit。预览不分配 readback ring。
+- 编码：`nvenc`/`hevc-nvenc` 原生吃 NV12；`x264`/`x265` 也直接吃 NV12，
+  不再走 CPU swscale。编码参数全部可调，默认取实测的速度/体积/画质
+  平衡档（见下表）。
 - 每帧 CPU 侧构建 `DrawList`：SDF 圆环/圆盘/辉光/胶囊/圆弧、纹理
-  四边形、滑条身体带描边条带（MSAA 抗锯齿），按 alpha/加色混合分段
-  绘制，绘制顺序复刻 `OsuPlayfield` 层级（spinner → follow points →
-  判定爆炸 → 物件(早者在上) → 判定文字 → approach → 光标 → HUD）。
+  四边形、滑条身体（SDF 预通道），按 alpha/加色混合分段绘制，绘制顺序
+  复刻 `OsuPlayfield` 层级（spinner → follow points → 判定爆炸 →
+  物件(早者在上) → 判定文字 → approach → 光标 → HUD）。
 - 游戏状态：判定引擎跑完整回放后输出逐帧快照（光标插值位置、按键、
   slider tracking、spinner 旋转/进度）+ 判定事件时间轴，渲染端据此
   求值任意时刻的视觉状态（`game::snapshot_at` 支持任意输出帧率）。
 
 ## 渲染流水线（离屏 CLI 路径）
 
-渲染与编码三级重叠，CPU 与 GPU 互不空等（`main.rs` 主循环 +
-`render.rs` 的 `render_deferred`/`read_oldest_into`）：
+渲染、回读、编码三级流水，渲染线程只做「构建场景 + 提交」：
 
-1. **GPU 回读环形缓冲**（3 个 readback buffer）：每帧 `render_deferred`
-   只提交不等待；积压达到深度 2 才 `read_oldest_into` 映射最老的一帧。
-   CPU 建下一帧场景时 GPU 手里始终有已排队的渲染工作。
-2. **独立写出线程 + 有界通道**（深度 3,天然背压）：帧数据经
-   `SyncSender` 发给拥有 ffmpeg stdin 的写出线程,每帧单次
-   `write_all`;编码慢时阻塞在 `send` 而不是拖慢渲染。
-3. **帧缓冲复用**：写出线程用完的 `Vec<u8>`（1080p 约 8MB）经回传
-   通道还回渲染线程,`read_oldest_into` 直接从 GPU 映射区拷入,
-   每帧零大分配、单次拷贝。
+1. **异步 GPU 回读**：每帧提交后，把
+   `ReadbackFrame { Arc<Buffer>, SubmissionIndex, ... }` 直接交给 writer
+   线程。writer 在**自己的线程**里 `map_async` →
+   `poll(WaitForSubmissionIndex)` → `write_all(ffmpeg stdin)` → `unmap` →
+   把 ring slot 还回渲染线程。渲染线程不再 map，也不做 8/33 MB 的整帧
+   CPU 拷贝。
+2. **只等该 slot 的 submission**：旧实现用 `poll(Wait)`，语义是等
+   **最近一次 submit**，会把刚提交的下一帧也算进去，等于每次回读多等
+   一帧 GPU。改成按 slot 的 `SubmissionIndex` 等待后，回读等待在
+   1080p/4K/8K 下实测下降约 **36–49%**。
+3. **双重背压**：3 个 readback slot + 深度 3 的有界 channel；编码慢时
+   渲染线程阻塞在 slot/send 上，而不是让 GPU 队列或内存无限增长。
+4. **PNG 模式**仍走同步 `read_oldest_into`，不启用异步 writer。
 
-实测（1080p60, x264 medium crf18, 1800 帧）：流水线化前 ~165fps,
-之后 ~245fps,基本贴住 ffmpeg 单独编码的上限（~255fps）;渲染管线
-本身（提交+回读）仅 ~0.6ms/帧。输出与流水线化前逐字节一致。
-PNG 模式不走流水线（`Renderer::render` 同步路径）。
+实测（i5-12500H + RTX 3050 Ti Laptop，ReI [Rain] 30–40 s，600 帧
+1080p / 120 帧 4K；同一次会话内交替跑，绝对值受笔记本功耗/温度影响）：
+
+| 配置（新代码，1080p 600 帧） | 耗时 | 文件 |
+|---|---|---|
+| NVENC p5 CQ18（旧默认档） | 7.3–7.7 ms/帧 | 16 MB |
+| **NVENC p4 CQ22（新默认）** | **5.45–5.55 ms/帧** | **11 MB** |
+| x264 medium CRF18 | 10.0–10.5 ms/帧 | 5 MB |
+| **x264 veryfast CRF18** | **5.6–5.8 ms/帧** | **5 MB** |
+| **HEVC NVENC p4 CQ22** | **5.0–5.1 ms/帧** | 9 MB |
+
+4K（120 帧）：新默认 NVENC p4 CQ22 ≈ 26 ms/帧（3 MB），x264 veryfast
+≈ 34 ms/帧（1 MB）。**同样的 p4/CQ22 档位下，只把输入从 BGRA 换成
+GPU NV12，1080p 数据通路从 ~4.45 ms/帧降到 ~1.13 ms/帧（−75%）**；
+这是 1080p 提升有限、4K 提升明显（约 −18%）的原因。
+
+### 编码默认值怎么选
+
+同内容 300 帧的 VMAF/体积（x264 CRF18 与 NVENC CQ18 不可直接比质量）：
+
+| 设置 | 速度（1080p） | 体积 | VMAF |
+|---|---|---|---|
+| x264 medium CRF18 | ~10 ms/帧 | 2.6 MB | 97.81 |
+| x264 veryfast CRF18 | ~4.8 ms/帧 | 2.5 MB | 97.53 |
+| NVENC p5 CQ18 | ~5.8 ms/帧 | 7.3 MB | 98.71 |
+| NVENC p4 CQ20 | ~4.5 ms/帧 | 6 MB | 98.72 |
+| **NVENC p4 CQ22（默认）** | ~4.8 ms/帧 | 5 MB | 98.64 |
+| NVENC p3 CQ22 | ~3.9 ms/帧 | 6 MB | 98.66 |
+| HEVC NVENC p1 CQ18 | ~2.3 ms/帧 | 8.6 MB | 98.99 |
+
+- **默认 `auto` → NVENC p4 + CQ22**：速度、体积、画质最平衡；有 NVENC 时
+  不占 CPU，适合边渲染边做别的。
+- **体积优先** → `--encoder x264 --preset veryfast --crf 18`：本机 1080p
+  几乎同速，文件约为 NVENC 的一半；4K 会慢约 30%。
+- **极限速度** → `--encoder hevc-nvenc --preset p4 --cq 22`（需 HEVC 兼容）
+  或 `--encoder nvenc --preset p3 --cq 22`。
+- **分段并行**：多进程各跑一段 + 关键帧对齐 concat，NVENC 2–4 会话实测
+  可再多约 30–40%；x264 已吃满 CPU，无收益。
+
+### NV12 覆盖与结果验证
+
+- **覆盖范围**：`width % 2 == 0 && height % 2 == 0` 全部走 GPU NV12，
+  包括 1366×768（宽度不是 8 的倍数，compute 内补齐到 1368 后按行裁回）。
+  只有奇宽/奇高才回退 BGRA。
+- **性能对比**（同会话，ReI，NVENC p4 CQ22 / x264 veryfast CRF18）：
+
+| 分辨率 / 编码器 | NV12 | BGRA | 提升 |
+|---|---|---|---|
+| 1366×768 NVENC | 4.23 ms/帧 | 5.60 ms/帧 | **+32%** |
+| 1366×768 x264 | 5.52 ms/帧 | 6.90 ms/帧 | **+25%** |
+| 1920×1080 NVENC | 5.9–6.0 ms/帧 | 7.4–7.6 ms/帧 | **+23%** |
+| 1920×1080 x264 | 6.15 ms/帧 | 8.40 ms/帧 | **+37%** |
+| 3840×2160 NVENC | 28.5 ms/帧 | 35.5–37.1 ms/帧 | **+27%** |
+| 3840×2160 x264 | 61.4 ms/帧 | 66.8 ms/帧 | +9% |
+
+- **正确性验证**：`scripts/check-nv12.sh <map> <replay> [size] [frames] [encoder]`
+  会分别用 NV12 / `--no-gpu-yuv` 渲染同一段，检查尺寸/pix_fmt、
+  near-black 帧、平均亮度、PSNR/SSIM。当前结果：
+
+| 分辨率 / 编码器 | PSNR | SSIM | YAVG | near-black |
+|---|---|---|---|---|
+| 1366×768 NVENC | 54.96 dB | 0.9978 | 89.79 | 0 |
+| 1920×1080 NVENC | 55.09 dB | 0.9979 | 89.77 | 0 |
+| 2560×1440 NVENC | 58.55 dB | 0.9990 | 89.77 | 0 |
+| 3840×2160 NVENC | 59.97 dB | 0.9993 | 89.78 | 0 |
+| 1920×1080 x264 | 50.32 dB | 0.9953 | 89.79 | 0 |
+
+  另有 `tests/nv12_validation.rs`：用高对比色块在 1280×720 / 1366×768 /
+  1920×1080 上比较 BGRA 与 NV12，要求 PSNR > 32 dB 且非黑屏。
+  `cargo test --release` 会一起跑。
+
+## 故事板 / 视频层成本
+
+故事板（`--storyboard`/`--video`）走 `osu-storyboard-render` 独立渲染器：
+每帧把 640×480（宽屏扩展）场景渲进图集的 1920×1080 子矩形，再由主场景
+采样。用 `--render-only` 在 1080p 下测得的**同会话增量**：
+
+| 场景 | 渲染增量 | 默认编码端到端增量 |
+|---|---|---|
+| 空故事板（只有区域清屏 + atlas load/store） | **+0.6 ms/帧** | +0.2 ms/帧（多数被编码掩盖） |
+| 50 个全屏级精灵（1200×671） | **+2.7 ms/帧** | +0.9 ms/帧 |
+| 200 个全屏级精灵 | **+7.1 ms/帧** | +5.0 ms/帧 |
+| 1000 个全屏级精灵 | **+30 ms/帧** | 渲染成为绝对瓶颈 |
+| 1000 个 64×64 小精灵 | ~0 ms/帧 | ~0 |
+| 720p 故事板视频 | +0.7 ms/帧 | +0.5 ms/帧 |
+| 视频 + FSR | +0.9 ms/帧 | +1.1 ms/帧 |
+| 视频 + Anime4K | +3.3 ms/帧 | +4.6 ms/帧 |
+
+结论：
+- **典型稀疏故事板（几十个精灵）不是瓶颈**：固定开销约 0.6 ms/帧，
+  端到端大多被编码器掩盖。
+- **密集/生成式故事板才是瓶颈**：成本与覆盖像素（overdraw）成正比，
+  而不是 draw call 数——1000 个小精灵几乎免费，1000 个全屏精灵可达
+  +30 ms/帧；200 个全屏精灵就足以超过 1080p NVENC 的编码时间。
+- 故事板槽位封顶 1080p，所以 4K 输出下它的绝对成本与 1080p 接近；
+  4K 基础场景更重，相对占比反而更小（50 精灵 +2.1 ms/帧）。
+- 视频层本身很轻（720p +0.5 ms/帧），但 **Anime4K 视频超分** 是例外
+  （+4.6 ms/帧），4K/低端 GPU 上应谨慎开启。
+
+可优化点（`osu-storyboard-render`）：
+1. 故事板改用**独立 1920×1080 纹理/纹理数组层**，不要渲进整张
+   4096×2048 图集子矩形；当前 `LoadOp::Load + Store` 会触碰整张图集，
+   且子矩形模式必须用巨型透明四边形清屏。独立槽位还能让图集缩小。
+2. below/above 两个槽位**合并到一个 render pass**（动态 viewport），
+   或提供 `render_into(&mut CommandEncoder)` 让宿主与主场景共用一次
+   submit；目前每槽位独立 `queue.submit`。
+3. 在 `build_draws_filtered` 增加**离屏 AABB 剔除**；alpha≤0.002 已剔除，
+   但完全在 640×480 容器外的全屏精灵仍会走实例/光栅化。
+4. 4K 导出可把故事板槽位降到 720p/900p 再在场景里放大（密集 SB 的
+   fill 成本约降 2–2.25×），代价是故事板清晰度。
+5. 视频上传从 RGBA 改 NV12（3.7→1.8 MB/帧），或对 4K 只保留 FSR、
+   慎用 Anime4K。
 
 ## Autoplay 谱面预览（`--autoplay`）
 

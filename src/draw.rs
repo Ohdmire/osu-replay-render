@@ -782,7 +782,8 @@ impl DrawList {
         ]);
     }
 
-    /// Quad with per-vertex colours (flat coverage; relies on MSAA for edges).
+    /// Quad with per-vertex colours (flat coverage; edges come from the
+    /// SDF primitives around it).
     pub fn quad_gradient(&mut self, pts: &[[f32; 2]; 4], cols: [Colour; 4], blend: Blend) {
         let mk = |i: usize| Vertex {
             pos: pts[i],

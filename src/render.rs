@@ -1,8 +1,11 @@
 //! Offscreen wgpu renderer: uploads the atlas, renders a `DrawList` to a
-//! texture with MSAA, reads the frame back as BGRA bytes.
+//! texture without MSAA, then either read back BGRA/NV12 or present it
+//! straight to a window surface.
 
 use crate::draw::{Atlas, Blend, DrawList, Vertex};
 use std::num::NonZeroU64;
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, SyncSender};
 
 const SHADER: &str = r#"
 struct Screen {
@@ -48,8 +51,6 @@ fn aa(sdf: f32) -> f32 {
     return clamp(sdf / 0.75 + 0.5, 0.0, 1.0);
 }
 
-// ----- Slider body distance-field prepass (lazer PathDrawNode style) -----
-
 struct VsOut2 {
     @builtin(position) pos: vec4<f32>,
     @location(0) start: vec2<f32>,
@@ -90,50 +91,6 @@ fn distToSeg(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
 fn fs_body_pre(in: VsOut2) -> @location(0) f32 {
     let p = vec2<f32>(in.pos.x, in.pos.y);
     return distToSeg(p, in.start, in.end) / in.radius;
-}
-
-@fragment
-fn fs_body_main(in: VsOut) -> @location(0) vec4<f32> {
-    // Single composite sample of the distance field: border band at the
-    // rim, body colour inside, analytic AA at the outer edge, all scaled
-    // by the fade alpha (no per-segment compositing).
-    let uv = in.uv.xy / screen.size;
-    let d = textureSampleLevel(tex, samp, uv, 0.0).r * in.aux.y;
-    let r = in.aux.y;
-    let b = in.aux.z;
-
-    if (in.aux.w > 0.5) {
-        // Legacy radial gradient (`LegacyDrawableSliderPath.ColourAt`,
-        // position 0 = path edge, 1 = centre): transparent-black rim over
-        // [0, shadow], the border colour over (shadow, border], then the
-        // sRGB lerp accent.Darken(0.1) -> lighten(accent, 0.5). The inner
-        // colour rides in local.xy + uv.z; its alpha equals the outer
-        // (body) alpha. The shadow/border segment alphas take the fade
-        // from the border alpha (borders ship opaque).
-        let position = clamp(1.0 - d / r, 0.0, 1.0);
-        let SHADOW = 0.078125;  // 1 - 59/64
-        let BORDER = 0.1875;
-        // Analytic 0.75px feathers at both colour seams (shadow->border,
-        // border->gradient): the hard switches staircased along curved
-        // paths. Feather width converts from pixels via the body radius.
-        let px = 0.75 / r;
-        let ramp_a = 0.25 * clamp(position / SHADOW, 0.0, 1.0) * in.color2.a;
-        let shadow_col = vec4<f32>(0.0, 0.0, 0.0, ramp_a);
-        let w1 = smoothstep(SHADOW - px, SHADOW + px, position);
-        let t = clamp((position - BORDER) / (1.0 - BORDER), 0.0, 1.0);
-        let inner = vec3<f32>(in.local.x, in.local.y, in.uv.z);
-        let grad_col = vec4<f32>(mix(in.color.rgb, inner, t), in.color.a);
-        let w2 = smoothstep(BORDER - px, BORDER + px, position);
-        let col = mix(mix(shadow_col, in.color2, w1), grad_col, w2);
-        let aa_a = aa(r - d) * col.a;
-        return vec4<f32>(col.rgb * aa_a, aa_a);
-    }
-
-    // Border/body seam: same-width analytic feather as the outer aa().
-    let seam = clamp((d - (r - b)) / max(min(0.75, b), 1e-3) + 0.5, 0.0, 1.0);
-    let col = mix(in.color, in.color2, seam);
-    let alpha = aa(r - d) * col.a;
-    return vec4<f32>(col.rgb * alpha, alpha);
 }
 
 @fragment
@@ -265,6 +222,82 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+const BODY_LAYER_SHADER: &str = r#"
+struct Screen {
+    size: vec2<f32>,
+};
+
+@group(0) @binding(0) var<uniform> screen: Screen;
+@group(1) @binding(0) var tex: texture_2d_array<f32>;
+@group(1) @binding(1) var samp: sampler;
+
+struct VsIn {
+    @location(0) pos: vec2<f32>,
+    @location(1) local: vec2<f32>,
+    @location(2) color: vec4<f32>,
+    @location(3) color2: vec4<f32>,
+    @location(4) uv: vec4<f32>,
+    @location(5) aux: vec4<f32>,
+};
+
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) local: vec2<f32>,
+    @location(1) color: vec4<f32>,
+    @location(2) color2: vec4<f32>,
+    @location(3) uv: vec4<f32>,
+    @location(4) aux: vec4<f32>,
+};
+
+@vertex
+fn vs_main(in: VsIn) -> VsOut {
+    var out: VsOut;
+    let ndc = vec2<f32>(in.pos.x / screen.size.x * 2.0 - 1.0, 1.0 - in.pos.y / screen.size.y * 2.0);
+    out.pos = vec4<f32>(ndc, 0.0, 1.0);
+    out.local = in.local;
+    out.color = in.color;
+    out.color2 = in.color2;
+    out.uv = in.uv;
+    out.aux = in.aux;
+    return out;
+}
+
+fn aa(sdf: f32) -> f32 {
+    return clamp(sdf / 0.75 + 0.5, 0.0, 1.0);
+}
+
+@fragment
+fn fs_body_layer(in: VsOut) -> @location(0) vec4<f32> {
+    let uv = in.uv.xy / screen.size;
+    let layer = i32(in.uv.w + 0.5);
+    let d = textureSampleLevel(tex, samp, uv, layer, 0.0).r * in.aux.y;
+    let r = in.aux.y;
+    let b = in.aux.z;
+
+    if (in.aux.w > 0.5) {
+        let position = clamp(1.0 - d / r, 0.0, 1.0);
+        let SHADOW = 0.078125;
+        let BORDER = 0.1875;
+        let px = 0.75 / r;
+        let ramp_a = 0.25 * clamp(position / SHADOW, 0.0, 1.0) * in.color2.a;
+        let shadow_col = vec4<f32>(0.0, 0.0, 0.0, ramp_a);
+        let w1 = smoothstep(SHADOW - px, SHADOW + px, position);
+        let t = clamp((position - BORDER) / (1.0 - BORDER), 0.0, 1.0);
+        let inner = vec3<f32>(in.local.x, in.local.y, in.uv.z);
+        let grad_col = vec4<f32>(mix(in.color.rgb, inner, t), in.color.a);
+        let w2 = smoothstep(BORDER - px, BORDER + px, position);
+        let col = mix(mix(shadow_col, in.color2, w1), grad_col, w2);
+        let aa_a = aa(r - d) * col.a;
+        return vec4<f32>(col.rgb * aa_a, aa_a);
+    }
+
+    let seam = clamp((d - (r - b)) / max(min(0.75, b), 1e-3) + 0.5, 0.0, 1.0);
+    let col = mix(in.color, in.color2, seam);
+    let alpha = aa(r - d) * col.a;
+    return vec4<f32>(col.rgb * alpha, alpha);
+}
+"#;
+
 /// RGB → YUV420 (BT.601 limited range) on the GPU. One Y invocation packs
 /// 4 horizontal luma bytes into one storage word; one chroma invocation
 /// packs a full storage word (or two for NV12), so no two invocations ever
@@ -274,6 +307,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 const YUV_SHADER: &str = r#"
 struct Params {
     size: vec2<u32>,
+    // Output plane dimensions (width rounded up to 8, height even).
+    padded: vec2<u32>,
 };
 @group(0) @binding(0) var<uniform> params: Params;
 @group(1) @binding(0) var tex: texture_2d<f32>;
@@ -290,11 +325,18 @@ fn chroma_uv(c: vec3<f32>) -> vec2<u32> {
     return vec2<u32>(u32(clamp(cb, 16.0, 240.0) + 0.5), u32(clamp(cr, 16.0, 240.0) + 0.5));
 }
 
-fn block_avg(x: u32, y: u32) -> vec3<f32> {
+fn load_rgb(x: u32, y: u32, w: u32, h: u32) -> vec3<f32> {
+    if (x >= w || y >= h) {
+        return vec3<f32>(0.0);
+    }
+    return textureLoad(tex, vec2<i32>(i32(x), i32(y)), 0).rgb;
+}
+
+fn block_avg(x: u32, y: u32, w: u32, h: u32) -> vec3<f32> {
     var sum = vec3<f32>(0.0, 0.0, 0.0);
     for (var dy = 0u; dy < 2u; dy = dy + 1u) {
         for (var dx = 0u; dx < 2u; dx = dx + 1u) {
-            sum = sum + textureLoad(tex, vec2<i32>(i32(x + dx), i32(y + dy)), 0).rgb;
+            sum = sum + load_rgb(x + dx, y + dy, w, h);
         }
     }
     return sum * 0.25;
@@ -304,15 +346,17 @@ fn block_avg(x: u32, y: u32) -> vec3<f32> {
 fn cs_y(@builtin(global_invocation_id) gid: vec3<u32>) {
     let w = params.size.x;
     let h = params.size.y;
+    let pw = params.padded.x;
+    let ph = params.padded.y;
     let x0 = gid.x * 4u;
     let y = gid.y;
-    if (x0 + 3u >= w || y >= h) { return; }
+    if (x0 >= pw || y >= ph) { return; }
     var word = 0u;
     for (var i = 0u; i < 4u; i = i + 1u) {
-        let c = textureLoad(tex, vec2<i32>(i32(x0 + i), i32(y)), 0).rgb;
+        let c = load_rgb(x0 + i, y, w, h);
         word = word | (luma_y(c) << (8u * i));
     }
-    out[y * (w / 4u) + gid.x] = word;
+    out[y * (pw / 4u) + gid.x] = word;
 }
 
 // NV12: UV pairs interleaved after the Y plane, one pair per 2x2 block.
@@ -320,19 +364,21 @@ fn cs_y(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn cs_uv_nv12(@builtin(global_invocation_id) gid: vec3<u32>) {
     let w = params.size.x;
     let h = params.size.y;
-    let cw = w / 2u;
-    let ch = h / 2u;
+    let pw = params.padded.x;
+    let ph = params.padded.y;
+    let cw = pw / 2u;
+    let ch = ph / 2u;
     let cx0 = gid.x * 4u;
     let cy = gid.y;
-    if (cx0 + 3u >= cw || cy >= ch) { return; }
+    if (cx0 >= cw || cy >= ch) { return; }
     var words = array<u32, 2>(0u, 0u);
     for (var i = 0u; i < 4u; i = i + 1u) {
-        let uv = chroma_uv(block_avg((cx0 + i) * 2u, cy * 2u));
+        let uv = chroma_uv(block_avg((cx0 + i) * 2u, cy * 2u, w, h));
         let j = i / 2u;
         let s = (i % 2u) * 16u;
         words[j] = words[j] | (uv.x << s) | (uv.y << (s + 8u));
     }
-    let base = (w * h + cy * w + cx0 * 2u) / 4u;
+    let base = (pw * ph + cy * pw + cx0 * 2u) / 4u;
     out[base] = words[0];
     out[base + 1u] = words[1];
 }
@@ -342,20 +388,22 @@ fn cs_uv_nv12(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn cs_uv_i420(@builtin(global_invocation_id) gid: vec3<u32>) {
     let w = params.size.x;
     let h = params.size.y;
-    let cw = w / 2u;
-    let ch = h / 2u;
+    let pw = params.padded.x;
+    let ph = params.padded.y;
+    let cw = pw / 2u;
+    let ch = ph / 2u;
     let cx0 = gid.x * 4u;
     let cy = gid.y;
-    if (cx0 + 3u >= cw || cy >= ch) { return; }
+    if (cx0 >= cw || cy >= ch) { return; }
     var wu = 0u;
     var wv = 0u;
     for (var i = 0u; i < 4u; i = i + 1u) {
-        let uv = chroma_uv(block_avg((cx0 + i) * 2u, cy * 2u));
+        let uv = chroma_uv(block_avg((cx0 + i) * 2u, cy * 2u, w, h));
         wu = wu | (uv.x << (8u * i));
         wv = wv | (uv.y << (8u * i));
     }
-    let u_base = (w * h + cy * cw + cx0) / 4u;
-    let v_base = (w * h + cw * ch + cy * cw + cx0) / 4u;
+    let u_base = (pw * ph + cy * cw + cx0) / 4u;
+    let v_base = (pw * ph + cw * ch + cy * cw + cx0) / 4u;
     out[u_base] = wu;
     out[v_base] = wv;
 }
@@ -369,13 +417,42 @@ struct YuvPass {
     tex_bind: wgpu::BindGroup,
     out_bind: wgpu::BindGroup,
     out_buf: wgpu::Buffer,
-    ring: Vec<wgpu::Buffer>,
-    ring_next: usize,
-    pending: std::collections::VecDeque<usize>,
-    /// Packed frame size in bytes (w*h*3/2); ring buffers are this size.
+    ring: Vec<Arc<wgpu::Buffer>>,
+    ring_free: std::collections::VecDeque<usize>,
+    pending: std::collections::VecDeque<(usize, wgpu::SubmissionIndex, bool)>,
+    /// Actual packed NV12/I420 bytes (w*h*3/2).
     bytes: u32,
+    /// Padded GPU buffer/copy size (padded_w*height*3/2).
+    padded_bytes: u32,
+    padded_width: u32,
     groups_y: (u32, u32),
     groups_uv: (u32, u32),
+}
+
+/// Which ring a readback frame belongs to. The writer thread returns the
+/// slot to the matching free list after unmapping.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReadbackKind {
+    Bgra,
+    Yuv,
+}
+
+/// One GPU frame handed to the writer thread. The writer maps the buffer,
+/// waits only for the submission that filled it, writes it to ffmpeg, then
+/// unmaps and returns the slot. No full-frame CPU staging copy.
+pub struct ReadbackFrame {
+    pub buffer: Arc<wgpu::Buffer>,
+    pub submission: wgpu::SubmissionIndex,
+    pub slot: usize,
+    pub kind: ReadbackKind,
+    pub width: u32,
+    pub height: u32,
+    /// BGRA row stride in bytes (0 for packed YUV).
+    pub stride: u32,
+    /// Bytes to write (BGRA: stride*height; YUV: w*h*3/2).
+    pub bytes: usize,
+    /// YUV only: true = NV12, false = I420.
+    pub interleaved: bool,
 }
 
 pub struct Renderer {
@@ -384,6 +461,11 @@ pub struct Renderer {
     queue: wgpu::Queue,
     pipeline_alpha: wgpu::RenderPipeline,
     pipeline_additive: wgpu::RenderPipeline,
+    body_pre_pipeline: wgpu::RenderPipeline,
+    body_layer_pipeline: wgpu::RenderPipeline,
+    body_layer_layout: wgpu::BindGroupLayout,
+    body_layer_sampler: wgpu::Sampler,
+    body_layers: Option<BodyLayerCache>,
     atlas_bind: wgpu::BindGroup,
     atlas_layout: wgpu::BindGroupLayout,
     atlas_sampler: wgpu::Sampler,
@@ -394,25 +476,25 @@ pub struct Renderer {
     /// Cached view of [`atlas_tex`]: storyboard composite render target.
     atlas_view: wgpu::TextureView,
     screen_bind: wgpu::BindGroup,
-    body_tex: wgpu::Texture,
-    body_bind: wgpu::BindGroup,
-    body_pre_pipeline: wgpu::RenderPipeline,
-    body_main_pipeline: wgpu::RenderPipeline,
-    /// Dedicated prepass buffers: the prepass commands must not see the
-    /// scene vertex data (all queue writes land before the encoder runs).
+    /// Dedicated prepass vertex/index buffers (must not alias the scene VBO).
     body_vbo: wgpu::Buffer,
     body_ibo: wgpu::Buffer,
     target: wgpu::Texture,
-    msaa: wgpu::Texture,
+    target_view: wgpu::TextureView,
     vbo: wgpu::Buffer,
     ibo: wgpu::Buffer,
     /// Ring of readback buffers: frames are submitted and copied into the
     /// next slot WITHOUT waiting; the oldest pending slot is mapped one or
     /// more frames later, so the GPU keeps a queue of work (no per-frame
     /// pipeline stall).
-    readback_ring: Vec<wgpu::Buffer>,
-    readback_next: usize,
-    readback_pending: std::collections::VecDeque<usize>,
+    readback_ring: Vec<Arc<wgpu::Buffer>>,
+    readback_free: std::collections::VecDeque<usize>,
+    readback_pending: std::collections::VecDeque<(usize, wgpu::SubmissionIndex)>,
+    /// Async export: every submitted frame is handed to the writer thread
+    /// immediately; `None` keeps the synchronous `read_oldest_into` path
+    /// (PNG / tests).
+    readback_tx: Option<SyncSender<ReadbackFrame>>,
+    readback_return: Option<Receiver<(ReadbackKind, usize)>>,
     /// Lazy GPU RGB→YUV420 conversion (see [`YuvPass`]); None until the
     /// first `render_deferred_yuv`.
     yuv: Option<YuvPass>,
@@ -421,11 +503,22 @@ pub struct Renderer {
     pub padded_row: u32,
 }
 
-fn sample_count() -> u32 {
-    // Android (Mali/Adreno/SwiftShader): MSAA costs 4× the fragment work and
-    // has driver-side resolve quirks that drop parts of the scene; the
-    // software renderer benefits even more from disabling it.
-    if cfg!(target_os = "android") || std::env::var("NO_MSAA").is_ok() { 1 } else { 4 }
+
+/// Compact slider-body prepass vertex: 28 bytes (the fat 80-byte scene
+/// Vertex wastes 60+ bytes per prepass corner).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PrepassVertex {
+    pos: [f32; 2],
+    start: [f32; 2],
+    end: [f32; 2],
+    radius: f32,
+}
+
+struct BodyLayerCache {
+    layers: u32,
+    layer_views: Vec<wgpu::TextureView>,
+    bind: wgpu::BindGroup,
 }
 
 pub fn block_on<F: std::future::Future>(fut: F) -> F::Output {
@@ -554,6 +647,18 @@ impl Renderer {
         height: u32,
         atlas: &Atlas,
     ) -> Renderer {
+        Self::from_adapter_with_readback(adapter, width, height, atlas, true)
+    }
+
+    /// `readback = false` skips the staging ring entirely (window/preview
+    /// hosts that present directly and never map pixels).
+    pub fn from_adapter_with_readback(
+        adapter: wgpu::Adapter,
+        width: u32,
+        height: u32,
+        atlas: &Atlas,
+        readback: bool,
+    ) -> Renderer {
         // The atlas may be packed past `Limits::default()`'s 8192 2D-texture
         // cap (see `probe_max_texture_dimension_2d`); requesting up to the
         // adapter's own limit is always supported.
@@ -597,7 +702,7 @@ impl Renderer {
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
-                    min_binding_size: NonZeroU64::new(8),
+                    min_binding_size: NonZeroU64::new(16),
                 },
                 count: None,
             }],
@@ -644,7 +749,7 @@ impl Renderer {
             ],
         };
 
-        let make_pipeline = |blend: wgpu::BlendState, sample_count: u32| {
+        let make_pipeline = |blend: wgpu::BlendState| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("scene pipeline"),
                 layout: Some(&pipeline_layout),
@@ -667,7 +772,7 @@ impl Renderer {
                 primitive: wgpu::PrimitiveState::default(),
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState {
-                    count: sample_count,
+                    count: 1,
                     mask: !0,
                     alpha_to_coverage_enabled: false,
                 },
@@ -705,71 +810,18 @@ impl Renderer {
             },
         };
 
-        let sc = sample_count();
-        let pipeline_alpha = make_pipeline(premult_alpha, sc);
-        let pipeline_additive = make_pipeline(premult_add, sc);
+        let pipeline_alpha = make_pipeline(premult_alpha);
+        let pipeline_additive = make_pipeline(premult_add);
 
-
-        // Atlas texture.
-        let tex_size = wgpu::Extent3d { width: atlas.width, height: atlas.height, depth_or_array_layers: 1 };
-        let atlas_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("atlas"),
-            size: tex_size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            // RENDER_ATTACHMENT:storyboard 合成层每帧直接渲进图集槽位
-            usage: wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_DST
-                | wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &atlas_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &atlas.rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(atlas.width * 4),
-                rows_per_image: Some(atlas.height),
-            },
-            tex_size,
-        );
-        let atlas_view = atlas_tex.create_view(&Default::default());
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("atlas sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-        let atlas_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &atlas_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&atlas_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
-            ],
-            label: Some("atlas bind"),
-        });
-
-        // Slider-body distance field: R16Float, min-blended capsule SDFs.
-        let body_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("body layout"),
+        let body_layer_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("body layer layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
                         multisampled: false,
                     },
                     count: None,
@@ -782,20 +834,42 @@ impl Renderer {
                 },
             ],
         });
-        let body_size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
-        let body_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("body distfield"),
-            size: body_size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R16Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
+        let body_layer_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("body layer shader"),
+            source: wgpu::ShaderSource::Wgsl(BODY_LAYER_SHADER.into()),
         });
-        let body_view = body_tex.create_view(&Default::default());
-        let body_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("body sampler"),
+        let body_layer_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("body layer pipeline"),
+            bind_group_layouts: &[&screen_layout, &body_layer_layout],
+            push_constant_ranges: &[],
+        });
+        let body_layer_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("body layer"),
+            layout: Some(&body_layer_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &body_layer_module,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[vertex_layout.clone()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &body_layer_module,
+                entry_point: Some("fs_body_layer"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Bgra8Unorm,
+                    blend: Some(premult_alpha),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        let body_layer_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("body layer sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -804,25 +878,7 @@ impl Renderer {
             mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
-        let body_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &body_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&body_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&body_sampler) },
-            ],
-            label: Some("body bind"),
-        });
 
-        let empty_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("empty layout"),
-            bind_group_layouts: &[],
-            push_constant_ranges: &[],
-        });
-        let body_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("body main layout"),
-            bind_group_layouts: &[&screen_layout, &body_layout],
-            push_constant_ranges: &[],
-        });
 
         let min_blend = wgpu::BlendState {
             color: wgpu::BlendComponent {
@@ -877,32 +933,6 @@ impl Renderer {
             multiview: None,
             cache: None,
         });
-        let body_main_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("body main"),
-            layout: Some(&body_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &module,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[vertex_layout.clone()],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &module,
-                entry_point: Some("fs_body_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Bgra8Unorm,
-                    blend: Some(premult_alpha),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState { count: sc, mask: !0, alpha_to_coverage_enabled: false },
-            multiview: None,
-            cache: None,
-        });
-
         let screen_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("screen uniform"),
             size: 16,
@@ -918,13 +948,63 @@ impl Renderer {
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                     buffer: &screen_buf,
                     offset: 0,
-                    size: Some(NonZeroU64::new(8).unwrap()),
+                    size: Some(NonZeroU64::new(16).unwrap()),
                 }),
             }],
             label: Some("screen bind"),
         });
 
-        // Offscreen target + MSAA texture.
+        // Offscreen scene target (also used by the YUV pass and PNG readback).
+        // Atlas texture.
+        let tex_size = wgpu::Extent3d { width: atlas.width, height: atlas.height, depth_or_array_layers: 1 };
+        let atlas_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("atlas"),
+            size: tex_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            // RENDER_ATTACHMENT:storyboard 合成层每帧直接渲进图集槽位
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &atlas_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &atlas.rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(atlas.width * 4),
+                rows_per_image: Some(atlas.height),
+            },
+            tex_size,
+        );
+        let atlas_view = atlas_tex.create_view(&Default::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("atlas sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let atlas_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &atlas_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&atlas_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ],
+            label: Some("atlas bind"),
+        });
+
         let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("target"),
@@ -936,16 +1016,8 @@ impl Renderer {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let msaa = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("msaa"),
-            size,
-            mip_level_count: 1,
-            sample_count: sc,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Bgra8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
+        let target_view = target.create_view(&Default::default());
+
 
         let vbo = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("vbo"),
@@ -959,6 +1031,7 @@ impl Renderer {
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+
         let body_vbo = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("body vbo"),
             // 16 MiB ÷ (4 verts × 28 B) ≈ 149k slider segments per frame;
@@ -979,46 +1052,51 @@ impl Renderer {
 
         // NO_READBACK(壁纸等无回读宿主):跳过 3×帧大小的 MAP_READ 暂存堆
         //(2560×1440 下约 44MB 提交内存,壁纸端从不回读,纯浪费)。
-        let readback_ring: Vec<wgpu::Buffer> = if std::env::var_os("NO_READBACK").is_some() {
-            Vec::new()
-        } else {
-            (0..3)
-                .map(|i| {
-                    device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some(&format!("readback {i}")),
-                        size: (padded_row * height) as u64,
-                        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
+        let readback_ring: Vec<Arc<wgpu::Buffer>> =
+            if !readback || std::env::var_os("NO_READBACK").is_some() {
+                Vec::new()
+            } else {
+                (0..3)
+                    .map(|i| {
+                        Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some(&format!("readback {i}")),
+                            size: (padded_row * height) as u64,
+                            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        }))
                     })
-                })
-                .collect()
-        };
+                    .collect()
+            };
+        let readback_free = (0..readback_ring.len()).collect();
 
         Renderer {
             adapter,
             device,
             queue,
-            body_tex,
-            body_bind,
-            body_pre_pipeline,
-            body_main_pipeline,
-            body_vbo,
-            body_ibo,
             pipeline_alpha,
             pipeline_additive,
+            body_pre_pipeline,
+            body_layer_pipeline,
+            body_layer_layout,
+            body_layer_sampler,
+            body_layers: None,
             atlas_bind,
             atlas_layout,
             atlas_sampler: sampler,
             atlas_tex,
             atlas_view,
             screen_bind,
+            body_vbo,
+            body_ibo,
             target,
-            msaa,
+            target_view,
             vbo,
             ibo,
             readback_ring,
-            readback_next: 0,
+            readback_free,
             readback_pending: std::collections::VecDeque::new(),
+            readback_tx: None,
+            readback_return: None,
             yuv: None,
             width,
             height,
@@ -1037,18 +1115,346 @@ impl Renderer {
         out
     }
 
-    /// Builds the full scene command encoder (slider-body prepasses +
-    /// composites + scene runs + MSAA resolve).
-    pub fn encode_scene(&mut self, list: &DrawList, clear: [f64; 4]) -> wgpu::CommandEncoder {
-        let vbytes = list.vertices.len() * std::mem::size_of::<Vertex>();
-        let ibytes = list.indices.len() * 4;
-        // 场景顶点/索引缓冲按需增长(替代旧的 assert 崩溃)。常规谱面
-        // 远用不满初始 4/8 MiB;会爆的是 Aspire 类坏图 —— Flashbacklog [V]
-        // 带离屏 4 万像素级的物件,引导点(follow points)沿物件连接
-        // 每 32px 一个、数量无上限,单帧涌入 ~2 万 quad,旧实现直接
-        // panic、壁纸进程整体消失。扩容按 next_power_of_two,仅在新
-        // 需求超出当前容量时发生(普通曲目零开销);不做缩容 —— 换图
-        // 后偶发的小帧不值得释放重分配。COPY_SRC 保留给回读路径。
+
+    /// One color pass. Slider bodies are capsules, not a distance-field
+    /// prepass, so a phone GPU never reloads a half-drawn frame.
+    fn encode_scene_only_into(
+        &mut self,
+        list: &DrawList,
+        clear: [f64; 4],
+        target_view: &wgpu::TextureView,
+    ) -> wgpu::CommandEncoder {
+        self.ensure_mesh(list.vertices.len(), list.indices.len());
+        self.queue.write_buffer(&self.vbo, 0, cast_slice(&list.vertices));
+        self.queue.write_buffer(&self.ibo, 0, cast_slice(&list.indices));
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("frame encoder"),
+        });
+        let clear_color = wgpu::Color { r: clear[0], g: clear[1], b: clear[2], a: clear[3] };
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("scene pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(clear_color),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_bind_group(0, &self.screen_bind, &[]);
+        pass.set_bind_group(1, &self.atlas_bind, &[]);
+        pass.set_vertex_buffer(0, self.vbo.slice(..));
+        pass.set_index_buffer(self.ibo.slice(..), wgpu::IndexFormat::Uint32);
+        for (blend, offset, count) in &list.runs {
+            let pipeline = match blend {
+                Blend::Alpha => &self.pipeline_alpha,
+                Blend::Additive => &self.pipeline_additive,
+            };
+            pass.set_pipeline(pipeline);
+            pass.draw_indexed(*offset..(*offset + *count), 0, 0..1);
+        }
+        drop(pass);
+        encoder
+    }
+
+    /// Slider bodies: one SDF prepass per body into its own R16Float layer,
+    /// then a single scene pass compositing them in draw order. No MSAA and
+    /// no full-screen color pass per body.
+    fn encode_bodies_into(
+        &mut self,
+        list: &DrawList,
+        clear: [f64; 4],
+        target_view: &wgpu::TextureView,
+    ) -> wgpu::CommandEncoder {
+        if list.bodies.is_empty() {
+            return self.encode_scene_only_into(list, clear, target_view);
+        }
+        let mut body_quads: Vec<Vertex> = Vec::new();
+        let mut body_indices: Vec<u32> = Vec::new();
+        let mut prepass_verts: Vec<PrepassVertex> = Vec::new();
+        let mut prepass_indices: Vec<u32> = Vec::new();
+        let mut prepass_ranges: Vec<(u32, u32)> = Vec::new();
+        for (layer, body) in list.bodies.iter().enumerate() {
+            let pad = body.radius + 1.5;
+            let mut minx = f32::MAX;
+            let mut miny = f32::MAX;
+            let mut maxx = f32::MIN;
+            let mut maxy = f32::MIN;
+            let start = prepass_indices.len() as u32;
+            for (a, b) in &body.segments {
+                minx = minx.min(a[0] - pad).min(b[0] - pad);
+                miny = miny.min(a[1] - pad).min(b[1] - pad);
+                maxx = maxx.max(a[0] + pad).max(b[0] + pad);
+                maxy = maxy.max(a[1] + pad).max(b[1] + pad);
+                let base = prepass_verts.len() as u32;
+                for corner in [
+                    [a[0].min(b[0]) - pad, a[1].min(b[1]) - pad],
+                    [a[0].max(b[0]) + pad, a[1].min(b[1]) - pad],
+                    [a[0].max(b[0]) + pad, a[1].max(b[1]) + pad],
+                    [a[0].min(b[0]) - pad, a[1].max(b[1]) + pad],
+                ] {
+                    prepass_verts.push(PrepassVertex {
+                        pos: corner,
+                        start: [a[0], a[1]],
+                        end: [b[0], b[1]],
+                        radius: body.radius,
+                    });
+                }
+                prepass_indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            }
+            prepass_ranges.push((start, prepass_indices.len() as u32));
+
+            let base = body_quads.len() as u32;
+            let inner = body.inner_colour;
+            for corner in [[minx, miny], [maxx, miny], [maxx, maxy], [minx, maxy]] {
+                body_quads.push(Vertex {
+                    pos: corner,
+                    local: match inner {
+                        Some(c) => [c.r, c.g],
+                        None => [0.0; 2],
+                    },
+                    color: [body.body.r, body.body.g, body.body.b, body.body.a],
+                    color2: [body.border_colour.r, body.border_colour.g, body.border_colour.b, body.border_colour.a],
+                    uv: [corner[0], corner[1], inner.map(|c| c.b).unwrap_or(0.0), layer as f32],
+                    aux: [crate::draw::MODE_CAPSULE, body.radius, body.border, if inner.is_some() { 1.0 } else { 0.0 }],
+                });
+            }
+            body_indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+
+        let pre_vbytes = prepass_verts.len() * std::mem::size_of::<PrepassVertex>();
+        let pre_ibytes = prepass_indices.len() * 4;
+        if pre_vbytes as u64 > self.body_vbo.size() {
+            self.body_vbo = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("body vbo(grown)"),
+                size: (pre_vbytes as u64).next_power_of_two(),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if pre_ibytes as u64 > self.body_ibo.size() {
+            self.body_ibo = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("body ibo(grown)"),
+                size: (pre_ibytes as u64).next_power_of_two(),
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+
+        let mut all_verts = body_quads;
+        let mut all_idx = body_indices;
+        let scene_base = all_verts.len() as u32;
+        all_verts.extend_from_slice(&list.vertices);
+        for i in &list.indices {
+            all_idx.push(*i + scene_base);
+        }
+        self.ensure_mesh(all_verts.len(), all_idx.len());
+        self.queue.write_buffer(&self.body_vbo, 0, cast_slice(&prepass_verts));
+        self.queue.write_buffer(&self.body_ibo, 0, cast_slice(&prepass_indices));
+        self.queue.write_buffer(&self.vbo, 0, cast_slice(&all_verts));
+        self.queue.write_buffer(&self.ibo, 0, cast_slice(&all_idx));
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("frame encoder"),
+        });
+        let clear_color = wgpu::Color { r: clear[0], g: clear[1], b: clear[2], a: clear[3] };
+        self.draw_bodies_one_pass(&mut encoder, list, &prepass_ranges, target_view, clear_color);
+        encoder
+    }
+
+    fn ensure_body_layers(&mut self, needed: u32) {
+        if needed == 0 {
+            return;
+        }
+        if self
+            .body_layers
+            .as_ref()
+            .is_some_and(|cache| cache.layers >= needed)
+        {
+            return;
+        }
+        let layers = needed.next_power_of_two().max(4);
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("body distfield layers"),
+            size: wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: layers,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let sample_view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("body distfield array"),
+            format: None,
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            usage: None,
+            aspect: wgpu::TextureAspect::All,
+            base_mip_level: 0,
+            mip_level_count: None,
+            base_array_layer: 0,
+            array_layer_count: Some(layers),
+        });
+        let layer_views = (0..layers)
+            .map(|layer| {
+                texture.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("body distfield layer"),
+                    format: None,
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    usage: None,
+                    aspect: wgpu::TextureAspect::All,
+                    base_mip_level: 0,
+                    mip_level_count: None,
+                    base_array_layer: layer,
+                    array_layer_count: Some(1),
+                })
+            })
+            .collect();
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("body layer bind"),
+            layout: &self.body_layer_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&sample_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.body_layer_sampler),
+                },
+            ],
+        });
+        self.body_layers = Some(BodyLayerCache {
+            layers,
+            layer_views,
+            bind,
+        });
+    }
+
+    /// Prepass every slider into its own distance-field layer, then draw
+    /// notes and slider quads in a single color pass.
+    fn draw_bodies_one_pass(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        list: &DrawList,
+        prepass_ranges: &[(u32, u32)],
+        target_view: &wgpu::TextureView,
+        clear_color: wgpu::Color,
+    ) {
+        self.ensure_body_layers(list.bodies.len() as u32);
+        let cache = self.body_layers.as_ref().expect("body layers");
+        for (index, &(start, end)) in prepass_ranges.iter().enumerate() {
+            let mut pre = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("body prepass layer"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &cache.layer_views[index],
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 256.0,
+                            g: 256.0,
+                            b: 256.0,
+                            a: 256.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            if start < end {
+                pre.set_pipeline(&self.body_pre_pipeline);
+                pre.set_bind_group(0, &self.screen_bind, &[]);
+                pre.set_vertex_buffer(0, self.body_vbo.slice(..));
+                pre.set_index_buffer(self.body_ibo.slice(..), wgpu::IndexFormat::Uint32);
+                pre.draw_indexed(start..end, 0, 0..1);
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        enum Op {
+            Run(crate::draw::Blend, u32, u32),
+            Body(usize),
+        }
+        let mut ops: Vec<Op> = Vec::new();
+        let marks = &list.body_marks;
+        let mut mi = 0usize;
+        for &(blend, off, cnt) in &list.runs {
+            let mut start = off;
+            while mi < marks.len() && marks[mi].0 <= off {
+                ops.push(Op::Body(marks[mi].1));
+                mi += 1;
+            }
+            while mi < marks.len() && marks[mi].0 < off + cnt {
+                let (key, bi) = marks[mi];
+                if key > start {
+                    ops.push(Op::Run(blend, start, key - start));
+                }
+                ops.push(Op::Body(bi));
+                start = key;
+                mi += 1;
+            }
+            if start < off + cnt {
+                ops.push(Op::Run(blend, start, off + cnt - start));
+            }
+        }
+        while mi < marks.len() {
+            ops.push(Op::Body(marks[mi].1));
+            mi += 1;
+        }
+
+        let base = (list.bodies.len() * 6) as u32;
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("scene one pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(clear_color),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_bind_group(0, &self.screen_bind, &[]);
+        pass.set_vertex_buffer(0, self.vbo.slice(..));
+        pass.set_index_buffer(self.ibo.slice(..), wgpu::IndexFormat::Uint32);
+        for op in ops {
+            match op {
+                Op::Run(blend, off, cnt) => {
+                    let pipeline = match blend {
+                        crate::draw::Blend::Alpha => &self.pipeline_alpha,
+                        crate::draw::Blend::Additive => &self.pipeline_additive,
+                    };
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(1, &self.atlas_bind, &[]);
+                    let o = off + base;
+                    pass.draw_indexed(o..(o + cnt), 0, 0..1);
+                }
+                Op::Body(bi) => {
+                    pass.set_pipeline(&self.body_layer_pipeline);
+                    pass.set_bind_group(1, &cache.bind, &[]);
+                    let o = (bi * 6) as u32;
+                    pass.draw_indexed(o..(o + 6), 0, 0..1);
+                }
+            }
+        }
+    }
+
+    fn ensure_mesh(&mut self, vert_count: usize, index_count: usize) {
+        let vbytes = vert_count * std::mem::size_of::<Vertex>();
+        let ibytes = index_count * 4;
         if vbytes as u64 > self.vbo.size() {
             self.vbo = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("vbo(grown)"),
@@ -1069,331 +1475,24 @@ impl Renderer {
                 mapped_at_creation: false,
             });
         }
+    }
 
-        let use_msaa = sample_count() > 1;
+    /// Builds the full scene command encoder (offscreen target).
+    pub fn encode_scene(&mut self, list: &DrawList, clear: [f64; 4]) -> wgpu::CommandEncoder {
+        let target_view = self.target_view.clone();
+        self.encode_bodies_into(list, clear, &target_view)
+    }
 
-        // ---- Slider bodies (lazer PathDrawNode style) --------------------
-        // Per body: pass A min-blends that body's capsule-segment SDFs into
-        // an R16Float field (cleared far beyond 1.0 so pixels covered by no
-        // segment quad - e.g. corners of the body's AABB - stay transparent
-        // instead of reading as the capsule edge). Pass B composites one quad
-        // sampling the field (border band at the rim, body fill inside,
-        // analytic AA), drawn under all scene elements. Each body gets its
-        // own field pass so overlapping bodies never share distance values.
-        let mut body_quads: Vec<Vertex> = Vec::new();
-        let mut body_indices: Vec<u32> = Vec::new();
-        let mut prepass_verts: Vec<PrepassVertex> = Vec::new();
-        let mut prepass_indices: Vec<u32> = Vec::new();
-        // Index range of each body's segments inside the prepass buffers.
-        let mut prepass_ranges: Vec<(u32, u32)> = Vec::new();
-        for body in &list.bodies {
-            let pad = body.radius + 1.5;
-            let mut minx = f32::MAX;
-            let mut miny = f32::MAX;
-            let mut maxx = f32::MIN;
-            let mut maxy = f32::MIN;
-            let start = prepass_indices.len() as u32;
-            for (a, b) in &body.segments {
-                minx = minx.min(a[0] - pad).min(b[0] - pad);
-                miny = miny.min(a[1] - pad).min(b[1] - pad);
-                maxx = maxx.max(a[0] + pad).max(b[0] + pad);
-                maxy = maxy.max(a[1] + pad).max(b[1] + pad);
-
-                let base = prepass_verts.len() as u32;
-                for corner in [
-                    [a[0].min(b[0]) - pad, a[1].min(b[1]) - pad],
-                    [a[0].max(b[0]) + pad, a[1].min(b[1]) - pad],
-                    [a[0].max(b[0]) + pad, a[1].max(b[1]) + pad],
-                    [a[0].min(b[0]) - pad, a[1].max(b[1]) + pad],
-                ] {
-                    prepass_verts.push(PrepassVertex {
-                        pos: corner,
-                        start: [a[0], a[1]],
-                        end: [b[0], b[1]],
-                        radius: body.radius,
-                    });
-                }
-                prepass_indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-            }
-            prepass_ranges.push((start, prepass_indices.len() as u32));
-
-            let base = body_quads.len() as u32;
-            // Legacy gradient bodies smuggle the inner colour through the
-            // idle channels: local.xy + uv.z (uv.w stays unused).
-            let inner = body.inner_colour;
-            for corner in [[minx, miny], [maxx, miny], [maxx, maxy], [minx, maxy]] {
-                body_quads.push(Vertex {
-                    pos: corner,
-                    local: match inner {
-                        Some(c) => [c.r, c.g],
-                        None => [0.0; 2],
-                    },
-                    color: [body.body.r, body.body.g, body.body.b, body.body.a],
-                    color2: [body.border_colour.r, body.border_colour.g, body.border_colour.b, body.border_colour.a],
-                    uv: [corner[0], corner[1], inner.map(|c| c.b).unwrap_or(0.0), 0.0],
-                    aux: [crate::draw::MODE_CAPSULE, body.radius, body.border, if inner.is_some() { 1.0 } else { 0.0 }],
-                });
-            }
-            body_indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-        }
-        let pre_vbytes = prepass_verts.len() * std::mem::size_of::<Vertex>();
-        let pre_ibytes = prepass_indices.len() * 4;
-        // 滑条预通道缓冲同样按需增长(见上方主 vbo/ibo 的注释;
-        // 初始 16/8 MiB ≈ 149k 段,坏图/超密滑条组超出时扩容而非崩溃)。
-        if pre_vbytes as u64 > self.body_vbo.size() {
-            self.body_vbo = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("body vbo(grown)"),
-                size: (pre_vbytes as u64).next_power_of_two(),
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        }
-        if pre_ibytes as u64 > self.body_ibo.size() {
-            self.body_ibo = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("body ibo(grown)"),
-                size: (pre_ibytes as u64).next_power_of_two(),
-                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        }
-
-        // ---- Scene geometry (body composites prepended) ------------------
-        let mut all_verts = body_quads.clone();
-        let mut all_idx = body_indices.clone();
-        all_verts.extend_from_slice(&list.vertices);
-        for i in &list.indices {
-            all_idx.push(*i + body_quads.len() as u32);
-        }
-        self.queue.write_buffer(&self.body_vbo, 0, cast_slice(&prepass_verts));
-        self.queue.write_buffer(&self.body_ibo, 0, cast_slice(&prepass_indices));
-        self.queue.write_buffer(&self.vbo, 0, cast_slice(&all_verts));
-        self.queue.write_buffer(&self.ibo, 0, cast_slice(&all_idx));
-
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("frame encoder"),
-        });
-
-        let target_view = self.target.create_view(&Default::default());
-        let msaa_view = self.msaa.create_view(&Default::default());
-        let clear_color = wgpu::Color { r: clear[0], g: clear[1], b: clear[2], a: clear[3] };
-
-        let has_bodies = !list.bodies.is_empty();
-        let body_view = self.body_tex.create_view(&Default::default());
-        if has_bodies {
-            // Clear the scene target first; the passes below must load.
-            drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("clear pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: if use_msaa { &msaa_view } else { &target_view },
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            }));
-
-            // Interleave scene runs and body composites in draw order: each
-            // body's composite lands where its slider sits in the object
-            // ordering (lazer layers whole sliders by start time, so an
-            // earlier slider's body covers later objects). Body marks split
-            // any run that spans them.
-            #[derive(Clone, Copy)]
-            enum Op {
-                Run(Blend, u32, u32),
-                Body(usize),
-            }
-            let marks = &list.body_marks;
-            let mut ops: Vec<Op> = Vec::new();
-            let mut mi = 0usize;
-            for &(blend, off, cnt) in &list.runs {
-                let mut start = off;
-                while mi < marks.len() && marks[mi].0 <= off {
-                    ops.push(Op::Body(marks[mi].1));
-                    mi += 1;
-                }
-                while mi < marks.len() && marks[mi].0 < off + cnt {
-                    let (key, bi) = marks[mi];
-                    if key > start {
-                        ops.push(Op::Run(blend, start, key - start));
-                    }
-                    ops.push(Op::Body(bi));
-                    start = key;
-                    mi += 1;
-                }
-                if start < off + cnt {
-                    ops.push(Op::Run(blend, start, off + cnt - start));
-                }
-            }
-            while mi < marks.len() {
-                ops.push(Op::Body(marks[mi].1));
-                mi += 1;
-            }
-
-            // Group consecutive runs so each render pass is opened and
-            // dropped within one statement (wgpu pass borrows the encoder).
-            enum Seg {
-                Runs(Vec<(Blend, u32, u32)>),
-                Body(usize),
-            }
-            let mut segs: Vec<Seg> = Vec::new();
-            for op in ops {
-                match op {
-                    Op::Run(blend, off, cnt) => match segs.last_mut() {
-                        Some(Seg::Runs(runs)) => runs.push((blend, off, cnt)),
-                        _ => segs.push(Seg::Runs(vec![(blend, off, cnt)])),
-                    },
-                    Op::Body(bi) => segs.push(Seg::Body(bi)),
-                }
-            }
-
-            let base = body_indices.len() as u32;
-            for seg in &segs {
-                match seg {
-                    Seg::Runs(runs) => {
-                        let mut p = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("scene segment"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: if use_msaa { &msaa_view } else { &target_view },
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Load,
-                                    store: wgpu::StoreOp::Store,
-                                },
-                            })],
-                            depth_stencil_attachment: None,
-                            timestamp_writes: None,
-                            occlusion_query_set: None,
-                        });
-                        p.set_bind_group(0, &self.screen_bind, &[]);
-                        p.set_bind_group(1, &self.atlas_bind, &[]);
-                        p.set_vertex_buffer(0, self.vbo.slice(..));
-                        p.set_index_buffer(self.ibo.slice(..), wgpu::IndexFormat::Uint32);
-                        for &(blend, off, cnt) in runs {
-                            let pipeline = match blend {
-                                Blend::Alpha => &self.pipeline_alpha,
-                                Blend::Additive => &self.pipeline_additive,
-                            };
-                            p.set_pipeline(pipeline);
-                            let o = off + base;
-                            p.draw_indexed(o..(o + cnt), 0, 0..1);
-                        }
-                    }
-                    Seg::Body(bi) => {
-                        let (start, end) = prepass_ranges[*bi];
-                        // Pass A: this body's segment SDFs, min-blended.
-                        {
-                            let mut pre = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: Some("body prepass"),
-                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view: &body_view,
-                                    resolve_target: None,
-                                    ops: wgpu::Operations {
-                                        // Far above any real d/r (<= ~1.02
-                                        // inside the segment quads): uncovered
-                                        // pixels composite to zero alpha.
-                                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                                            r: 256.0,
-                                            g: 256.0,
-                                            b: 256.0,
-                                            a: 256.0,
-                                        }),
-                                        store: wgpu::StoreOp::Store,
-                                    },
-                                })],
-                                depth_stencil_attachment: None,
-                                timestamp_writes: None,
-                                occlusion_query_set: None,
-                            });
-                            pre.set_pipeline(&self.body_pre_pipeline);
-                            pre.set_bind_group(0, &self.screen_bind, &[]);
-                            pre.set_vertex_buffer(0, self.body_vbo.slice(..));
-                            pre.set_index_buffer(self.body_ibo.slice(..), wgpu::IndexFormat::Uint32);
-                            pre.draw_indexed(start..end, 0, 0..1);
-                        }
-                        // Pass B: composite this body over the scene.
-                        {
-                            let mut comp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: Some("body composite"),
-                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view: if use_msaa { &msaa_view } else { &target_view },
-                                    resolve_target: None,
-                                    ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::Load,
-                                        store: wgpu::StoreOp::Store,
-                                    },
-                                })],
-                                depth_stencil_attachment: None,
-                                timestamp_writes: None,
-                                occlusion_query_set: None,
-                            });
-                            comp.set_pipeline(&self.body_main_pipeline);
-                            comp.set_bind_group(0, &self.screen_bind, &[]);
-                            comp.set_bind_group(1, &self.body_bind, &[]);
-                            comp.set_vertex_buffer(0, self.vbo.slice(..));
-                            comp.set_index_buffer(self.ibo.slice(..), wgpu::IndexFormat::Uint32);
-                            comp.draw_indexed((*bi * 6) as u32..(*bi * 6 + 6) as u32, 0, 0..1);
-                        }
-                    }
-                }
-            }
-
-            if use_msaa {
-                // Resolve the accumulated multisampled frame into the target.
-                drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("resolve pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &msaa_view,
-                        resolve_target: Some(&target_view),
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                }));
-            }
-        }
-
-        if !has_bodies {
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("scene pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: if use_msaa { &msaa_view } else { &target_view },
-                    resolve_target: if use_msaa { Some(&target_view) } else { None },
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-
-            rpass.set_bind_group(0, &self.screen_bind, &[]);
-            rpass.set_vertex_buffer(0, self.vbo.slice(..));
-            rpass.set_index_buffer(self.ibo.slice(..), wgpu::IndexFormat::Uint32);
-
-            rpass.set_bind_group(1, &self.atlas_bind, &[]);
-
-            for (blend, offset, count) in &list.runs {
-                let pipeline = match blend {
-                    Blend::Alpha => &self.pipeline_alpha,
-                    Blend::Additive => &self.pipeline_additive,
-                };
-                rpass.set_pipeline(pipeline);
-                let off = offset + body_indices.len() as u32;
-                rpass.draw_indexed(off..(off + *count), 0, 0..1);
-            }
-        }
-
-        encoder
+    /// Builds the scene into a caller-provided view (window presentation can
+    /// render straight into the swapchain, skipping the offscreen target and
+    /// the full-screen blit).
+    pub fn encode_scene_into(
+        &mut self,
+        list: &DrawList,
+        clear: [f64; 4],
+        view: &wgpu::TextureView,
+    ) -> wgpu::CommandEncoder {
+        self.encode_bodies_into(list, clear, view)
     }
 
     /// Renders one frame and SUBMITS it without waiting for the GPU; the
@@ -1404,23 +1503,84 @@ impl Renderer {
         self.submit_frame_with(encoder);
     }
 
-    /// Number of submitted-but-not-yet-read frames.
+    /// Number of submitted-but-not-yet-read frames (synchronous path).
     pub fn pending_len(&self) -> usize {
         self.readback_pending.len()
     }
 
+    /// Submit one frame without any readback copy (benchmark/diagnostic).
+    pub fn render_submit_only(&mut self, list: &DrawList, clear: [f64; 4]) {
+        let encoder = self.encode_scene(list, clear);
+        self.queue.submit(Some(encoder.finish()));
+    }
+
+    /// Free the BGRA staging ring when the caller only uses the YUV path.
+    /// No-op if a synchronous BGRA read is still pending.
+    pub fn release_bgra_readback(&mut self) {
+        if self.readback_pending.is_empty() {
+            self.readback_ring.clear();
+            self.readback_free.clear();
+        }
+    }
+
+    /// Block until all submitted GPU work finishes (benchmark/diagnostic).
+    pub fn wait_idle(&self) {
+        let _ = self.device.poll(wgpu::PollType::Wait);
+    }
+
+    /// Hand every submitted frame straight to the writer thread. The writer
+    /// maps it, waits for its own submission, writes to ffmpeg, then returns
+    /// the slot. The render thread never maps or copies a frame.
+    pub fn enable_async_readback(
+        &mut self,
+        tx: SyncSender<ReadbackFrame>,
+        ret: Receiver<(ReadbackKind, usize)>,
+    ) {
+        self.readback_tx = Some(tx);
+        self.readback_return = Some(ret);
+    }
+
+    /// Drop the render-thread sender so the writer sees EOF after draining.
+    pub fn disable_async_readback(&mut self) {
+        self.readback_tx = None;
+    }
+
+    fn acquire_slot(&mut self, kind: ReadbackKind) -> usize {
+        loop {
+            let free = match kind {
+                ReadbackKind::Bgra => self.readback_free.pop_front(),
+                ReadbackKind::Yuv => self.yuv.as_mut().and_then(|y| y.ring_free.pop_front()),
+            };
+            if let Some(slot) = free {
+                return slot;
+            }
+            let Some(rx) = self.readback_return.as_ref() else {
+                panic!("readback ring exhausted (no async writer to return slots)");
+            };
+            let (returned_kind, slot) = rx.recv().expect("readback writer exited");
+            match returned_kind {
+                ReadbackKind::Bgra => self.readback_free.push_back(slot),
+                ReadbackKind::Yuv => self
+                    .yuv
+                    .as_mut()
+                    .expect("yuv ring")
+                    .ring_free
+                    .push_back(slot),
+            }
+        }
+    }
+
     fn submit_frame_with(&mut self, mut encoder: wgpu::CommandEncoder) {
-        // 无回读配置(NO_READBACK):跳过 texture→buffer 拷贝直接提交
+        // 无回读配置(NO_READBACK / window preview):submit only.
         if self.readback_ring.is_empty() {
             self.queue.submit(Some(encoder.finish()));
             return;
         }
-        let slot = self.readback_next;
-        self.readback_next = (self.readback_next + 1) % self.readback_ring.len();
+        let slot = self.acquire_slot(ReadbackKind::Bgra);
         encoder.copy_texture_to_buffer(
             self.target.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
-                buffer: &self.readback_ring[slot],
+                buffer: self.readback_ring[slot].as_ref(),
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(self.padded_row),
@@ -1429,37 +1589,51 @@ impl Renderer {
             },
             wgpu::Extent3d { width: self.width, height: self.height, depth_or_array_layers: 1 },
         );
-        self.queue.submit(Some(encoder.finish()));
-        self.readback_pending.push_back(slot);
+        let idx = self.queue.submit(Some(encoder.finish()));
+        if let Some(tx) = &self.readback_tx {
+            let frame = ReadbackFrame {
+                buffer: Arc::clone(&self.readback_ring[slot]),
+                submission: idx,
+                slot,
+                kind: ReadbackKind::Bgra,
+                width: self.width,
+                height: self.height,
+                stride: self.padded_row,
+                bytes: self.padded_row as usize * self.height as usize,
+                interleaved: true,
+            };
+            tx.send(frame).expect("readback writer exited");
+        } else {
+            self.readback_pending.push_back((slot, idx));
+        }
     }
 
-    /// Maps the OLDEST pending frame and copies it into `out` (reused
-    /// between frames to avoid a per-frame allocation). With a frame or two
-    /// of GPU work already queued this returns almost immediately; the GPU
-    /// never starves while the CPU builds the next frame.
+    /// Maps the OLDEST pending frame and copies it into `out` (synchronous
+    /// PNG/test path). Waits only for the submission that wrote this slot.
     pub fn read_oldest_into(&mut self, out: &mut Vec<u8>) {
-        let slot = self
+        let (slot, idx) = self
             .readback_pending
             .pop_front()
             .expect("read_oldest with empty pipeline");
-        let buffer = &self.readback_ring[slot];
+        let buffer = Arc::clone(&self.readback_ring[slot]);
         let slice = buffer.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
-        self.device.poll(wgpu::PollType::Wait);
+        let _ = self.device.poll(wgpu::PollType::WaitForSubmissionIndex(idx));
         let data = slice.get_mapped_range();
         out.clear();
         out.extend_from_slice(&data);
         drop(data);
         buffer.unmap();
+        self.readback_free.push_back(slot);
     }
 
     // ---- GPU YUV420 output (BGRA scene target → NV12/I420 buffer) ----
 
-    /// Whether the GPU conversion supports this renderer's dimensions
-    /// (width % 8 == 0, height % 2 == 0; every plane row must be
-    /// word-aligned). Callers fall back to a CPU conversion otherwise.
+    /// Whether the GPU conversion supports this renderer's dimensions.
+    /// NV12/I420 need an even width/height; widths not divisible by 8 are
+    /// padded in the compute pass and compacted row-wise on the way out.
     pub fn yuv_ready(&self) -> bool {
-        self.width % 8 == 0 && self.height % 2 == 0
+        self.width >= 2 && self.height >= 2 && self.width % 2 == 0 && self.height % 2 == 0
     }
 
     /// Packed NV12/I420 frame size: `w * h * 3 / 2` bytes.
@@ -1468,8 +1642,10 @@ impl Renderer {
     }
 
     fn init_yuv(&mut self) {
-        assert!(self.yuv_ready(), "GPU YUV path requires width % 8 == 0 and even height");
+        assert!(self.yuv_ready(), "GPU YUV path requires even width/height");
         let (width, height) = (self.width, self.height);
+        let padded_width = (width + 7) / 8 * 8;
+        let padded_height = height;
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("yuv shader"),
             source: wgpu::ShaderSource::Wgsl(YUV_SHADER.into()),
@@ -1483,7 +1659,7 @@ impl Renderer {
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
-                    min_binding_size: NonZeroU64::new(8),
+                    min_binding_size: NonZeroU64::new(16),
                 },
                 count: None,
             }],
@@ -1536,11 +1712,15 @@ impl Renderer {
 
         let params_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("yuv params"),
-            size: 8,
+            size: 16,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        self.queue.write_buffer(&params_buf, 0, cast_slice(&[width, height]));
+        self.queue.write_buffer(
+            &params_buf,
+            0,
+            cast_slice(&[width, height, padded_width, padded_height]),
+        );
         let params_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &params_layout,
             entries: &[wgpu::BindGroupEntry {
@@ -1548,7 +1728,7 @@ impl Renderer {
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                     buffer: &params_buf,
                     offset: 0,
-                    size: Some(NonZeroU64::new(8).unwrap()),
+                    size: Some(NonZeroU64::new(16).unwrap()),
                 }),
             }],
             label: Some("yuv params bind"),
@@ -1564,12 +1744,13 @@ impl Renderer {
             label: Some("yuv tex bind"),
         });
 
-        // w*h*3/2 is a multiple of 4 for any %8/%2 dimensions (copy size
-        // requirement); round up anyway so odd cases still validate.
-        let bytes = ((self.yuv_frame_bytes() + 3) / 4 * 4) as u32;
+        // GPU layout uses the padded width; the writer compacts each row to
+        // the real width before handing it to ffmpeg.
+        let bytes = self.yuv_frame_bytes() as u32;
+        let padded_bytes = ((padded_width as usize * padded_height as usize * 3) / 2) as u32;
         let out_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("yuv out"),
-            size: bytes as u64,
+            size: padded_bytes as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
@@ -1585,16 +1766,17 @@ impl Renderer {
             }],
             label: Some("yuv out bind"),
         });
-        let ring: Vec<wgpu::Buffer> = (0..3)
+        let ring: Vec<Arc<wgpu::Buffer>> = (0..3)
             .map(|i| {
-                self.device.create_buffer(&wgpu::BufferDescriptor {
+                Arc::new(self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(&format!("yuv readback {i}")),
-                    size: bytes as u64,
+                    size: padded_bytes as u64,
                     usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
-                })
+                }))
             })
             .collect();
+        let ring_free = (0..ring.len()).collect();
 
         self.yuv = Some(YuvPass {
             pipeline_y,
@@ -1605,11 +1787,13 @@ impl Renderer {
             out_bind,
             out_buf,
             ring,
-            ring_next: 0,
+            ring_free,
             pending: std::collections::VecDeque::new(),
             bytes,
-            groups_y: ((width / 4 + 7) / 8, (height + 3) / 4),
-            groups_uv: ((width / 8 + 7) / 8, (height / 2 + 3) / 4),
+            padded_bytes,
+            padded_width,
+            groups_y: ((padded_width / 4 + 7) / 8, (padded_height + 3) / 4),
+            groups_uv: ((padded_width / 8 + 7) / 8, (padded_height / 2 + 3) / 4),
         });
     }
 
@@ -1621,12 +1805,7 @@ impl Renderer {
         if self.yuv.is_none() {
             self.init_yuv();
         }
-        let slot = {
-            let y = self.yuv.as_mut().unwrap();
-            let s = y.ring_next;
-            y.ring_next = (s + 1) % y.ring.len();
-            s
-        };
+        let slot = self.acquire_slot(ReadbackKind::Yuv);
         let mut encoder = self.encode_scene(list, clear);
         {
             let y = self.yuv.as_ref().unwrap();
@@ -1641,11 +1820,27 @@ impl Renderer {
             pass.dispatch_workgroups(y.groups_y.0, y.groups_y.1, 1);
             pass.set_pipeline(if interleaved { &y.pipeline_uv_nv12 } else { &y.pipeline_uv_i420 });
             pass.dispatch_workgroups(y.groups_uv.0, y.groups_uv.1, 1);
+            drop(pass);
+            encoder.copy_buffer_to_buffer(&y.out_buf, 0, &y.ring[slot], 0, y.padded_bytes as u64);
         }
-        let y = self.yuv.as_ref().unwrap();
-        encoder.copy_buffer_to_buffer(&y.out_buf, 0, &y.ring[slot], 0, y.bytes as u64);
-        self.queue.submit(Some(encoder.finish()));
-        self.yuv.as_mut().unwrap().pending.push_back(slot);
+        let idx = self.queue.submit(Some(encoder.finish()));
+        if let Some(tx) = &self.readback_tx {
+            let y = self.yuv.as_ref().unwrap();
+            let frame = ReadbackFrame {
+                buffer: Arc::clone(&y.ring[slot]),
+                submission: idx,
+                slot,
+                kind: ReadbackKind::Yuv,
+                width: self.width,
+                height: self.height,
+                stride: self.yuv.as_ref().unwrap().padded_width,
+                bytes: self.yuv.as_ref().unwrap().bytes as usize,
+                interleaved,
+            };
+            tx.send(frame).expect("readback writer exited");
+        } else {
+            self.yuv.as_mut().unwrap().pending.push_back((slot, idx, interleaved));
+        }
     }
 
     /// Number of submitted-but-not-yet-read YUV frames.
@@ -1654,7 +1849,8 @@ impl Renderer {
     }
 
     /// Maps the OLDEST pending YUV frame and copies it into `out`
-    /// (`yuv_frame_bytes()` bytes). Mirror of [`Renderer::read_oldest_into`].
+    /// (`yuv_frame_bytes()` bytes). Synchronous path; async export uses
+    /// [`ReadbackFrame`] directly.
     pub fn read_oldest_yuv_into(&mut self, out: &mut Vec<u8>) {
         out.clear();
         out.resize(self.yuv_frame_bytes(), 0);
@@ -1666,31 +1862,58 @@ impl Renderer {
     /// hands its direct buffer over directly, skipping the extra
     /// full-frame copy through a staging Vec.
     pub fn read_oldest_yuv_into_slice(&mut self, out: &mut [u8]) {
-        let slot = self
+        let (slot, idx, interleaved) = self
             .yuv
             .as_mut()
             .and_then(|y| y.pending.pop_front())
             .expect("read_oldest_yuv with empty pipeline");
-        let buffer = &self.yuv.as_ref().unwrap().ring[slot];
+        let y = self.yuv.as_ref().unwrap();
+        let (width, height, stride) = (self.width, self.height, y.padded_width);
+        let buffer = Arc::clone(&y.ring[slot]);
         let slice = buffer.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
-        self.device.poll(wgpu::PollType::Wait);
+        let _ = self.device.poll(wgpu::PollType::WaitForSubmissionIndex(idx));
         let data = slice.get_mapped_range();
-        out.copy_from_slice(&data);
+        if stride as usize == width as usize {
+            out.copy_from_slice(&data[..out.len()]);
+        } else {
+            compact_yuv(&data, out, width, height, stride, interleaved);
+        }
         drop(data);
         buffer.unmap();
+        self.yuv.as_mut().unwrap().ring_free.push_back(slot);
     }
 }
 
-/// Compact slider-body prepass vertex: 28 bytes (the fat 80-byte scene
-/// Vertex wastes 60+ bytes per prepass corner).
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct PrepassVertex {
-    pos: [f32; 2],
-    start: [f32; 2],
-    end: [f32; 2],
-    radius: f32,
+fn compact_yuv(data: &[u8], out: &mut [u8], width: u32, height: u32, stride: u32, interleaved: bool) {
+    let (w, h, stride) = (width as usize, height as usize, stride as usize);
+    let mut o = 0usize;
+    for row in 0..h {
+        let s = row * stride;
+        out[o..o + w].copy_from_slice(&data[s..s + w]);
+        o += w;
+    }
+    let uv_off = stride * h;
+    if interleaved {
+        for row in 0..h / 2 {
+            let s = uv_off + row * stride;
+            out[o..o + w].copy_from_slice(&data[s..s + w]);
+            o += w;
+        }
+    } else {
+        let cw = w / 2;
+        for row in 0..h / 2 {
+            let s = uv_off + row * (stride / 2);
+            out[o..o + cw].copy_from_slice(&data[s..s + cw]);
+            o += cw;
+        }
+        let v_off = uv_off + (stride / 2) * (h / 2);
+        for row in 0..h / 2 {
+            let s = v_off + row * (stride / 2);
+            out[o..o + cw].copy_from_slice(&data[s..s + cw]);
+            o += cw;
+        }
+    }
 }
 
 // Minimal bytemuck-style cast (avoids the extra dependency).
