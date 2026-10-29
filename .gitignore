@@ -7,6 +7,7 @@ frames*/
 probe.json
 ffmpeg_err.log
 atlas_dump.png
+.tmp-*
 __pycache__/
 tv/
 v340.png
