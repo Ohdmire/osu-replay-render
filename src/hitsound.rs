@@ -12,30 +12,59 @@
 //! - non-repeating objects use the point at `EndTime + 5ms`, slider heads
 //!   at `StartTime + 6ms`, slider node *i* at `StartTime + i*span + 5ms`
 //!   (`CONTROL_POINT_LENIENCY` = 5);
-//! - sliders play `NodeSamples[0]` on head hits, `NodeSamples[i]` on
-//!   repeat hits, `TailSamples` (`NodeSamples[span]`) on the body
+//! - sliders play `NodeSamples[0]` on head hits, `NodeSamples[RepeatIndex+1]`
+//!   on repeat hits, `TailSamples` (`NodeSamples[span]`) on the body
 //!   judgement, `slidertick` on tick hits, and loop `sliderslide` (+
-//!   `sliderwhistle` when the whistle flag is set) while tracked;
-//! - playback volume = `max(volume, 5)%` (`MINIMUM_SAMPLE_VOLUME`),
-//!   stereo balance follows the playfield X (`PositionalHitsoundsLevel`
-//!   0.8 → `round2(1.6 * (x/512 - 0.5))`). Samples always play at their
+//!   `sliderwhistle` when the whistle flag is set) while tracked. The body
+//!   samples are gated on the TAIL circle's own result
+//!   (`DrawableSlider.PlaySamples`: `!TailCircle.SamplePlaysOnlyOnHit ||
+//!   TailCircle.IsHit`, and `SamplePlaysOnlyOnHit` defaults to true), not on
+//!   the slider's aggregate judgement;
+//! - playback volume = `max(volume, 5)%` (`MINIMUM_SAMPLE_VOLUME`) times the
+//!   game's three layers: the gameplay mixer (`OsuSetting.HitsoundVolume`,
+//!   default 0.6), `VolumeEffect` (default 0.6) and `VolumeUniversal`
+//!   (default 0.6). `Gameplay/combobreak` skips the gameplay mixer only.
+//!   Stereo balance follows the playfield X (`PositionalHitsoundsLevel`
+//!   0.8 → `round2(1.6 * (x/512 - 0.5))`, clamped to ±1 the way BASS clamps
+//!   `BASS_ATTRIB_PAN` — see `balance`). Samples always play at their
 //!   natural rate, under every mod — rate mods only compress the trigger
-//!   times onto the wall timeline, the pitch never shifts (a deliberate
-//!   deviation from lazer, whose gameplay mixer resamples samples with
-//!   the rate; this holds under Nightcore too, whose BGM does keep the
-//!   game's pitch-up);
+//!   times onto the wall timeline, the pitch never shifts. That is parity,
+//!   not a deviation: lazer's `ModRateAdjust` resamples the *track* only
+//!   (`ApplyToTrack`), while `ApplyToSample` is consumed by storyboard
+//!   samples alone (`DrawableStoryboardSample`), so gameplay hitsounds do
+//!   not follow the rate either — and Nightcore/Daycore likewise pitch the
+//!   BGM, never the hit samples;
 //! - a combo drop to zero plays `Gameplay/combobreak` (`ComboEffects`:
 //!   old combo > 20, or the first break while `AlwaysPlayFirstComboBreak`
 //!   is on — the default), at full volume, centered;
 //! - spinners: the judgement plays the line samples, bonus revolutions
-//!   fire `spinnerbonus` at the ACTUAL full-rotation moments (bank/volume
-//!   from the point at the spinner's start; spins past the tick budget
-//!   `spinnerbonus-max`, whose LookupNames strip "-max"), and a looping
-//!   `spinnerspin` runs while the disc audibly spins — synthesized with
-//!   a phase accumulator at the lazer frequency curve
+//!   fire `spinnerbonus` at the ACTUAL full-rotation moments (spins past the
+//!   tick budget play `spinnerbonus-max`, whose LookupNames strip "-max"),
+//!   and a looping `spinnerspin` runs while the disc audibly spins —
+//!   synthesized with a phase accumulator at the lazer frequency curve
 //!   (`20k/44.1k + progressUnclamped * 40k/44.1k`, capped `100k/44.1k`;
 //!   `SpinnerFrequencyModulate` off pins it to the natural rate) under
 //!   the tracking envelope (`VolumeTo(1, 300)` / `VolumeTo(0, 240)`).
+//!   All three derive from the spinner's own `Samples`, which the decoder
+//!   resolved at `GetEndTime() + 5ms` — so their bank/volume come from the
+//!   point at the spinner's END, not its start. `spinnerbonus-max` is a plain
+//!   `HitSampleInfo` built from the *normal* sample: it inherits bank, volume
+//!   and suffix only (no file reference, no beatmap sample layer, and — not
+//!   being a `LegacyHitSampleInfo` — never the layered mute);
+//! - at most `SAMPLE_CONCURRENCY` (6) instances of one sample file sound at
+//!   once (`OsuGameBase.SAMPLE_CONCURRENCY` → BASS `max` +
+//!   `BassFlags.SampleOverrideLongestPlaying`): the 7th simultaneous play
+//!   stops the longest-playing one. A sample owned by a single reused
+//!   `SkinnableSound` instance (`spinnerbonus-max`, `combobreak`) has a cap of
+//!   1, because `Play()` runs `Stop(); Play();`. See [`limit_voices`];
+//! - a legacy skin with `LayeredHitSounds: 0` silences the layered hitnormal
+//!   that was auto-attached to a hitsound set without the Normal flag
+//!   (`LegacyHitSampleInfo.IsLayered` → `LegacySkinTransformer.GetSample`
+//!   returns `SampleVirtual`), and the samples derived from it (`slidertick`,
+//!   `sliderslide`, `spinnerspin`) inherit the mute. The mute belongs to the
+//!   user-skin layer: the beatmap's own files are a separate skin source
+//!   consulted BEFORE it, whose transformer never reads the user skin's
+//!   setting, so a map-provided layered sample still plays;
 //!
 //! Samples come from the skin's `Gameplay/ArgonPro/` resource set
 //! (`assets/sounds/ArgonPro`, embedded at compile time). Every osu!standard
@@ -85,6 +114,11 @@ const CONTROL_POINT_LENIENCY: f64 = 5.0;
 /// Lazer default `PositionalHitsoundsLevel` (0.8) doubled, see
 /// `CalculateSamplePlaybackBalance`.
 const POSITIONAL_HITSOUNDS_LEVEL: f64 = 0.8;
+/// `OsuGameBase.SAMPLE_CONCURRENCY` → `ISample.PlaybackConcurrency`: how many
+/// instances of one sample file may sound at the same time. The BASS handle is
+/// loaded with `BassFlags.SampleOverrideLongestPlaying`, so the 7th
+/// simultaneous play stops the instance that has been playing longest.
+const SAMPLE_CONCURRENCY: usize = 6;
 
 
 /// `SamplePointAt`: rightmost point with `time <= t`; before the first
@@ -121,6 +155,55 @@ struct HitSample {
     /// The hitSample's explicit filename (`FileHitSampleInfo`): replaces
     /// the banked hitnormal slot with this beatmap-local file.
     filename: Option<String>,
+    /// `ConvertHitObjectParser.LegacyHitSampleInfo.IsLayered`: the hitnormal
+    /// auto-attached to a hitsound set that does NOT carry the Normal flag
+    /// (`type != None && !type.HasFlag(Normal)`). `With()` keeps the flag, so
+    /// the samples derived from that normal (`slidertick`, `sliderslide`,
+    /// `spinnerspin`) inherit it. A legacy skin with `LayeredHitSounds: 0`
+    /// replaces layered samples with `SampleVirtual`
+    /// (`LegacySkinTransformer.GetSample`) — silence that ends the chain.
+    /// Only the user-skin layer is affected; see [`SampleResolver::resolve`].
+    layered: bool,
+}
+
+impl HitSample {
+    /// How many instances of this sample may sound at once.
+    ///
+    /// `OsuGameBase.SAMPLE_CONCURRENCY` (6) is the per-file BASS limit. A
+    /// sample owned by a single reused `SkinnableSound` instance is limited to
+    /// 1 instead, because `SkinnableSound.Play()` runs `Stop(); Play();` on its
+    /// one child and therefore cuts the previous playback:
+    ///
+    /// - `maxBonusSample` (`DrawableSpinner`, the `spinnerbonus-max` sample);
+    /// - `ComboEffects.comboBreakSample` (`Gameplay/combobreak`).
+    ///
+    /// The two limits really live on different objects (a BASS sample handle vs
+    /// a `SkinnableSound` instance). They are collapsed into one per-voice cap
+    /// because each cap-1 owner also has a private file in practice; a skin
+    /// that makes `spinnerbonus-max` fall back to `spinnerbonus` shares the
+    /// 6-voice pool, which this model over-evicts (one play would stop every
+    /// live bonus voice instead of the longest one).
+    fn voice_cap(&self) -> usize {
+        match self.name {
+            "spinnerbonus-max" | "combobreak" => 1,
+            _ => SAMPLE_CONCURRENCY,
+        }
+    }
+
+    /// Whether the gameplay mixer's volume (`OsuSetting.HitsoundVolume`, bound
+    /// to `DrawableRuleset.Audio`) applies. `ComboEffects` is added to the
+    /// ruleset's `FrameStableComponents`, a sibling of that mixer, so
+    /// `combobreak` bypasses it (it is still scaled by `VolumeEffect`).
+    fn bypasses_gameplay_mixer(&self) -> bool {
+        self.name == "combobreak"
+    }
+}
+
+/// `LegacyHitSoundType`: None=0, Normal=1, Whistle=2, Finish=4, Clap=8.
+/// `convertSoundType` marks the auto-attached hitnormal as layered exactly when
+/// the set is non-empty and does not ask for the Normal sample itself.
+fn is_layered(sound_type: u8) -> bool {
+    sound_type != 0 && sound_type & 0b1 == 0
 }
 
 /// `convertSoundType` + `LegacySampleControlPoint.ApplyTo`: hitnormal
@@ -130,16 +213,19 @@ fn resolve_samples(sound_type: u8, info: &BankInfo, point: SamplePoint) -> Vec<H
     let mut out = Vec::with_capacity(4);
     let custom = if info.custom_index > 0 { info.custom_index } else { point.custom_index };
     let volume = if info.volume > 0 { info.volume } else { point.volume };
+    let layered = is_layered(sound_type);
     match info.filename.as_deref().filter(|f| !f.is_empty()) {
         // `FileHitSampleInfo`: custom index forced to 1 (beatmap-local,
         // never falls back through the suffixed chain), bank pinned to
-        // normal; additions below still play.
+        // normal; additions below still play. Never layered (`isLayered` keeps
+        // its default `false`).
         Some(file) => out.push(HitSample {
             name: "hitnormal",
             bank: Bank::Normal,
             custom: 1,
             volume,
             filename: Some(file.to_string()),
+            layered: false,
         }),
         None => out.push(HitSample {
             name: "hitnormal",
@@ -147,16 +233,17 @@ fn resolve_samples(sound_type: u8, info: &BankInfo, point: SamplePoint) -> Vec<H
             custom,
             volume,
             filename: None,
+            layered,
         }),
     }
     if sound_type & 0b100 != 0 {
-        out.push(HitSample { name: "hitfinish", bank: info.additions.unwrap_or(point.bank), custom, volume, filename: None });
+        out.push(HitSample { name: "hitfinish", bank: info.additions.unwrap_or(point.bank), custom, volume, filename: None, layered: false });
     }
     if sound_type & 0b10 != 0 {
-        out.push(HitSample { name: "hitwhistle", bank: info.additions.unwrap_or(point.bank), custom, volume, filename: None });
+        out.push(HitSample { name: "hitwhistle", bank: info.additions.unwrap_or(point.bank), custom, volume, filename: None, layered: false });
     }
     if sound_type & 0b1000 != 0 {
-        out.push(HitSample { name: "hitclap", bank: info.additions.unwrap_or(point.bank), custom, volume, filename: None });
+        out.push(HitSample { name: "hitclap", bank: info.additions.unwrap_or(point.bank), custom, volume, filename: None, layered: false });
     }
     out
 }
@@ -179,14 +266,46 @@ struct Placement {
     until: Option<f64>,
 }
 
+/// `DrawableHitObject.CalculateSamplePlaybackBalance`: the tracked playfield X
+/// mapped to a stereo balance, already **clamped to [-1, 1]**.
+///
+/// The clamp is not cosmetic. lazer computes the same unclamped number and hands
+/// it to BASS as `BASS_ATTRIB_PAN`, which clamps to [-1, 1] before the value can
+/// reach the mix. Here the balance *is* the channel gain
+/// (`gl = v * (1 - bal.max(0))`, `gr = v * (1 - (-bal).max(0))`), so an
+/// out-of-range balance turns into a negative or >unity gain instead of a hard
+/// pan. That is reachable with a degenerate beatmap position: an aspire
+/// "infinite length" slider (`pixelLength = 2147483647`) makes `SliderPath`
+/// scale its ~1.4 px path to ~1.5e9 playfield units, and `balance(1.5e9)` is
+/// ~4.7e6 — a gain of ~-1.4e6 that slams the bus limiter into a full-scale
+/// block (osu! beatmap 5839931, the 65-span sliders at 124.774 s / 125.074 s /
+/// 125.374 s). Non-finite input maps to centre, like BASS treating an invalid
+/// pan as 0.
 fn balance(x: f32) -> f64 {
+    if !x.is_finite() {
+        return 0.0;
+    }
     let b = POSITIONAL_HITSOUNDS_LEVEL * 2.0 * (x as f64 / 512.0 - 0.5);
-    (b * 100.0).round() / 100.0
+    ((b * 100.0).round() / 100.0).clamp(-1.0, 1.0)
 }
 
 fn build_placements(game: &GameData, data: &SampleData, t0: f64, t_map_end: f64, resolver: &mut SampleResolver) -> Vec<Placement> {
     let mut out: Vec<Placement> = Vec::new();
     if game.objects.len() != data.objects.len() {
+        // `SampleData::objects` is indexed POSITIONALLY against the beatmap's
+        // hit-object list: row *i* describes object *i*. A parser that drops a
+        // line on one side only therefore does not merely lose that object, it
+        // shifts every later object onto the wrong samples — so bailing is the
+        // only honest option. Warn loudly, because the alternative failure mode
+        // is a map that is silently hitsound-free everywhere (`osu-parse`'s
+        // per-line `MAX_COORDINATE_VALUE` drop did exactly this: 1713 judged
+        // objects vs 2287 sample rows for beatmap 5839931).
+        log::warn!(
+            "hitsounds: beatmap parser and sample-table parser disagree ({} objects vs {} sample rows); \
+             skipping every hitsound for this map",
+            game.objects.len(),
+            data.objects.len()
+        );
         return out; // parser mismatch; silence rather than desynced sounds
     }
 
@@ -212,26 +331,24 @@ fn build_placements(game: &GameData, data: &SampleData, t0: f64, t_map_end: f64,
                     }
                 }
                 // Bonus revolutions (`SpinnerBonusTick`: Samples =
-                // CreateHitSampleInfo("spinnerbonus"), bank/volume from the
-                // sample point at the spinner's start) fire at the ACTUAL
-                // full-rotation moments. Plain `SpinnerTick`s carry no
-                // samples in lazer (SmallBonus is silent); spins past the
-                // tick budget play `spinnerbonus-max` (sound, no score —
-                // `maxBonusSample`; its LookupNames tail falls back to
-                // "spinnerbonus" when a skin has no -max file).
-                let point = point_at(&data.points, raw.start_time);
-                let file = raw.bank.filename.clone();
+                // `CreateHitSampleInfo("spinnerbonus")`) fire at the ACTUAL
+                // full-rotation moments. Plain `SpinnerTick`s carry no samples
+                // in lazer (SmallBonus is silent); spins past the tick budget
+                // play `spinnerbonus-max` (sound, no score — `maxBonusSample`;
+                // its LookupNames tail falls back to "spinnerbonus" when a skin
+                // has no -max file).
+                //
+                // All three reference samples derive from the spinner's own
+                // `Samples`, which the decoder resolved at `GetEndTime() + 5`
+                // (`applySamples`'s non-repeats branch; `GetPlayableBeatmap`
+                // re-runs `ApplyDefaults` afterwards, so `CreateNestedHitObjects`
+                // sees the applied list) — NOT the point at the start.
+                let refs = spinner_refs(raw, data);
                 for (oi, time, large) in &game.spinner_ticks {
                     if *oi == obj.index && *large && *time >= t0 && *time <= t_map_end {
                         out.push(Placement {
                             time: *time,
-                            sample: HitSample {
-                                name: "spinnerbonus",
-                                bank: point.bank,
-                                custom: point.custom_index,
-                                volume: point.volume,
-                                filename: file.clone(),
-                            },
+                            sample: HitSample { name: "spinnerbonus", ..refs.bonus() },
                             x: 256.0,
                             until: None,
                         });
@@ -241,12 +358,22 @@ fn build_placements(game: &GameData, data: &SampleData, t0: f64, t_map_end: f64,
                     if *oi == obj.index && *time >= t0 && *time <= t_map_end {
                         out.push(Placement {
                             time: *time,
+                            // `SpinnerBonusMaxSampleInfo(HitObject.CreateHitSampleInfo())`
+                            // is a plain `HitSampleInfo`: it copies the normal
+                            // sample's bank, suffix and volume and nothing else.
+                            // No file reference, `UseBeatmapSamples = false`, and
+                            // not a `LegacyHitSampleInfo`, so the layered mute
+                            // cannot reach it. `custom: 0` also drops the suffix,
+                            // which matches the user legacy skin
+                            // (`UseCustomSampleBanks = false` filters suffixed
+                            // names out anyway).
                             sample: HitSample {
                                 name: "spinnerbonus-max",
-                                bank: point.bank,
-                                custom: point.custom_index,
-                                volume: point.volume,
-                                filename: file.clone(),
+                                bank: refs.normal.bank,
+                                custom: 0,
+                                volume: refs.normal.volume,
+                                filename: None,
+                                layered: false,
                             },
                             x: 256.0,
                             until: None,
@@ -294,8 +421,11 @@ fn build_placements(game: &GameData, data: &SampleData, t0: f64, t_map_end: f64,
                             });
                         }
                         NestedKind::Repeat => {
-                            // RepeatIndex + 1 == span index of the repeat.
-                            for s in node_samples(n.span_index) {
+                            // `repeat.Samples = GetNodeSamples(RepeatIndex + 1)`
+                            // (`Slider.UpdateNestedSamples`), and `span_index`
+                            // is the 0-based span the repeat closes — so the
+                            // node index is one past it.
+                            for s in node_samples(n.span_index + 1) {
                                 out.push(Placement { time: t, sample: s, x: n.position[0], until: None });
                             }
                         }
@@ -303,11 +433,26 @@ fn build_placements(game: &GameData, data: &SampleData, t0: f64, t_map_end: f64,
                     }
                 }
 
-                // Slider body judgement plays the tail samples.
-                if let Some((t, r)) = obj.body_judged {
-                    if hit_result_ext::is_hit(r) && t >= t0 && t <= t_map_end {
-                        for s in node_samples(obj.span_count) {
-                            out.push(Placement { time: t, sample: s, x: obj.end_position[0], until: None });
+                // The body judgement plays `TailSamples`, gated on the TAIL
+                // circle's own result (`DrawableSlider.PlaySamples`:
+                // `!TailCircle.SamplePlaysOnlyOnHit || TailCircle.IsHit`;
+                // `SamplePlaysOnlyOnHit` defaults to true and only
+                // `OsuModClassic`'s "always play tail sample" relaxes it —
+                // mods are out of scope here). The slider's own result is an
+                // aggregate over every nested object (any nested hit → max),
+                // so it may be a hit while the tail itself was missed; using
+                // it as the gate wrongly plays the tail sample in that case.
+                let tail = obj.nested.iter().find(|n| n.kind == NestedKind::Tail).and_then(|n| n.judged);
+                if tail.is_some_and(|(_, r)| hit_result_ext::is_hit(r)) {
+                    // `PlaySamples` runs at the slider's own judgement time
+                    // (`HitStateUpdateTime`), applied once the tail has been
+                    // judged and the end time has passed.
+                    let t = obj.body_judged.map(|(t, _)| t).or(tail.map(|(t, _)| t));
+                    if let Some(t) = t {
+                        if t >= t0 && t <= t_map_end {
+                            for s in node_samples(obj.span_count) {
+                                out.push(Placement { time: t, sample: s, x: obj.end_position[0], until: None });
+                            }
                         }
                     }
                 }
@@ -365,6 +510,7 @@ fn build_placements(game: &GameData, data: &SampleData, t0: f64, t_map_end: f64,
                             custom: 0,
                             volume: 100,
                             filename: None,
+                            layered: false,
                         },
                         x: 256.0,
                         until: None,
@@ -411,12 +557,15 @@ fn tile_loop(
 fn slider_object_samples(raw: &RawObj, obj: &crate::game::ObjView, data: &SampleData) -> (Vec<HitSample>, HitSample) {
     let head_point = point_at(&data.points, obj.start_time + CONTROL_POINT_LENIENCY + 1.0);
     let obj_samples = resolve_samples(raw.sound_type, &raw.bank, head_point);
+    // `resolve_samples` always yields the hitnormal first; the fallback only
+    // exists so the signature stays total.
     let obj_normal = obj_samples.iter().find(|s| s.name == "hitnormal").cloned().unwrap_or(HitSample {
         name: "hitnormal",
         bank: head_point.bank,
         custom: head_point.custom_index,
         volume: head_point.volume,
         filename: None,
+        layered: is_layered(raw.sound_type),
     });
     (obj_samples, obj_normal)
 }
@@ -424,7 +573,8 @@ fn slider_object_samples(raw: &RawObj, obj: &crate::game::ObjView, data: &Sample
 /// Looping samples of a tracked slider: `sliderslide` always,
 /// `sliderwhistle` when the object's whistle flag is set
 /// (`CreateSlidingSamples`: the object's hitnormal/whistle sample with
-/// the name swapped — custom index and filename carry over).
+/// the name swapped — custom index and filename carry over, and the whistle
+/// is an addition, so it is never `IsLayered`).
 fn slide_loop_samples(obj_samples: &[HitSample], obj_normal: HitSample, sound_type: u8) -> Vec<HitSample> {
     let mut out = vec![HitSample { name: "sliderslide", ..obj_normal }];
     if sound_type & 0b10 != 0 {
@@ -434,6 +584,7 @@ fn slide_loop_samples(obj_samples: &[HitSample], obj_normal: HitSample, sound_ty
             custom: obj_normal.custom,
             volume: obj_normal.volume,
             filename: None,
+            layered: false,
         });
     }
     out
@@ -496,6 +647,12 @@ pub struct LoopSoundEvent {
     /// Beatmap sample volume 0-100 (receiver applies `max(5)` and the
     /// Effect channel volume).
     pub volume: i32,
+    /// `LegacyHitSampleInfo.IsLayered` of the source sample. A legacy skin
+    /// with `LayeredHitSounds: 0` mutes layered samples, but only in the
+    /// user-skin layer — a beatmap-local file still wins. Hosts that resolve
+    /// samples themselves should pass this to
+    /// [`resolve_sample_parts`] (and key their sample cache by it).
+    pub layered: bool,
     /// Audible intervals (map ms, ascending); slider runs are exactly the
     /// tracking intervals, spinner runs carry the 300ms/240ms fade.
     pub runs: Vec<(f64, f64)>,
@@ -588,6 +745,7 @@ pub fn collect_loop_events(game: &GameData, data: &SampleData) -> Vec<LoopSoundE
                         custom: sample.custom,
                         filename: sample.filename,
                         volume: sample.volume,
+                        layered: sample.layered,
                         runs: runs.clone(),
                         control: LoopControl::Slider { object_index: obj.index },
                     });
@@ -601,6 +759,7 @@ pub fn collect_loop_events(game: &GameData, data: &SampleData) -> Vec<LoopSoundE
                         custom: lp.sample.custom,
                         filename: lp.sample.filename.clone(),
                         volume: lp.sample.volume,
+                        layered: lp.sample.layered,
                         runs: lp.runs,
                         control: LoopControl::Spin { rotation: lp.rotation, spins_required: lp.spins_required },
                     });
@@ -807,6 +966,22 @@ fn skin_lookup_names(bank: &str, name: &str, filename: Option<&str>) -> Vec<Stri
     names
 }
 
+/// Does this skin turn `LayeredHitSounds` off?
+///
+/// `LegacySkinTransformer.GetSample` replaces a layered sample with
+/// `SampleVirtual` only when the *legacy* skin resolves the setting to `false`
+/// (absent means on). Hosts that decode samples themselves use this to apply
+/// the same gate before [`resolve_sample_parts`].
+pub fn mutes_layered_hit_sounds(skin: &dyn crate::skin::Skin) -> bool {
+    skin.is_legacy()
+        && skin
+            .get_config(crate::skin::SkinLookup::LegacySetting(
+                crate::skin::configuration::LegacySetting::LayeredHitSounds,
+            ))
+            .and_then(|v| v.as_bool())
+            == Some(false)
+}
+
 /// Per-render hitsound resolver — lazer's gameplay sample chain:
 /// beatmap-local files first (slots opted in via custom index ≥ 1 or an
 /// explicit filename, `LegacyBeatmapSkin.GetSample`'s `UseBeatmapSamples`
@@ -822,7 +997,18 @@ pub struct SampleResolver<'a> {
     /// `OsuSkinConfiguration.SpinnerFrequencyModulate` (default true): the
     /// spinning loop's playback rate rises with spin progress.
     frequency_modulate: bool,
-    cache: HashMap<(Bank, &'static str, i32, Option<String>), Option<Arc<Clip>>>,
+    /// `LegacySkinTransformer.GetSample`: with `LayeredHitSounds: 0` on a legacy
+    /// skin, a layered hit sample is replaced by `SampleVirtual` — i.e. silence
+    /// that terminates the chain (it does not fall through to ArgonPro).
+    mute_layered: bool,
+    /// Keyed by slot AND the layered flag: the same slot can be produced by a
+    /// plain (`None`/Normal) set and by a layered one, and `LayeredHitSounds: 0`
+    /// silences only the latter.
+    cache: HashMap<(Bank, &'static str, i32, Option<String>, bool), Option<Arc<Clip>>>,
+    /// Decoded clips deduplicated by the resource they came from, so two slots
+    /// resolving to the same file share one `Arc` (and therefore one
+    /// playback-concurrency pool).
+    by_source: HashMap<String, Arc<Clip>>,
 }
 
 impl<'a> SampleResolver<'a> {
@@ -839,34 +1025,78 @@ impl<'a> SampleResolver<'a> {
                 .get_config(crate::skin::SkinLookup::Generic("SpinnerFrequencyModulate".into()))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true),
+            mute_layered: mutes_layered_hit_sounds(skin),
             cache: HashMap::new(),
+            by_source: HashMap::new(),
         }
     }
 
     /// The embedded ArgonPro set alone (no user skin in scope).
     fn builtin() -> SampleResolver<'static> {
-        SampleResolver { skin: None, beatmap: None, frequency_modulate: true, cache: HashMap::new() }
+        SampleResolver {
+            skin: None,
+            beatmap: None,
+            frequency_modulate: true,
+            mute_layered: false,
+            cache: HashMap::new(),
+            by_source: HashMap::new(),
+        }
     }
 
     /// Resolve one sample: beatmap file → user skin file → embedded
     /// ArgonPro entry → silent. Results (including negatives) are cached
-    /// per (bank, name, custom, filename).
+    /// per (bank, name, custom, filename, layered).
     fn clip(&mut self, sample: &HitSample) -> Option<Arc<Clip>> {
-        let key = (sample.bank, sample.name, sample.custom, sample.filename.clone());
+        let key = (sample.bank, sample.name, sample.custom, sample.filename.clone(), sample.layered);
         if let Some(hit) = self.cache.get(&key) {
             return hit.clone();
         }
+        let clip = self.resolve(sample);
+        // A muted layered sample is deliberate silence (`LayeredHitSounds: 0`),
+        // not a missing slot — and only silence when no beatmap file claimed it.
+        if clip.is_none() && !(sample.layered && self.mute_layered) {
+            eprintln!(
+                "hitsound warning: no sample for {}-{}{} in the beatmap, the skin or the default set, its hitsounds are silent",
+                sample.bank.as_str(),
+                sample.name,
+                sample.custom.max(0)
+            );
+        }
+        self.cache.insert(key, clip.clone());
+        clip
+    }
+
+    /// Intern a decoded clip by its source, so identical files share one `Arc`.
+    fn intern(&mut self, source: String, clip: Clip) -> Arc<Clip> {
+        if let Some(existing) = self.by_source.get(&source) {
+            return existing.clone();
+        }
+        let arc = Arc::new(clip);
+        self.by_source.insert(source, arc.clone());
+        arc
+    }
+
+    /// The lookup chain itself. The `LayeredHitSounds: 0` gate sits between
+    /// the beatmap layer and the user skin: in lazer the beatmap skin is a
+    /// source *above* the user skin (`BeatmapSkinProvidingContainer` wraps the
+    /// ruleset chain), its transformer reads the *beatmap's* configuration
+    /// (which this model does not load), and its `GetSample` returns the file
+    /// before the user skin is ever asked — so a map-provided layered sample
+    /// plays even when the user skin mutes layered sounds.
+    fn resolve(&mut self, sample: &HitSample) -> Option<Arc<Clip>> {
         let bank = sample.bank.as_str();
         let filename = sample.filename.as_deref();
+        let beatmap = self.beatmap;
+        let skin = self.skin;
         let mut clip = None;
         // 1. Beatmap-local layer (`LegacyBeatmapSkin`): only slots opted
         //    in (custom ≥ 1 / filename / plain SampleInfo); a found file
         //    ends the whole chain, decode failure included.
-        if let Some(store) = self.beatmap {
+        if let Some(store) = beatmap {
             for cand in beatmap_lookup_names(bank, sample.name, sample.custom, filename) {
                 if let Some(path) = store.sample_path(&cand) {
                     clip = match decode_sample_file(&path) {
-                        Ok(c) => Some(Arc::new(c)),
+                        Ok(c) => Some(self.intern(format!("beatmap:{}", path.display()), c)),
                         Err(e) => {
                             eprintln!(
                                 "hitsound: beatmap sample {} not decodable ({}), treated as disabled by the map",
@@ -880,20 +1110,25 @@ impl<'a> SampleResolver<'a> {
                 }
             }
         }
-        // 2. User skin (suffix stripped, File slots look up the raw name).
+        // 2. `LayeredHitSounds: 0` on the user's legacy skin replaces a layered
+        //    sample with `SampleVirtual` — deliberate silence that ends the
+        //    chain (no fall-through to the built-in set). The beatmap layer
+        //    above already had its chance.
+        if clip.is_none() && sample.layered && self.mute_layered {
+            return None;
+        }
+        // 3. User skin (suffix stripped, File slots look up the raw name).
         if clip.is_none() {
             let mut names = skin_lookup_names(bank, sample.name, filename);
             if filename.is_none() && let Some(stripped) = sample.name.strip_suffix("-max") {
                 names.extend(skin_lookup_names(bank, stripped, None));
             }
-            let resolved = self
-                .skin
-                .and_then(|skin| names.iter().find_map(|n| skin.get_sample(n)));
+            let resolved = skin.and_then(|skin| names.iter().find_map(|n| skin.get_sample(n)));
             clip = match resolved {
                 // 皮肤提供了该槽位 = 权威:解码失败(含 0 字节禁用占位)即静音,
                 // 不回退内置默认
                 Some(path) => match decode_sample_file(&path) {
-                    Ok(c) => Some(Arc::new(c)),
+                    Ok(c) => Some(self.intern(format!("skin:{}", path.display()), c)),
                     Err(e) => {
                         eprintln!(
                             "hitsound: skin sample {} not decodable ({}), treated as disabled by the skin",
@@ -909,19 +1144,14 @@ impl<'a> SampleResolver<'a> {
                 // 继续响普通 bonus。皮肤查找链自己已经带了剥后缀的回退。
                 None => {
                     let name = if filename.is_some() { "hitnormal" } else { sample.name };
-                    sample_clip(if filename.is_some() { "normal" } else { bank }, name).map(Arc::new)
+                    let bank = if filename.is_some() { "normal" } else { bank };
+                    match sample_clip(bank, name) {
+                        Some(c) => Some(self.intern(format!("builtin:{bank}-{name}"), c)),
+                        None => None,
+                    }
                 }
             };
         }
-        if clip.is_none() {
-            eprintln!(
-                "hitsound warning: no sample for {}-{}{} in the beatmap, the skin or the default set, its hitsounds are silent",
-                bank,
-                sample.name,
-                sample.custom.max(0)
-            );
-        }
-        self.cache.insert(key, clip.clone());
         clip
     }
 
@@ -939,17 +1169,23 @@ impl<'a> SampleResolver<'a> {
 /// decode in-process via symphonia), else the embedded ArgonPro entry.
 /// A hit layer is authoritative: 0-byte placeholders and read/decode
 /// failures mean silence, never a fall-through to the next layer.
+///
+/// `layered` is `HitsoundEvent::layered` / `LoopSoundEvent::layered`: a
+/// legacy skin with `LayeredHitSounds: 0` silences those samples unless a
+/// beatmap file claims the slot first. `SampleSlot::File` is never layered
+/// (`FileHitSampleInfo` leaves `IsLayered` at `false`).
 pub fn resolve_sample_bytes(
     slot: &SampleSlot,
+    layered: bool,
     beatmap: Option<&dyn BeatmapSampleStore>,
     skin: &dyn crate::skin::Skin,
 ) -> Option<Vec<u8>> {
     match slot {
         SampleSlot::File { filename } => {
-            resolve_sample_parts("normal", "hitnormal", 1, Some(filename), beatmap, skin)
+            resolve_sample_parts("normal", "hitnormal", 1, Some(filename), false, beatmap, skin)
         }
         SampleSlot::Bank { bank, name, custom } => {
-            resolve_sample_parts(bank, name, *custom, None, beatmap, skin)
+            resolve_sample_parts(bank, name, *custom, None, layered, beatmap, skin)
         }
     }
 }
@@ -960,10 +1196,13 @@ pub fn resolve_sample_parts(
     name: &str,
     custom: i32,
     filename: Option<&str>,
+    layered: bool,
     beatmap: Option<&dyn BeatmapSampleStore>,
     skin: &dyn crate::skin::Skin,
 ) -> Option<Vec<u8>> {
-    // 1. Beatmap-local files (`LegacyBeatmapSkin` layer).
+    // 1. Beatmap-local files (`LegacyBeatmapSkin` layer). The beatmap skin is
+    //    a source above the user skin and never consults its
+    //    `LayeredHitSounds`, so it wins before the gate below.
     if let Some(store) = beatmap {
         for cand in beatmap_lookup_names(bank, name, custom, filename) {
             if let Some(path) = store.sample_path(&cand) {
@@ -971,7 +1210,13 @@ pub fn resolve_sample_parts(
             }
         }
     }
-    // 2. User skin (suffix stripped).
+    // 2. `LayeredHitSounds: 0` on the user's legacy skin: `SampleVirtual`
+    //    (`LegacySkinTransformer.GetSample`), i.e. silence that ends the
+    //    chain — no fall-through to the built-in set.
+    if layered && mutes_layered_hit_sounds(skin) {
+        return None;
+    }
+    // 3. User skin (suffix stripped).
     if skin.is_legacy() {
         let mut names = skin_lookup_names(bank, name, filename);
         if filename.is_none() && let Some(stripped) = name.strip_suffix("-max") {
@@ -984,7 +1229,7 @@ pub fn resolve_sample_parts(
             return sample_file_bytes(&path);
         }
     }
-    // 3. 皮肤未提供该槽位(或非 legacy 皮肤):回退内置默认(File 槽按
+    // 4. 皮肤未提供该槽位(或非 legacy 皮肤):回退内置默认(File 槽按
     // normal-hitnormal)。`spinnerbonus-max` 保留原名,MAX 音效和普通
     // bonus 是两条采样。
     let name = if filename.is_some() { "hitnormal" } else { name };
@@ -1008,9 +1253,15 @@ fn sample_file_bytes(path: &Path) -> Option<Vec<u8>> {
 
 /// Bytes-level resolution without the beatmap-local layer (user skin →
 /// embedded ArgonPro) — the pre-beatmap-samples behavior, kept for hosts
-/// that resolve before a beatmap store exists.
-pub fn resolve_sample_wav(bank: &str, name: &str, skin: &dyn crate::skin::Skin) -> Option<Vec<u8>> {
-    resolve_sample_parts(bank, name, 0, None, None, skin)
+/// that resolve before a beatmap store exists. `layered` has the same
+/// meaning as in [`resolve_sample_parts`].
+pub fn resolve_sample_wav(
+    bank: &str,
+    name: &str,
+    layered: bool,
+    skin: &dyn crate::skin::Skin,
+) -> Option<Vec<u8>> {
+    resolve_sample_parts(bank, name, 0, None, layered, None, skin)
 }
 
 /// Decode a skin sample file: WAV in-process ([`decode_wav`]); anything
@@ -1285,13 +1536,30 @@ pub struct HitsoundEvent {
     /// Beatmap sample volume 0-100 (apply `max(5)` and the Effect
     /// channel volume on the receiver's side).
     pub volume: i32,
-    /// Playfield X (0..512) for stereo balance.
+    /// `LegacyHitSampleInfo.IsLayered` of the sample. A legacy skin with
+    /// `LayeredHitSounds: 0` mutes layered samples in the user-skin layer
+    /// only — a beatmap-local file still wins. Hosts that resolve samples
+    /// themselves pass this to [`resolve_sample_parts`] and key their sample
+    /// cache by it (lazer includes `IsLayered` in `LegacyHitSampleInfo`
+    /// equality for the same pooling reason).
+    pub layered: bool,
+    /// Playfield X for stereo balance.
+    ///
+    /// Nominally 0..512, but **not guaranteed to be in range**: a degenerate
+    /// slider (`pixelLength = 2147483647`, aspire "infinite length") resolves
+    /// its repeat positions through a path scaled to ~1.5e9 units, and a host
+    /// that maps this straight to a channel gain would get a negative/oversized
+    /// gain instead of a hard pan (see `balance`, which clamps like BASS's
+    /// `BASS_ATTRIB_PAN`). Hosts must clamp too — Aria's `osu_panning` does.
     pub pan_x: f32,
 }
 
 /// Sample-slot identity for downstream sound tables: everything needed
 /// to run the lazer lookup chain (`HitSampleInfo.LookupNames`) minus the
-/// per-hit volume/pan.
+/// per-hit volume/pan and the `layered` flag. The flag only changes the
+/// result when a legacy skin turns `LayeredHitSounds` off, so hosts that
+/// cache resolved samples should key by the slot **and** the event's
+/// `layered` bit (see [`resolve_sample_parts`]).
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum SampleSlot {
     /// A banked gameplay sample: bank × name × custom sample bank index
@@ -1331,8 +1599,8 @@ const SPIN_FADE_OUT: f64 = 240.0;
 /// which fixed-rate one-shots cannot express — `render_spin_loops`
 /// synthesizes it directly with a phase accumulator.
 struct SpinLoop {
-    /// `referenceSample.With("spinnerspin")`: the .osu line's first
-    /// sample's bank/volume with the name swapped.
+    /// `referenceSample.With("spinnerspin")`: the spinner's normal sample's
+    /// bank/volume with the name swapped.
     sample: HitSample,
     /// Audibly-spinning intervals (map ms).
     runs: Vec<(f64, f64)>,
@@ -1340,6 +1608,46 @@ struct SpinLoop {
     /// the modulation curve.
     rotation: Vec<(f64, f32)>,
     spins_required: f64,
+}
+
+/// The spinner's own sample list (`HitObject.Samples` AFTER `applySamples`).
+struct SpinnerRefs {
+    /// `Samples[0]` — the hitnormal (or the `FileHitSampleInfo` slot).
+    normal: HitSample,
+    /// First non-hitnormal entry, when the line carries Whistle/Finish/Clap.
+    addition: Option<HitSample>,
+}
+
+impl SpinnerRefs {
+    /// `CreateHitSampleInfo("spinnerbonus")`: the first addition if the set has
+    /// one (additions are never `IsLayered`), else the normal.
+    fn bonus(&self) -> HitSample {
+        self.addition.clone().unwrap_or_else(|| self.normal.clone())
+    }
+}
+
+/// Resolve a spinner's reference samples the way lazer does.
+///
+/// `CreateSpinningSamples()` / `CreateHitSampleInfo("spinnerbonus")` /
+/// `SpinnerBonusMaxSampleInfo` all derive from `HitObject.Samples`, and
+/// `LegacyBeatmapDecoder.applySamples` applies the sample point at
+/// `GetEndTime() + LENIENCY` to non-repeats objects. `GetPlayableBeatmap` then
+/// re-runs `ApplyDefaults`, so `CreateNestedHitObjects` (where the bonus ticks
+/// take their snapshot) sees the applied list. The point at the spinner's
+/// START is therefore the wrong one.
+fn spinner_refs(raw: &RawObj, data: &SampleData) -> SpinnerRefs {
+    let point = point_at(&data.points, raw.end_time + CONTROL_POINT_LENIENCY);
+    let mut samples = resolve_samples(raw.sound_type, &raw.bank, point).into_iter();
+    let normal = samples.next().unwrap_or_else(|| HitSample {
+        name: "hitnormal",
+        bank: point.bank,
+        custom: point.custom_index,
+        volume: point.volume,
+        filename: None,
+        layered: is_layered(raw.sound_type),
+    });
+    let addition = samples.find(|s| s.name != "hitnormal");
+    SpinnerRefs { normal, addition }
 }
 
 fn collect_spin_loops(game: &GameData, data: &SampleData) -> Vec<SpinLoop> {
@@ -1418,18 +1726,12 @@ fn spin_loop_for(game: &GameData, data: &SampleData, obj: &crate::game::ObjView,
     if runs.is_empty() {
         return None;
     }
-    let point = point_at(&data.points, raw.start_time);
     Some(SpinLoop {
-        // `referenceSample.With("spinnerspin")`: the .osu line's first
-        // sample's bank/volume/custom index (ApplyTo merge) with the
-        // name swapped; a filename reference keeps its file.
-        sample: HitSample {
-            name: "spinnerspin",
-            bank: raw.bank.normal.unwrap_or(point.bank),
-            custom: if raw.bank.custom_index > 0 { raw.bank.custom_index } else { point.custom_index },
-            volume: if raw.bank.volume > 0 { raw.bank.volume } else { point.volume },
-            filename: raw.bank.filename.clone(),
-        },
+        // `referenceSample.With("spinnerspin")`: the spinner's own (applied)
+        // normal sample with the name swapped; a filename reference keeps its
+        // file. `applySamples` resolved that sample at `GetEndTime() + 5`, not
+        // at the start time.
+        sample: HitSample { name: "spinnerspin", ..spinner_refs(raw, data).normal },
         runs,
         rotation,
         spins_required: obj.spins_required,
@@ -1459,18 +1761,39 @@ fn rotation_at(rot: &[(f64, f32)], t: f64) -> f64 {
 
 /// Synthesize the spinning loops straight into the mix buffer (clip
 /// resolution via the resolver, then the pure [`synth_spin_loop`]).
-fn render_spin_loops(buf: &mut [f32], loops: &[SpinLoop], resolver: &mut SampleResolver, t0: f64, rate: f64) {
+///
+/// `mixer_gain` is the gameplay mixer layer (`OsuSetting.HitsoundVolume`):
+/// `spinningSample` lives inside `DrawableSpinner`, i.e. under
+/// `DrawableRuleset.Audio`, so the spin loop takes it exactly like the
+/// one-shot voices do.
+fn render_spin_loops(
+    buf: &mut [f32],
+    loops: &[SpinLoop],
+    resolver: &mut SampleResolver,
+    t0: f64,
+    rate: f64,
+    mixer_gain: f32,
+) {
     for lp in loops {
         let Some(clip) = resolver.clip(&lp.sample) else { continue };
-        synth_spin_loop(buf, &clip.data, lp, resolver.frequency_modulate, t0, rate);
+        synth_spin_loop(buf, &clip.data, lp, resolver.frequency_modulate, t0, rate, mixer_gain);
     }
 }
 
 /// The read phase advances by the modulation ratio each output frame and
 /// wraps at the clip length (seamless: the sample is authored to loop),
-/// gain = line volume × the tracking envelope. `progressUnclamped` keeps
-/// rising past 1.0, capped at the `100_000/44_100` frequency ceiling.
-fn synth_spin_loop(buf: &mut [f32], data: &[f32], lp: &SpinLoop, freq_modulate: bool, t0: f64, rate: f64) {
+/// gain = line volume × gameplay mixer × the tracking envelope.
+/// `progressUnclamped` keeps rising past 1.0, capped at the
+/// `100_000/44_100` frequency ceiling.
+fn synth_spin_loop(
+    buf: &mut [f32],
+    data: &[f32],
+    lp: &SpinLoop,
+    freq_modulate: bool,
+    t0: f64,
+    rate: f64,
+    mixer_gain: f32,
+) {
     let frames = data.len() / 2;
     if frames == 0 {
         return;
@@ -1507,7 +1830,7 @@ fn synth_spin_loop(buf: &mut [f32], data: &[f32], lp: &SpinLoop, freq_modulate: 
                 let frac = (phase - phase.floor()) as f32;
                 let l = data[p0 * 2] + (data[p1 * 2] - data[p0 * 2]) * frac;
                 let r = data[p0 * 2 + 1] + (data[p1 * 2 + 1] - data[p0 * 2 + 1]) * frac;
-                let g = vol * env as f32;
+                let g = vol * mixer_gain * env as f32;
                 buf[(i as usize) * 2] += l * g;
                 buf[(i as usize) * 2 + 1] += r * g;
             }
@@ -1533,6 +1856,7 @@ pub fn collect_events(game: &GameData, data: &SampleData) -> Vec<HitsoundEvent> 
             custom: p.sample.custom,
             filename: p.sample.filename,
             volume: p.sample.volume,
+            layered: p.sample.layered,
             pan_x: p.x,
         })
         .collect();
@@ -1579,14 +1903,29 @@ pub fn sample_bytes(bank: &str, name: &str) -> Option<&'static [u8]> {
 /// PCM16 stereo WAV. `t0` is the first output frame's map time,
 /// `wall_secs` the output video's duration in seconds; the track spans
 /// exactly that wall window so it muxes 1:1 with the video.
-/// `master_gain` scales the whole bus (`--hitsounds-volume`).
+///
+/// `bus_gain` scales the whole bus (`--hitsounds-volume`, the game's
+/// `VolumeEffect`); `mixer_gain` is the gameplay mixer layer
+/// (`OsuSetting.HitsoundVolume`, default 0.6) that `DrawableRuleset.Audio`
+/// applies to the playfield's samples. `Gameplay/combobreak` bypasses that
+/// mixer (`ComboEffects` sits beside it), so it takes `bus_gain` alone.
 ///
 /// Loudness follows the game's defaults: samples play at their authored
-/// level (beatmap volume × the sample's mastering, Effect channel 1.0),
-/// no bus normalization. Stacked hits sum in float and the encoder's
-/// soft limiter replaces the DAC clipping the game would do.
-pub fn render_track_wav(game: &GameData, data: &SampleData, t0: f64, wall_secs: f64, rate: f64, master_gain: f32, skin: &dyn crate::skin::Skin) -> Vec<u8> {
-    render_track(game, data, t0, wall_secs, rate, master_gain, true, skin, None)
+/// level (beatmap volume × the sample's mastering, no bus normalization),
+/// stacked hits are capped by the per-sample concurrency limit
+/// (see [`limit_voices`]) and the encoder's soft limiter replaces the DAC
+/// clipping the game would do.
+pub fn render_track_wav(
+    game: &GameData,
+    data: &SampleData,
+    t0: f64,
+    wall_secs: f64,
+    rate: f64,
+    bus_gain: f32,
+    mixer_gain: f32,
+    skin: &dyn crate::skin::Skin,
+) -> Vec<u8> {
+    render_track(game, data, t0, wall_secs, rate, bus_gain, mixer_gain, true, skin, None)
 }
 
 /// [`render_track_wav`] with the beatmap-local sample layer enabled: the
@@ -1598,11 +1937,12 @@ pub fn render_track_wav_with_beatmap(
     t0: f64,
     wall_secs: f64,
     rate: f64,
-    master_gain: f32,
+    bus_gain: f32,
+    mixer_gain: f32,
     skin: &dyn crate::skin::Skin,
     beatmap: Option<&dyn BeatmapSampleStore>,
 ) -> Vec<u8> {
-    render_track(game, data, t0, wall_secs, rate, master_gain, true, skin, beatmap)
+    render_track(game, data, t0, wall_secs, rate, bus_gain, mixer_gain, true, skin, beatmap)
 }
 
 /// `render_track_wav` without the bus soft limiter: the sum stays
@@ -1613,8 +1953,17 @@ pub fn render_track_wav_with_beatmap(
 /// bus ducked dense stacks 2-4 dB and bent every stack peak; the
 /// float-sum mix only needs the headroom so PCM16 can carry stacks
 /// above unity.
-pub fn render_track_wav_linear(game: &GameData, data: &SampleData, t0: f64, wall_secs: f64, rate: f64, scale: f32, skin: &dyn crate::skin::Skin) -> Vec<u8> {
-    render_track(game, data, t0, wall_secs, rate, scale, false, skin, None)
+pub fn render_track_wav_linear(
+    game: &GameData,
+    data: &SampleData,
+    t0: f64,
+    wall_secs: f64,
+    rate: f64,
+    scale: f32,
+    mixer_gain: f32,
+    skin: &dyn crate::skin::Skin,
+) -> Vec<u8> {
+    render_track(game, data, t0, wall_secs, rate, scale, mixer_gain, false, skin, None)
 }
 
 /// [`render_track_wav_linear`] with the beatmap-local sample layer
@@ -1626,10 +1975,11 @@ pub fn render_track_wav_linear_with_beatmap(
     wall_secs: f64,
     rate: f64,
     scale: f32,
+    mixer_gain: f32,
     skin: &dyn crate::skin::Skin,
     beatmap: Option<&dyn BeatmapSampleStore>,
 ) -> Vec<u8> {
-    render_track(game, data, t0, wall_secs, rate, scale, false, skin, beatmap)
+    render_track(game, data, t0, wall_secs, rate, scale, mixer_gain, false, skin, beatmap)
 }
 
 /// One `PlaySamples` burst for storyboard `HitSound` triggers.
@@ -1666,7 +2016,81 @@ pub fn trigger_sample_groups(game: &GameData) -> Vec<TriggerSampleGroup> {
     groups
 }
 
-fn render_track(game: &GameData, data: &SampleData, t0: f64, wall_secs: f64, rate: f64, gain: f32, limit: bool, skin: &dyn crate::skin::Skin, beatmap: Option<&dyn BeatmapSampleStore>) -> Vec<u8> {
+/// One scheduled sample playback, after clip resolution: everything
+/// [`place`] needs plus the per-sample concurrency bookkeeping.
+struct MixVoice {
+    clip: Arc<Clip>,
+    /// Start of the sample on the WALL timeline (seconds).
+    start: f64,
+    /// Hard cutoff (loop tiles, or a steal by a newer voice).
+    until: Option<f64>,
+    gl: f32,
+    gr: f32,
+    /// Identity of the resolved resource: the pool this voice competes in.
+    key: usize,
+    /// How many voices of this pool may sound at once
+    /// (see [`HitSample::voice_cap`]).
+    cap: usize,
+}
+
+impl MixVoice {
+    /// The wall second this voice stops sounding: its natural length, unless
+    /// truncated by `until`.
+    fn ends_at(&self) -> f64 {
+        let natural = self.start + self.clip.duration_ms() / 1000.0;
+        match self.until {
+            Some(u) => natural.min(u),
+            None => natural,
+        }
+    }
+}
+
+/// Apply `ISample.PlaybackConcurrency` the way the game's BASS mixer does.
+///
+/// `OsuGameBase` sets the sample store's concurrency to [`SAMPLE_CONCURRENCY`]
+/// (6) and `SampleBassFactory` loads every sample with
+/// `BassFlags.SampleOverrideLongestPlaying`: while six instances of one sample
+/// are sounding, the seventh stops the one that has been playing longest. A
+/// `cap` of 1 (a single reused `SkinnableSound` instance) therefore models
+/// `Stop(); Play();` — each retrigger cuts the previous playback.
+///
+/// Loop tiles are skipped: lazer holds ONE looping channel per slider/spinner
+/// for its whole run, while this track expands loops into consecutive tiles, so
+/// counting tiles as competing voices would make a single loop steal from
+/// itself.
+fn limit_voices(voices: &mut [MixVoice]) {
+    // One-shots only, in start order: BASS evicts by "longest playing", which
+    // among simultaneously-live instances is the earliest start.
+    let mut order: Vec<usize> = (0..voices.len()).filter(|i| voices[*i].until.is_none()).collect();
+    order.sort_by(|a, b| voices[*a].start.total_cmp(&voices[*b].start));
+
+    let mut active: HashMap<usize, Vec<usize>> = HashMap::new();
+    for idx in order {
+        let start = voices[idx].start;
+        let cap = voices[idx].cap;
+        let list = active.entry(voices[idx].key).or_default();
+        list.retain(|&i| voices[i].ends_at() > start);
+        while list.len() >= cap {
+            let oldest = list.remove(0);
+            // The evicted instance is cut at the instant the new one starts.
+            voices[oldest].until = Some(start);
+        }
+        list.push(idx);
+    }
+}
+
+fn render_track(
+    game: &GameData,
+    data: &SampleData,
+    t0: f64,
+    wall_secs: f64,
+    rate: f64,
+    bus_gain: f32,
+    mixer_gain: f32,
+    limit: bool,
+    skin: &dyn crate::skin::Skin,
+    beatmap: Option<&dyn BeatmapSampleStore>,
+) -> Vec<u8> {
     let t_map_end = t0 + wall_secs * rate * 1000.0;
     let mut resolver = SampleResolver::with_beatmap(skin, beatmap);
     let placements = build_placements(game, &data, t0, t_map_end, &mut resolver);
@@ -1678,20 +2102,46 @@ fn render_track(game: &GameData, data: &SampleData, t0: f64, wall_secs: f64, rat
     let total = (wall_secs.max(0.0) * SAMPLE_RATE as f64).round() as usize;
     let mut buf = vec![0.0f32; total * 2];
 
-    // Decode each distinct (bank, name) once; a sample that fails to
-    // decode warns once and drops only its own placements (a silent
-    // `continue` here hid a 24-bit asset mismatch before).
+    // Resolve every placement first: the concurrency cap needs each voice's
+    // natural length before anything is mixed. Each distinct slot decodes once;
+    // a sample that fails to decode warns once and drops only its own
+    // placements (a silent `continue` used to hide a 24-bit asset mismatch).
+    let mut voices: Vec<MixVoice> = Vec::with_capacity(placements.len());
     for p in &placements {
         let Some(clip) = resolver.clip(&p.sample) else {
             continue;
         };
         let volume = p.sample.volume.max(MINIMUM_SAMPLE_VOLUME) as f32 / 100.0;
+        // `DrawableRuleset.Audio` volume, bypassed by `ComboEffects`.
+        let mixer = if p.sample.bypasses_gameplay_mixer() { 1.0 } else { mixer_gain };
         let bal = balance(p.x) as f32;
-        let gl = volume * (1.0 - bal.max(0.0));
-        let gr = volume * (1.0 - (-bal).max(0.0));
-        let wall = (p.time - t0) / rate / 1000.0;
+        let gl = volume * mixer * (1.0 - bal.max(0.0));
+        let gr = volume * mixer * (1.0 - (-bal).max(0.0));
+        let start = (p.time - t0) / rate / 1000.0;
         let until = p.until.map(|u| (u - t0) / rate / 1000.0);
-        place(&mut buf, &clip, wall, gl, gr, until);
+        voices.push(MixVoice {
+            key: Arc::as_ptr(&clip) as usize,
+            clip,
+            start,
+            until,
+            gl,
+            gr,
+            cap: p.sample.voice_cap(),
+        });
+    }
+    let loop_tiles = voices.iter().filter(|v| v.until.is_some()).count();
+    limit_voices(&mut voices);
+    if std::env::var("HITSOUND_DEBUG").is_ok() {
+        let cut = voices.iter().filter(|v| v.until.is_some()).count();
+        eprintln!(
+            "hitsound debug: {} voices, {} loop tiles, {} cut by the concurrency limit",
+            voices.len(),
+            loop_tiles,
+            cut.saturating_sub(loop_tiles),
+        );
+    }
+    for v in &voices {
+        place(&mut buf, &v.clip, v.start, v.gl, v.gr, v.until);
     }
 
     // The spinner spinning loops (pitch-modulated, phase-accumulator
@@ -1710,13 +2160,14 @@ fn render_track(game: &GameData, data: &SampleData, t0: f64, wall_secs: f64, rat
             );
         }
     }
-    render_spin_loops(&mut buf, &loops, &mut resolver, t0, rate);
+    render_spin_loops(&mut buf, &loops, &mut resolver, t0, rate, mixer_gain);
 
-    // Master gain / headroom scale (`--hitsounds-volume`, or the linear
-    // variant's PCM headroom).
-    if (gain - 1.0).abs() > 1e-6 {
+    // Bus gain (`--hitsounds-volume`, the game's `VolumeEffect`), or the
+    // linear variant's PCM headroom. The gameplay mixer layer is already in
+    // each voice (`mixer_gain`).
+    if (bus_gain - 1.0).abs() > 1e-6 {
         for v in &mut buf {
-            *v *= gain;
+            *v *= bus_gain;
         }
     }
 
@@ -1808,7 +2259,7 @@ mod zero_byte_skin_tests {
         let wav = dir.join("normal-hitnormal.wav");
         std::fs::write(&wav, b"").unwrap(); // 0 字节占位
         let skin = StubSkin { conf: Default::default(), sample: wav };
-        let resolved = resolve_sample_wav("normal", "hitnormal", &skin);
+        let resolved = resolve_sample_wav("normal", "hitnormal", false, &skin);
         match resolved {
             Some(bytes) => assert!(bytes.is_empty(), "0 字节占位应原样返回空字节,而不是内置默认"),
             None => {} // 非 wav/读取失败路径:同样表示静音
@@ -1830,7 +2281,7 @@ mod zero_byte_skin_tests {
     #[test]
     fn missing_slot_still_falls_back_to_builtin() {
         let skin = MissingSkin { conf: Default::default() };
-        let resolved = resolve_sample_wav("normal", "hitnormal", &skin);
+        let resolved = resolve_sample_wav("normal", "hitnormal", false, &skin);
         assert!(resolved.is_some_and(|b| !b.is_empty()), "未提供槽位应回退内置非空采样");
     }
 }
@@ -1901,23 +2352,23 @@ mod tests {
         assert!(skin.is_legacy());
         let mut resolver = SampleResolver::new(&skin);
 
-        let whistled = resolver.clip(&HitSample { name: "hitwhistle", bank: Bank::Normal, custom: 0, volume: 100, filename: None }).unwrap();
+        let whistled = resolver.clip(&HitSample { name: "hitwhistle", bank: Bank::Normal, custom: 0, volume: 100, filename: None, layered: false }).unwrap();
         assert!((45.0..55.0).contains(&whistled.duration_ms()), "skin file wins, got {}ms", whistled.duration_ms());
         let builtin_whistle = sample_clip("normal", "hitwhistle").unwrap();
         assert!(builtin_whistle.duration_ms() > 100.0);
 
         // The skin has no drum-hitfinish: the embedded ArgonPro copy fills it.
-        let finish = resolver.clip(&HitSample { name: "hitfinish", bank: Bank::Drum, custom: 0, volume: 100, filename: None }).unwrap();
+        let finish = resolver.clip(&HitSample { name: "hitfinish", bank: Bank::Drum, custom: 0, volume: 100, filename: None, layered: false }).unwrap();
         assert_eq!(finish.duration_ms(), sample_clip("drum", "hitfinish").unwrap().duration_ms());
 
         // Universal bank-less file serves every bank's hitclap (lazer's
         // `Gameplay/{Name}` + raw-name tail of `getLegacyLookupNames`).
-        let clap = resolver.clip(&HitSample { name: "hitclap", bank: Bank::Soft, custom: 0, volume: 100, filename: None }).unwrap();
+        let clap = resolver.clip(&HitSample { name: "hitclap", bank: Bank::Soft, custom: 0, volume: 100, filename: None, layered: false }).unwrap();
         assert!((45.0..55.0).contains(&clap.duration_ms()));
 
         // Nothing provides this: silent, and cached as such.
-        assert!(resolver.clip(&HitSample { name: "nosuchsound", bank: Bank::Soft, custom: 0, volume: 100, filename: None }).is_none());
-        assert!(resolver.clip(&HitSample { name: "nosuchsound", bank: Bank::Soft, custom: 0, volume: 100, filename: None }).is_none());
+        assert!(resolver.clip(&HitSample { name: "nosuchsound", bank: Bank::Soft, custom: 0, volume: 100, filename: None, layered: false }).is_none());
+        assert!(resolver.clip(&HitSample { name: "nosuchsound", bank: Bank::Soft, custom: 0, volume: 100, filename: None, layered: false }).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1927,9 +2378,72 @@ mod tests {
     fn resolver_builtin_skin_uses_embedded_set() {
         let skin = crate::skin::load_skin(None).unwrap();
         let mut resolver = SampleResolver::new(&skin);
-        let clip = resolver.clip(&HitSample { name: "hitnormal", bank: Bank::Normal, custom: 0, volume: 100, filename: None }).unwrap();
+        let clip = resolver.clip(&HitSample { name: "hitnormal", bank: Bank::Normal, custom: 0, volume: 100, filename: None, layered: false }).unwrap();
         let builtin = sample_clip("normal", "hitnormal").unwrap();
         assert_eq!(clip.duration_ms(), builtin.duration_ms());
+    }
+
+    /// `LayeredHitSounds: 0` on a legacy skin silences only the layered
+    /// hitnormal (`LegacySkinTransformer.GetSample` → `SampleVirtual`), and the
+    /// cache must keep that decision separate from the same slot played
+    /// non-layered.
+    #[test]
+    fn layered_hit_sounds_setting_mutes_only_layered_samples() {
+        let dir = std::env::temp_dir().join(format!("osr_layered_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("skin.ini"), "[General]\nVersion: 2.5\nLayeredHitSounds: 0\n").unwrap();
+
+        let skin = crate::skin::load_skin(Some(&dir)).unwrap();
+        assert!(skin.is_legacy());
+        let plain = HitSample { name: "hitnormal", bank: Bank::Soft, custom: 0, volume: 100, filename: None, layered: false };
+        let layered = HitSample { layered: true, ..plain.clone() };
+
+        // Plain first, layered second: the cached plain result must not leak.
+        let mut resolver = SampleResolver::new(&skin);
+        assert!(resolver.clip(&plain).is_some(), "plain hitnormal still plays");
+        assert!(resolver.clip(&layered).is_none(), "layered hitnormal is silenced");
+
+        // Layered first: the plain slot must still resolve afterwards.
+        let mut resolver = SampleResolver::new(&skin);
+        assert!(resolver.clip(&layered).is_none());
+        assert!(resolver.clip(&plain).is_some(), "silencing is not cached across the layered flag");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The layered mute belongs to the user-skin layer: a beatmap file is
+    /// served by the beatmap skin, which sits above the user skin and never
+    /// reads its `LayeredHitSounds`. The beatmap layer must win before the
+    /// gate, even for a layered sample.
+    #[test]
+    fn layered_mute_does_not_apply_to_beatmap_samples() {
+        let skin_dir = std::env::temp_dir().join(format!("osr_layered_bm_skin_{}", std::process::id()));
+        let map_dir = std::env::temp_dir().join(format!("osr_layered_bm_map_{}", std::process::id()));
+        for d in [&skin_dir, &map_dir] {
+            let _ = std::fs::remove_dir_all(d);
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(skin_dir.join("skin.ini"), "[General]\nVersion: 2.5\nLayeredHitSounds: 0\n").unwrap();
+        // ~11ms marker: distinguishable from anything the skin/builtin serve.
+        let marker = encode_wav(&vec![0.01f32; 500], false);
+        std::fs::write(map_dir.join("soft-hitnormal.wav"), &marker).unwrap();
+
+        let skin = crate::skin::load_skin(Some(&skin_dir)).unwrap();
+        let store = DirectorySampleStore::new(&map_dir);
+
+        // custom=1 opts the beatmap layer in: the map file wins over the mute.
+        let from_map = resolve_sample_parts("soft", "hitnormal", 1, None, true, Some(&store), &skin)
+            .expect("map-provided layered sample still plays");
+        assert!(from_map == marker, "the beatmap file should be returned untouched");
+
+        // custom=0 keeps the beatmap layer out, so the user-skin mute applies.
+        assert!(
+            resolve_sample_parts("soft", "hitnormal", 0, None, true, Some(&store), &skin).is_none(),
+            "layered sample falls to the user skin, which mutes it"
+        );
+
+        std::fs::remove_dir_all(&skin_dir).ok();
+        std::fs::remove_dir_all(&map_dir).ok();
     }
 
     /// The spinner trio resolves from the embedded Argon level (the
@@ -1942,16 +2456,54 @@ mod tests {
         }
     }
 
+    /// `--hitsounds-mixer-volume` (the gameplay mixer layer) scales the whole
+    /// track linearly; `--hitsounds-volume` (`bus_gain`) multiplies on top.
+    #[test]
+    fn mixer_gain_scales_the_track() {
+        let map = "osu file format v14\n\
+                   \n[General]\nMode: 0\n\
+                   \n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:8\nSliderMultiplier:1.8\nSliderTickRate:1\n\
+                   \n[TimingPoints]\n500,400,4,2,0,40,1,0\n\
+                   \n[HitObjects]\n\
+                   100,100,1000,1,0,0:0:0:0:\n";
+        let dir = std::env::temp_dir().join(format!("osr_mix_gain_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gain.osu");
+        std::fs::write(&path, map).unwrap();
+        let game = crate::game::load_autoplay(path.to_str().unwrap(), 0, false, false).unwrap();
+        let skin = crate::skin::load_skin(None).unwrap();
+
+        let peak = |wav: &[u8]| -> f32 {
+            wav[44..]
+                .chunks_exact(2)
+                .map(|c| (i16::from_le_bytes([c[0], c[1]]) as f32 / 32767.0).abs())
+                .fold(0.0, f32::max)
+        };
+        // Linear variant: no soft limiter, so the gain relation is exact.
+        let full = render_track_wav_linear(&game, &game.sample_data, 900.0, 0.5, 1.0, 1.0, 1.0, &skin);
+        let half = render_track_wav_linear(&game, &game.sample_data, 900.0, 0.5, 1.0, 1.0, 0.5, &skin);
+        let quarter = render_track_wav_linear(&game, &game.sample_data, 900.0, 0.5, 1.0, 0.5, 0.5, &skin);
+        let p_full = peak(&full);
+        assert!(p_full > 0.05, "the hit is audible, peak={p_full}");
+        assert!((peak(&half) / p_full - 0.5).abs() < 0.02, "mixer layer halves the track");
+        assert!((peak(&quarter) / p_full - 0.25).abs() < 0.02, "bus gain multiplies on top");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// `collect_loop_events` on an autoplay one-slider-one-spinner map.
     #[test]
     fn collect_loop_events_autoplay() {
+        // The trailing `hitSample` field is the filename: `0:0:0:0:` leaves it
+        // empty (banked sample), while `0:0:0:0:0` would be
+        // `FileHitSampleInfo("0")` in lazer — a file lookup that resolves to the
+        // default set instead of the timing point's bank.
         let map = "osu file format v14\n\
                    \n[General]\nMode: 0\n\
                    \n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:8\nSliderMultiplier:1.8\nSliderTickRate:1\n\
                    \n[TimingPoints]\n500,400,4,2,0,40,1,0\n\
                    \n[HitObjects]\n\
                    100,100,1000,2,0,B|300:100,1,200,0,0:0:0:0:0,0:0:0:0:0\n\
-                   256,192,2000,12,0,3500,0:0:0:0:0\n";
+                   256,192,2000,12,0,3500,0:0:0:0:\n";
         let dir = std::env::temp_dir().join(format!("osr_loop_events_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("loops.osu");
@@ -2007,6 +2559,165 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// `spinnerspin`/`spinnerbonus`/`spinnerbonus-max` inherit bank/volume from
+    /// the sample point at `GetEndTime() + 5ms` (`applySamples`'s non-repeats
+    /// branch), not from the point at the spinner's start.
+    #[test]
+    fn spinner_reference_samples_use_the_end_point() {
+        let map = "osu file format v14\n\
+                   \n[General]\nMode: 0\n\
+                   \n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:8\nSliderMultiplier:1.8\nSliderTickRate:1\n\
+                   \n[TimingPoints]\n500,400,4,2,0,40,1,0\n1500,400,4,3,0,70,1,0\n\
+                   \n[HitObjects]\n\
+                   256,192,1000,12,0,3000,0:0:0:0:\n";
+        let dir = std::env::temp_dir().join(format!("osr_spin_endpoint_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("spin.osu");
+        std::fs::write(&path, map).unwrap();
+        let game = crate::game::load_autoplay(path.to_str().unwrap(), 0, false, false).unwrap();
+
+        let events = collect_loop_events(&game, &osu_parse::samples::parse(map));
+        let spin = events.iter().find(|e| e.name == "spinnerspin").expect("spinnerspin event");
+        // The spinner starts under the soft/40 point and ends under drum/70;
+        // `Samples` (and therefore the loop) is resolved at the END.
+        assert_eq!(spin.bank, "drum");
+        assert_eq!(spin.volume, 70);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `spinnerbonus-max` is `SpinnerBonusMaxSampleInfo(HitObject.CreateHitSampleInfo())`
+    /// — a plain `HitSampleInfo` carrying only the normal sample's bank, suffix
+    /// and volume. It must not inherit the spinner line's filename, must not opt
+    /// into the beatmap sample layer, and (not being a `LegacyHitSampleInfo`)
+    /// must never be layered, even when the spinner's own sample is.
+    #[test]
+    fn spinner_bonus_max_is_a_plain_sample() {
+        let map = "osu file format v14\n\
+                   \n[General]\nMode: 0\n\
+                   \n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:8\nSliderMultiplier:1.8\nSliderTickRate:1\n\
+                   \n[TimingPoints]\n500,400,4,2,0,40,1,0\n\
+                   \n[HitObjects]\n\
+                   256,192,1000,12,0,9000,0:0:2:70:spin.wav\n";
+        let dir = std::env::temp_dir().join(format!("osr_spin_max_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("spinmax.osu");
+        std::fs::write(&path, map).unwrap();
+        let game = crate::game::load_autoplay(path.to_str().unwrap(), 0, false, false).unwrap();
+
+        let events = collect_events(&game, &game.sample_data);
+        let max: Vec<_> = events.iter().filter(|e| e.name == "spinnerbonus-max").collect();
+        assert!(!max.is_empty(), "autoplay must spin past the bonus budget for this test input");
+        for e in max {
+            assert_eq!(e.bank, "normal");
+            assert_eq!(e.volume, 70, "volume comes from the normal sample");
+            assert_eq!(e.custom, 0, "plain HitSampleInfo: no custom-bank suffix");
+            assert_eq!(e.filename, None, "plain HitSampleInfo: no file reference");
+            assert!(!e.layered, "plain HitSampleInfo: never layered");
+        }
+        // The plain bonus sample does keep the file reference (`With` preserves
+        // the `FileHitSampleInfo`), so the two slots differ on purpose.
+        assert!(
+            events.iter().filter(|e| e.name == "spinnerbonus").any(|e| e.filename.is_some()),
+            "FileHitSampleInfo.With keeps the file for spinnerbonus"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `Sample.PlaybackConcurrency`: 6 at a time per sample file, and a single
+    /// reused `SkinnableSound` instance (`cap == 1`) cuts on every retrigger.
+    #[test]
+    fn voice_limit_caps_and_steals_longest_playing() {
+        let clip = Arc::new(decode_wav(wav!("normal-hitnormal")).unwrap());
+        let dur = clip.duration_ms() / 1000.0;
+        let voice = |start: f64, key: usize, cap: usize| MixVoice {
+            clip: clip.clone(),
+            start,
+            until: None,
+            gl: 1.0,
+            gr: 1.0,
+            key,
+            cap,
+        };
+
+        // Seven instances of one sample at the same instant: the seventh play
+        // evicts the longest-playing (the first) and cuts it immediately.
+        let mut voices: Vec<MixVoice> =
+            (0..7).map(|_| voice(0.0, 1, SAMPLE_CONCURRENCY)).collect();
+        limit_voices(&mut voices);
+        assert_eq!(voices[0].until, Some(0.0), "voice 0 is stolen at 0s");
+        assert!(voices[1..].iter().all(|v| v.until.is_none()), "voices 1..6 keep playing");
+
+        // cap 1: each retrigger cuts the previous playback.
+        let mut voices: Vec<MixVoice> = (0..3).map(|i| voice(i as f64 * 0.01, 2, 1)).collect();
+        limit_voices(&mut voices);
+        assert_eq!(voices[0].until, Some(0.01));
+        assert_eq!(voices[1].until, Some(0.02));
+        assert_eq!(voices[2].until, None);
+
+        // A voice that already ended holds no slot.
+        let mut voices = vec![voice(0.0, 3, 1), voice(dur + 0.1, 3, 1)];
+        limit_voices(&mut voices);
+        assert_eq!(voices[0].until, None, "finished playback is not stolen");
+        assert_eq!(voices[1].until, None);
+
+        // Different resources never compete (separate BASS handles).
+        let mut voices = vec![voice(0.0, 4, 1), voice(0.01, 5, 1)];
+        limit_voices(&mut voices);
+        assert!(voices.iter().all(|v| v.until.is_none()));
+
+        // Loop tiles keep their own cutoff (and never steal from themselves).
+        let mut voices: Vec<MixVoice> = (0..8)
+            .map(|i| {
+                let mut v = voice(i as f64 * 0.01, 6, SAMPLE_CONCURRENCY);
+                v.until = Some(i as f64 * 0.01 + 0.005);
+                v
+            })
+            .collect();
+        limit_voices(&mut voices);
+        for (i, v) in voices.iter().enumerate() {
+            assert_eq!(v.until, Some(i as f64 * 0.01 + 0.005), "loop tile {i} untouched");
+        }
+    }
+
+    /// The stereo balance is clamped to [-1, 1] like BASS's `BASS_ATTRIB_PAN`:
+    /// out-of-range positions (degenerate aspire sliders scale their path to
+    /// ~1.5e9 units) must hard-pan, never turn into a negative/oversized gain.
+    #[test]
+    fn balance_clamps_like_bass_pan() {
+        assert!((balance(0.0) + 0.8).abs() < 1e-9, "left edge");
+        assert!((balance(512.0) - 0.8).abs() < 1e-9, "right edge");
+        assert_eq!(balance(256.0), 0.0, "centre");
+        for x in [1518500608.0f32, -1518500608.0, 1.0e30, -1.0e30, f32::INFINITY, f32::NEG_INFINITY] {
+            let b = balance(x);
+            assert!((-1.0..=1.0).contains(&b), "balance({x}) = {b} must stay within [-1, 1]");
+        }
+        assert_eq!(balance(f32::NAN), 0.0, "non-finite position → centre");
+        // A clamped balance can never produce a negative gain.
+        for x in [1518500608.0f32, -1518500608.0] {
+            let bal = balance(x) as f32;
+            assert!(1.0 - bal.max(0.0) >= 0.0 && 1.0 - (-bal).max(0.0) >= 0.0);
+        }
+    }
+
+    /// `LegacyHitSoundType` → `IsLayered`: a non-empty set without the Normal
+    /// flag attaches a layered hitnormal; None is a plain normal.
+    #[test]
+    fn layered_flag_matches_convert_sound_type() {
+        assert!(!is_layered(0), "None: plain normal sample");
+        assert!(!is_layered(1), "normal flag: not layered");
+        assert!(is_layered(2), "whistle only: layered hitnormal");
+        assert!(is_layered(4 | 8), "finish+clap: layered hitnormal");
+        assert!(!is_layered(1 | 2), "normal+whistle: not layered");
+        // The pooled-sample caps.
+        let base = HitSample { name: "hitnormal", bank: Bank::Normal, custom: 0, volume: 100, filename: None, layered: false };
+        assert_eq!(base.voice_cap(), SAMPLE_CONCURRENCY);
+        assert_eq!(HitSample { name: "spinnerbonus", ..base.clone() }.voice_cap(), SAMPLE_CONCURRENCY);
+        assert_eq!(HitSample { name: "spinnerbonus-max", ..base.clone() }.voice_cap(), 1);
+        assert_eq!(HitSample { name: "combobreak", ..base.clone() }.voice_cap(), 1);
+        assert!(HitSample { name: "combobreak", ..base.clone() }.bypasses_gameplay_mixer());
+        assert!(!base.bypasses_gameplay_mixer());
+    }
+
     /// A 200Hz sine through the spin-loop synth: with modulation the
     /// ratio at zero progress is `20_000/44_100` (pitch drops to ~91Hz),
     /// with `SpinnerFrequencyModulate` off it stays at the natural rate,
@@ -2023,7 +2734,7 @@ mod tests {
         // Constant rotation rate: 144 deg/s -> progress 0.4/s with
         // spins_required = 1 (stays under the 2.27x frequency cap).
         let lp = SpinLoop {
-            sample: HitSample { name: "spinnerspin", bank: Bank::Normal, custom: 0, volume: 100, filename: None },
+            sample: HitSample { name: "spinnerspin", bank: Bank::Normal, custom: 0, volume: 100, filename: None, layered: false },
             runs: vec![(100.0, 900.0)],
             rotation: (0..=20).map(|i| (i as f64 * 100.0, i as f32 * 14.4)).collect(),
             spins_required: 1.0,
@@ -2041,7 +2752,7 @@ mod tests {
         // 2s of stereo buffer; `vi(ms)` is the VALUE index of a frame.
         let vi = |ms: usize| ms * sr / 1000 * 2;
         let mut buf = vec![0.0f32; vi(2000)];
-        synth_spin_loop(&mut buf, &clip, &lp, false, 0.0, 1.0);
+        synth_spin_loop(&mut buf, &clip, &lp, false, 0.0, 1.0, 1.0);
         // Natural rate inside the run; silence before it and after the
         // fade tail (900ms + 240ms).
         assert!((395.0..405.0).contains(&zcr(&buf, sr / 2, sr * 8 / 10)), "natural rate (2 crossings/period)");
@@ -2051,10 +2762,17 @@ mod tests {
         let peak = buf[vi(600)..vi(800)].iter().fold(0.0f32, |m, v| m.max(v.abs()));
         assert!(peak > 0.95, "envelope reaches unity, peak={peak}");
 
+        // The gameplay mixer layer scales the loop like every other hitsound
+        // voice (`spinningSample` sits under `DrawableRuleset.Audio`).
+        let mut buf = vec![0.0f32; vi(2000)];
+        synth_spin_loop(&mut buf, &clip, &lp, false, 0.0, 1.0, 0.5);
+        let half = buf[vi(600)..vi(800)].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!((half / peak - 0.5).abs() < 0.01, "mixer halves the loop, peak={half}");
+
         // Modulated: over [300ms, 500ms] the progress spans 0.12..0.2 ->
         // ratio 0.562..0.635 -> ~225-254 crossings/s.
         let mut buf = vec![0.0f32; vi(2000)];
-        synth_spin_loop(&mut buf, &clip, &lp, true, 0.0, 1.0);
+        synth_spin_loop(&mut buf, &clip, &lp, true, 0.0, 1.0, 1.0);
         let z = zcr(&buf, sr * 3 / 10, sr / 2);
         assert!((220.0..260.0).contains(&z), "modulated pitch ~0.6x, got {z}");
         // Later window runs faster: [700ms, 900ms] -> ratio ~0.71..0.78.
@@ -2119,40 +2837,40 @@ mod beatmap_layer_tests {
         let ms = |bytes: &Vec<u8>| decode_wav(bytes).map(|c| c.duration_ms()).unwrap_or(0.0);
 
         // custom=2:谱面 soft-hitnormal2(45ms)压过皮肤的无后缀文件。
-        let r = resolve_sample_parts("soft", "hitnormal", 2, None, Some(&store), &skin).unwrap();
+        let r = resolve_sample_parts("soft", "hitnormal", 2, None, false, Some(&store), &skin).unwrap();
         assert!((10.0..12.0).contains(&ms(&r)), "custom=2 应命中谱面带后缀文件: {:.0}ms", ms(&r));
 
         // custom=1:谱面无后缀 soft-hitnormal(70ms)压过皮肤(140ms)。
-        let r = resolve_sample_parts("soft", "hitnormal", 1, None, Some(&store), &skin).unwrap();
+        let r = resolve_sample_parts("soft", "hitnormal", 1, None, false, Some(&store), &skin).unwrap();
         assert!((16.0..19.0).contains(&ms(&r)), "custom=1 应命中谱面无后缀文件: {:.0}ms", ms(&r));
 
         // custom=0:谱面文件不参与,皮肤(140ms)接管。
-        let r = resolve_sample_parts("soft", "hitnormal", 0, None, Some(&store), &skin).unwrap();
+        let r = resolve_sample_parts("soft", "hitnormal", 0, None, false, Some(&store), &skin).unwrap();
         assert!((34.0..36.0).contains(&ms(&r)), "custom=0 应由皮肤提供: {:.0}ms", ms(&r));
 
         // custom=3:谱面没有 soft-hitnormal3 → 皮肤剥后缀接管(140ms)。
-        let r = resolve_sample_parts("soft", "hitnormal", 3, None, Some(&store), &skin).unwrap();
+        let r = resolve_sample_parts("soft", "hitnormal", 3, None, false, Some(&store), &skin).unwrap();
         assert!((34.0..36.0).contains(&ms(&r)), "缺失的后缀文件应剥后缀落到皮肤: {:.0}ms", ms(&r));
 
         // 0 字节谱面占位 = 权威静音(不回退皮肤/内置,也不做通用名二次查找)。
-        let r = resolve_sample_parts("soft", "hitclap", 2, None, Some(&store), &skin);
+        let r = resolve_sample_parts("soft", "hitclap", 2, None, false, Some(&store), &skin);
         assert!(r.map(|b| b.is_empty()).unwrap_or(false), "0 字节占位应静音");
 
         // 组号文件缺失:谱面里的通用名 hitclap 优先于皮肤。
-        let r = resolve_sample_parts("soft", "hitclap", 4, None, Some(&store), &skin).unwrap();
+        let r = resolve_sample_parts("soft", "hitclap", 4, None, false, Some(&store), &skin).unwrap();
         assert!((54.0..60.0).contains(&ms(&r)), "组号缺失应命中谱面通用名: {:.0}ms", ms(&r));
 
         // filename 槽:谱面 tickle.wav 直接命中。
-        let r = resolve_sample_parts("normal", "hitnormal", 1, Some("tickle.wav"), Some(&store), &skin).unwrap();
+        let r = resolve_sample_parts("normal", "hitnormal", 1, Some("tickle.wav"), false, Some(&store), &skin).unwrap();
         assert!((10.0..12.0).contains(&ms(&r)), "filename 槽应命中谱面文件: {:.0}ms", ms(&r));
 
         // filename 槽缺失:剥扩展名也 miss → 内置 normal-hitnormal(非空)。
-        let r = resolve_sample_parts("normal", "hitnormal", 1, Some("nosuch.ogg"), Some(&store), &skin);
+        let r = resolve_sample_parts("normal", "hitnormal", 1, Some("nosuch.ogg"), false, Some(&store), &skin);
         assert!(r.is_some_and(|b| !b.is_empty()), "filename 缺失应回退内置 hitnormal");
 
         // 无皮肤参与的非 legacy 内置皮肤同样工作(store 单独在场)。
         let argon = crate::skin::load_skin(None).unwrap();
-        let r = resolve_sample_parts("soft", "hitnormal", 2, None, Some(&store), &argon).unwrap();
+        let r = resolve_sample_parts("soft", "hitnormal", 2, None, false, Some(&store), &argon).unwrap();
         assert!((10.0..12.0).contains(&ms(&r)));
 
         std::fs::remove_dir_all(&dir).ok();

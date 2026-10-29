@@ -41,6 +41,13 @@
 //!                          lazer gameplay-audio parity) and mix it into
 //!                          the export, amix-summed with --audio when
 //!                          present
+//!   --hitsounds-volume <0..1>
+//!                          Hitsound bus gain, lazer's Effect channel
+//!                          (VolumeEffect, default 0.6)
+//!   --hitsounds-mixer-volume <0..1>
+//!                          Gameplay mixer gain (OsuSetting.HitsoundVolume
+//!                          on DrawableRuleset.Audio, default 0.6);
+//!                          Gameplay/combobreak sits outside that mixer
 //!   --skin-colours         Force the user skin's combo colours over the
 //!                          beatmap's [Colours] (stable behaviour, lazer
 //!                          "Beatmap skins" off). Default: the beatmap's
@@ -182,12 +189,17 @@ struct Options {
     /// Hitsound bus gain 0..1 (`--hitsounds-volume`, default 0.6 =
     /// `VolumeEffect`, see `OsuGame.GetFrameworkConfigDefaults`).
     hitsounds_volume: f32,
+    /// Gameplay mixer gain 0..1 (`--hitsounds-mixer-volume`, default 0.6 =
+    /// `OsuSetting.HitsoundVolume`, bound to `DrawableRuleset.Audio`). The
+    /// game's hitsound chain is HitsoundVolume x VolumeEffect x
+    /// VolumeUniversal; `Gameplay/combobreak` sits outside that mixer.
+    hitsounds_mixer_volume: f32,
     /// BGM gain 0..1 (`--bgm-volume`, default 0.6 = `VolumeMusic`).
     bgm_volume: f32,
     /// Master gain applied to the final mixed audio 0..1
     /// (`--master-volume`, default 0.6 = `VolumeUniversal`). The game's
-    /// effective bus gain is channel x master (0.6 x 0.6), so at defaults
-    /// music + hitsounds peak at ~0.72 and essentially never clip.
+    /// music bus is channel x master (0.6 x 0.6); hitsounds additionally take
+    /// the gameplay mixer layer.
     master_volume: f32,
     /// Force the user skin's combo colours over the beatmap's `[Colours]`
     /// (`--skin-colours`; stable behaviour, = lazer's "Beatmap skins"
@@ -274,6 +286,7 @@ struct ConfigJson {
     hd: Option<String>,
     hitsounds: Option<bool>,
     hitsounds_volume: Option<f32>,
+    hitsounds_mixer_volume: Option<f32>,
     bgm_volume: Option<f32>,
     master_volume: Option<f32>,
     skin_colours: Option<bool>,
@@ -407,6 +420,7 @@ fn apply_config(opts: &mut Options, c: ConfigJson) -> Result<(), String> {
     }
     if let Some(true) = c.hitsounds { opts.hitsounds = true; }
     if let Some(v) = c.hitsounds_volume { opts.hitsounds_volume = v; }
+    if let Some(v) = c.hitsounds_mixer_volume { opts.hitsounds_mixer_volume = v; }
     if let Some(v) = c.bgm_volume { opts.bgm_volume = v; }
     if let Some(v) = c.master_volume { opts.master_volume = v; }
     if let Some(true) = c.skin_colours { opts.skin_colours = true; }
@@ -441,7 +455,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
     let autoplay = args.iter().any(|a| a == "--autoplay");
     let min_args = if autoplay { 2 } else { 3 };
     if args.len() < min_args {
-        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--hud on|off] [--hd auto|on|off] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro|dir] [--argon-hud] [--guides on|off] [--pp on|off] [--audio [file.mp3]] [--audio-offset ms] [--bg on|off] [--bg-opacity 0..1] [--storyboard on|off] [--video on|off] [--cursor-size 0.1..=2] [--hitsounds] [--skin-colours] [--upscale off|fsr|anime4k] [--results secs|off] [--results-style lazer|stable] [--results-only] [--avatar image] [--encoder auto|x264|x265|nvenc|hevc-nvenc] [--preset name] [--tune name] [--crf n] [--cq n] [--rc vbr|constqp|cbr] [--qp n] [--gop n] [--ffmpeg-extra arg] [--render-only] [--no-gpu-yuv] [--config file.json] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
+        return Err(format!("usage: {} <beatmap.osu> [replay.osr] [--autoplay] [--hud on|off] [--hd auto|on|off] [--out file.mp4] [--png-dir dir] [--size WxH] [--fps n] [--start ms] [--end ms] [--score classic] [--skin argon|argon-pro|dir] [--argon-hud] [--guides on|off] [--pp on|off] [--audio [file.mp3]] [--audio-offset ms] [--bg on|off] [--bg-opacity 0..1] [--storyboard on|off] [--video on|off] [--cursor-size 0.1..=2] [--hitsounds] [--hitsounds-volume 0..1] [--hitsounds-mixer-volume 0..1] [--skin-colours] [--upscale off|fsr|anime4k] [--results secs|off] [--results-style lazer|stable] [--results-only] [--avatar image] [--encoder auto|x264|x265|nvenc|hevc-nvenc] [--preset name] [--tune name] [--crf n] [--cq n] [--rc vbr|constqp|cbr] [--qp n] [--gop n] [--ffmpeg-extra arg] [--render-only] [--no-gpu-yuv] [--config file.json] [--limit n]", args.get(0).map(|s| s.as_str()).unwrap_or("osu_replay_render")));
     }
     let map_path = args[1].clone();
     let replay_path = if autoplay { None } else { Some(args[2].clone()) };
@@ -484,6 +498,7 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
         hd: HdMode::Auto,
         hitsounds: false,
         hitsounds_volume: 0.6,
+        hitsounds_mixer_volume: 0.6,
         bgm_volume: 0.6,
         master_volume: 0.6,
         skin_colours: false,
@@ -804,6 +819,16 @@ fn parse_args() -> Result<(Options, String, Option<String>), String> {
                     .ok_or("bad --hitsounds-volume (expected 0..1)")?;
                 if !(0.0..=1.0).contains(&opts.hitsounds_volume) {
                     return Err("--hitsounds-volume must be within 0..1".into());
+                }
+            }
+            "--hitsounds-mixer-volume" => {
+                i += 1;
+                opts.hitsounds_mixer_volume = args
+                    .get(i)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("bad --hitsounds-mixer-volume (expected 0..1)")?;
+                if !(0.0..=1.0).contains(&opts.hitsounds_mixer_volume) {
+                    return Err("--hitsounds-mixer-volume must be within 0..1".into());
                 }
             }
             "--bgm-volume" => {
@@ -1356,7 +1381,7 @@ fn main() {
         // 谱面自带采样层(LegacyBeatmapSkin):谱面集目录内文件优先于
         // 皮肤,custom sample bank 索引决定参与与否(lazer 同款链)。
         let beatmap_store = hitsound::DirectorySampleStore::new(&map_dir);
-        let wav = hitsound::render_track_wav_with_beatmap(&game, &game.sample_data, t0, wall_secs, game.rate, opts.hitsounds_volume, &resolved_skin, Some(&beatmap_store));
+        let wav = hitsound::render_track_wav_with_beatmap(&game, &game.sample_data, t0, wall_secs, game.rate, opts.hitsounds_volume, opts.hitsounds_mixer_volume, &resolved_skin, Some(&beatmap_store));
         let p = format!("{}.hits.wav", opts.out.as_ref().unwrap());
         std::fs::write(&p, wav).unwrap_or_else(|e| panic!("write {}: {}", p, e));
         eprintln!("hitsounds: {} ({} samples, {:.1}s)", p, if resolved_skin.is_legacy() { "beatmap/user skin mixed with ArgonPro" } else { "beatmap samples + ArgonPro" }, wall_secs);
