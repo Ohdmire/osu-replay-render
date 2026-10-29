@@ -70,6 +70,9 @@ pub struct ObjView {
     pub duration: f64,
     pub nested: Vec<NestedView>,
     pub spins_required: f64,
+    /// `Spinner.MaximumBonusSpins`: extra spins that award bonus score
+    /// after `SpinsRequired + 2`. Drives the Argon bonus counter.
+    pub maximum_bonus_spins: i64,
     /// Timeline events: head judgement (slider), body/final judgement.
     pub head_judged: Option<(f64, HitResult)>,
     pub body_judged: Option<(f64, HitResult)>,
@@ -589,10 +592,10 @@ pub fn build(
         let pos = [obj.position.x + stack.x, obj.position.y + stack.y];
         let end_pos = [obj.end_position.x + stack.x, obj.end_position.y + stack.y];
 
-        let (kind, slider_points, span_count, duration, nested_raw, spins_required) = match &obj.kind {
-            ProcKind::Circle => (ObjKind::Circle, Vec::new(), 0, 0.0, None, 0.0),
-            ProcKind::Spinner { spins_required, .. } => {
-                (ObjKind::Spinner, Vec::new(), 0, obj.end_time - obj.start_time, None, *spins_required as f64)
+        let (kind, slider_points, span_count, duration, nested_raw, spins_required, maximum_bonus_spins) = match &obj.kind {
+            ProcKind::Circle => (ObjKind::Circle, Vec::new(), 0, 0.0, None, 0.0, 0),
+            ProcKind::Spinner { spins_required, maximum_bonus_spins, .. } => {
+                (ObjKind::Spinner, Vec::new(), 0, obj.end_time - obj.start_time, None, *spins_required as f64, *maximum_bonus_spins as i64)
             }
             ProcKind::Slider { path, nested, span_count, duration, .. } => {
                 let pts: Vec<[f32; 2]> = path
@@ -600,7 +603,7 @@ pub fn build(
                     .iter()
                     .map(|p| [p.x, p.y])
                     .collect();
-                (ObjKind::Slider, pts, *span_count, *duration, Some(nested), 0.0)
+                (ObjKind::Slider, pts, *span_count, *duration, Some(nested), 0.0, 0)
             }
         };
 
@@ -662,6 +665,7 @@ pub fn build(
             duration,
             nested,
             spins_required,
+            maximum_bonus_spins,
             head_judged: None,
             body_judged: None,
             shake_times: Vec::new(),

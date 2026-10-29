@@ -49,12 +49,14 @@ const PLAYFIELD_SHIFT: f32 = 12.8; // 8 virtual px * 1.6
 const PLAYFIELD_SCALE: f32 = 1.6;
 
 const CURSOR_SIZE: f32 = 28.0;
-/// Argon trail sprite is 10px with container scale `0.8 / ScaleAdjust`
-/// (`ArgonCursorTrail`). In playfield units that is 8 across.
-const ARGON_TRAIL_UNITS: f32 = 8.0;
-/// `DisplayWidth * CursorScale / 2.5 * IntervalMultiplier(0.4)` at the
-/// default cursor scale: `10 / 2.5 * 0.4`.
-const ARGON_TRAIL_SPACING_UNITS: f32 = 1.6;
+/// Argon trail sprite (`Cursor/cursortrail`, 10px). The game texture store
+/// loads it at `ScaleAdjust = 2`, so `DisplayWidth` is 5, and
+/// `ArgonCursorTrail` then scales the container by `0.8 / ScaleAdjust`.
+/// Drawn size in playfield units is `5 * 0.8 / 2 = 2`.
+const ARGON_TRAIL_UNITS: f32 = 2.0;
+/// `DisplayWidth * CursorScale / 2.5 * IntervalMultiplier(0.4)`:
+/// `5 / 2.5 * 0.4 = 0.8` playfield units.
+const ARGON_TRAIL_SPACING_UNITS: f32 = 0.8;
 const TRAIL_DURATION: f64 = 300.0;
 const TRAIL_ALPHA: f32 = 0.8;
 const TRAIL_FADE_EXPONENT: f32 = 4.0;
@@ -346,9 +348,10 @@ impl SliderAnim {
 }
 
 struct SpinnerAnim {
-    /// Display rotation (`RotationTracker.Rotation`): Damp toward the raw
-    /// accumulated rotation with base 0.99 per elapsed MILLISECOND.
-    display_rotation: f64,
+    /// First draw after creation/seek: seed the cached counters and the
+    /// damped/lerped states from the snapshot without firing pops, so a
+    /// seek neither replays a stale MAX nor suppresses the next one.
+    initialized: bool,
     /// Tracking element interpolation (0.985 per elapsed ms), frozen once
     /// the spinner completes.
     tracking_lerp: f64,
@@ -357,16 +360,19 @@ struct SpinnerAnim {
     ring_inner: f64,
     side_alpha: f64,
     side_progress: f64,
-    spm_history: Vec<(f64, f32)>,
-    spm: f64,
     bonus_score: i64,
     bonus_flash: Option<(f64, bool)>,
+    /// Highest `CompletedFullSpins` seen. The bonus pop restarts on every
+    /// new whole spin, including the ones past the MAX clamp.
+    whole_bonus_spins: i64,
     /// `Result.TimeCompleted`: latched the moment the required spins are met.
     complete_at: Option<f64>,
     /// Whole rotations seen so far (drives the complete fill pulse).
     whole_rotations: i64,
-    /// Fill pulse start (0.4 -> 0.6 over 60ms OutExpo, back over 250ms).
-    fill_pulse: Option<f64>,
+    /// Fill pulse start and the alpha it started from
+    /// (`ArgonSpinnerDisc.fill`: 0.6 over 60ms OutExpo from the current
+    /// value, then 0.4 over 250ms OutQuint).
+    fill_pulse: Option<(f64, f32)>,
     /// First moment tracking started (`Result.TimeStarted`, gates the SPM).
     spm_started: Option<f64>,
 }
@@ -374,17 +380,16 @@ struct SpinnerAnim {
 impl SpinnerAnim {
     fn new() -> SpinnerAnim {
         SpinnerAnim {
-            display_rotation: 0.0,
+            initialized: false,
             tracking_lerp: 0.0,
             fill_scale: 0.1,
             ring_progress: 0.31,
             ring_inner: 0.02,
             side_alpha: 0.0,
             side_progress: 0.0,
-            spm_history: Vec::new(),
-            spm: 0.0,
             bonus_score: 0,
             bonus_flash: None,
+            whole_bonus_spins: 0,
             complete_at: None,
             whole_rotations: 0,
             fill_pulse: None,
@@ -758,9 +763,9 @@ pub struct SceneState {
     pub follow_points: bool,
     /// 光标尺寸倍率(lazer `OsuSetting.GameplayCursorSize`:默认 1.0,
     /// 范围 0.1..=2)。lazer 把它乘在光标容器的整体 Scale 上——argon 与
-    /// legacy 皮肤光标、拖尾部件尺寸全部生效;legacy 拖尾的部件间隔
+    /// legacy 皮肤光标、拖尾部件尺寸全部生�?legacy 拖尾的部件间�?
     /// 同时按 `1/max(size,1)` 稀疏化(`LegacyCursorTrail.IntervalMultiplier`,
-    /// 部件变大时间距不再继续变密)。皮肤层面没有尺寸配置(skin.ini 只有
+    /// 部件变大时间距不再继续变�?。皮肤层面没有尺寸配�?skin.ini 只有
     /// CursorExpand/CursorRotate/CursorCentre 三个布尔),故默认值内置于此。
     pub cursor_size: f32,
     /// Cursor rendering toggle (default on). Off = no cursor AND no
@@ -812,7 +817,7 @@ pub struct SceneState {
     /// 上下各 12.5% 的黑边（`LetterboxOverlay`）。
     pub letterbox_in_breaks: bool,
     /// 只渲染背景 + storyboard(音频/判定照常):跳过 note/滑条/转盘/
-    /// 跟随点/判定动画/光标等全部 gameplay 元素(壁纸"纯画面"模式)。
+    /// 跟随�?判定动画/光标等全�?gameplay 元素(壁纸"纯画�?模式)�?
     pub gameplay_hidden: bool,
     /// Results-screen cutoff: at times >= this the frame draws the results
     /// screen instead of gameplay. `None` = never.
@@ -912,6 +917,22 @@ impl SceneState {
         );
     }
 
+    /// Drop per-object animation caches after a hard time jump (seek /
+    /// loop). Stateful pops such as the spinner's MAX bounce are driven by
+    /// *changes* of the completed-spin counter; without this a backward
+    /// seek leaves the cached counter at its future value, so the next
+    /// MAX revolution no longer re-triggers (and a forward seek could fire
+    /// a spurious pop). The first draw after this seeds from the snapshot.
+    pub fn reset_animations(&mut self) {
+        for anim in &mut self.spinner_anims {
+            *anim = SpinnerAnim::new();
+        }
+        self.trail.clear();
+        self.ripples.clear();
+        self.cursor_anim = None;
+        self.was_pressed = false;
+    }
+
     pub fn build_frame(
         &mut self,
         game: &GameData,
@@ -942,6 +963,15 @@ impl SceneState {
         } else {
             1000.0 / 60.0
         };
+
+        // Hard time jump: a seek landing / a long stall, or a host that
+        // restarts the clock. Aria anchors the audio clock by up to 80ms
+        // per frame, so small backward corrections must NOT reset.
+        let jumped = self.last_t.is_finite()
+            && (t < self.last_t - 100.0 || t - self.last_t > 500.0);
+        if jumped {
+            self.reset_animations();
+        }
 
         // Resolve the legacy sprite set on the first frame a legacy skin
         // is active (missing elements keep their argon fallbacks).
@@ -1021,10 +1051,10 @@ impl SceneState {
                 Colour::BLACK.opacity(1.0)
             } else {
                 // lazer DimLevel:图像灰度染色 rgb×(1-dim),不是 alpha
-                // 淡出(淡出会透出清屏色)。注意 `bg_opacity` 存的是染色值
+                // 淡出(淡出会透出清屏�?。注�?`bg_opacity` 存的是染色�?
                 // 本身 = 1 - DimLevel(亮度),不是暗度 —— 休息段减淡是
-                // DimLevel - 0.3,换算到亮度即 min(op + 0.3, 1):加,不
-                // 是减(减就变暗了)。见 [`break_lighten_at`]。
+                // DimLevel - 0.3,换算到亮度即 min(op + 0.3, 1):�?�?
+                // 是减(减就变暗�?。见 [`break_lighten_at`]�?
                 let op = if self.break_lighten {
                     let first = game.objects.first().map(|o| o.start_time);
                     let last = game.objects.last().map(|o| o.end_time);
@@ -1052,7 +1082,7 @@ impl SceneState {
         // (rgb × (1-dim), alpha unchanged), not an alpha fade.
         if self.storyboard.is_some() {
             // 暗度已在精灵绘制时逐实例预乘进槽位(见 StoryboardLayer::set_dim)。
-            // 槽位是预乘结果:加色精灵只加 RGB、不写 alpha,必须按预乘 over
+            // 槽位是预乘结�?加色精灵只加 RGB、不�?alpha,必须按预�?over
             // 贴回,光才会叠在背景上并跟着背景亮度走。
             self.blit_storyboard(assets.atlas, list, crate::draw::Region::Storyboard);
         }
@@ -1081,7 +1111,7 @@ impl SceneState {
             }
         }
 
-        // 0.9 纯画面模式:只画背景 + storyboard(含 Overlay 槽),跳过 gameplay。
+        // 0.9 纯画面模�?只画背景 + storyboard(�?Overlay �?,跳过 gameplay�?
         if self.gameplay_hidden {
             if self.storyboard_fg {
                 self.blit_storyboard(assets.atlas, list, crate::draw::Region::StoryboardForeground);
@@ -1225,9 +1255,9 @@ impl SceneState {
     }
 
     fn update_trail(&mut self, cursor: [f32; 2], t: f64) {
-        // 时间不连续(实时预览的 seek 跳变,含回退):拖尾是光标运动的
-        // 时间连续性产物,跳变时旧轨迹整体作废且不做插值。否则回退后
-        // 旧点年龄为负、永不 retire 且 draw 端 clamp 成全亮;前进大跳
+        // 时间不连�?实时预览�?seek 跳变,含回退):拖尾是光标运动的
+        // 时间连续性产�?跳变时旧轨迹整体作废且不做插值。否则回退�?
+        // 旧点年龄为负、永�?retire �?draw �?clamp 成全�?前进大跳
         // 会在相距很远的两位置间插出一条贯穿屏幕的长尾,越拖越多。
         let (fade, spacing, disjoint) = self.trail_metrics();
         let jumped = self
@@ -1337,8 +1367,8 @@ impl SceneState {
         }
     }
 
-    /// `CursorRipple` + `DefaultCursorRipple`: 700ms scale 0.1→1 Out and
-    /// fade 1→0. A skin `cursor-ripple` sprite replaces the 128-unit ring
+    /// `CursorRipple` + `DefaultCursorRipple`: 700ms scale 0.1�? Out and
+    /// fade 1�?. A skin `cursor-ripple` sprite replaces the 128-unit ring
     /// (`OsuLegacySkinTransformer`); the stable 50% scale / 20% opacity
     /// hack stays commented out upstream, so it is not applied here.
     fn draw_ripples(&self, list: &mut DrawList, assets: &Assets) {
@@ -2080,12 +2110,35 @@ impl SceneState {
         }
         let complete = anim.complete_at.is_some_and(|ct| t >= ct);
 
-        // Display rotation: `Interpolation.Damp(Rotation, currentRotation,
-        // 0.99, |Time.Elapsed|)` - the framework Damp exponent is the
-        // elapsed MILLISECONDS (0.99^16.67 ≈ 0.85 per 60Hz frame), so the
-        // disc visibly keeps up with fast spins.
-        anim.display_rotation = damp_frame(anim.display_rotation, frame.visual_rotation as f64, 0.99, dt);
+        let rotations = ((frame.total_rotation / 360.0) as f64).floor() as i64;
+        let bonus = 50 * (rotations - obj.spins_required as i64 - 2)
+            .clamp(0, obj.maximum_bonus_spins);
+        // First draw after creation / a seek: re-arm from the snapshot at
+        // THIS time. A backward seek must put `whole_bonus_spins` (and the
+        // displayed score) back to the values of the target time, otherwise
+        // the next MAX revolution is not "new" and the bounce never
+        // re-triggers; a forward seek must not fire a spurious pop.
+        if !anim.initialized {
+            anim.initialized = true;
+            anim.tracking_lerp = if frame.tracking { 1.0 } else { 0.0 };
+            anim.fill_scale = (0.1 + (0.98 - 0.1) * progress) as f32;
+            anim.ring_progress = if complete { 0.50 } else { 0.31 };
+            anim.ring_inner = if complete { 0.02 * 2.2 } else { 0.02 };
+            anim.side_alpha = if progress > 0.0 && progress < 1.0 { 1.0 } else { 0.0 };
+            anim.side_progress = if progress >= 1.0 { 0.0 } else { 0.15 * progress };
+            anim.whole_rotations = rotations;
+            anim.whole_bonus_spins = rotations;
+            anim.bonus_score = bonus;
+            anim.bonus_flash = None;
+            anim.fill_pulse = None;
+        }
 
+        // Display rotation (and SPM) come straight from the engine
+        // snapshot: `SpinnerRotationTracker.Rotation` and
+        // `SpinnerSpmCalculator.Result` are simulated upstream per game
+        // frame, so a clip starting mid-spinner (or a preview seek) shows
+        // the source's angle/speed instead of re-damping from 0.
+        //
         // The tracking interpolation (fill alpha + centre size) only
         // advances while incomplete; it freezes once complete.
         if !complete {
@@ -2100,9 +2153,25 @@ impl SceneState {
         let target_fill = 0.1 + (0.98 - 0.1) * progress;
         anim.fill_scale = lerp(anim.fill_scale, target_fill as f32, (dt / 100.0).clamp(0.0, 1.0));
 
-        let rotations = ((frame.total_rotation / 360.0) as f64).floor() as i64;
+        // `ArgonSpinnerDisc.fill.Alpha`: the tracking interpolation owns it
+        // while incomplete (0.2 idle .. 0.4 tracking); once complete, the
+        // per-rotation pulse transforms own it and the interpolation
+        // freezes. A pulse re-triggered mid-transform starts from the
+        // current value (`FinishTransforms` semantics, approximated).
+        let base_fill_alpha = (anim.tracking_lerp * (0.4 - 0.2) + 0.2) as f32;
+        let fill_alpha = match anim.fill_pulse {
+            Some((pt, from)) => {
+                let x = t - pt;
+                if x < 60.0 {
+                    value_at(x, 0.0, 60.0, from as f64, 0.6, Easing::OutExpo) as f32
+                } else {
+                    value_at(x, 60.0, 310.0, 0.6, 0.4, Easing::OutQuint) as f32
+                }
+            }
+            None => base_fill_alpha,
+        };
         if complete && rotations > anim.whole_rotations {
-            anim.fill_pulse = Some(t);
+            anim.fill_pulse = Some((t, fill_alpha));
         }
         anim.whole_rotations = rotations.max(anim.whole_rotations);
 
@@ -2117,39 +2186,29 @@ impl SceneState {
         let side_progress_target = if progress >= 1.0 { 0.0 } else { 0.15 * progress };
         anim.side_progress = damp_half(anim.side_progress, side_progress_target, 40.0, dt);
 
-        // SPM (`SpinnerSpmCalculator`): records accumulate every frame while
-        // t <= EndTime (score-side `Result.TotalRotation`, NOT the visual
-        // rotation), over a 595ms window; the value FREEZES at EndTime so
-        // it doesn't drop during the fade out.
-        if t <= obj.end_time {
-            anim.spm_history.push((t, frame.total_rotation));
-            anim.spm_history.retain(|(ht, _)| t - ht <= 595.0);
-            if let Some(first) = anim.spm_history.first() {
-                let dtm = t - first.0;
-                if dtm > 0.0 {
-                    let drot = frame.total_rotation - first.1;
-                    anim.spm = (drot as f64 / dtm) * 1000.0 * 60.0 / 360.0;
-                }
-            }
-        }
+        // SPM (`SpinnerSpmCalculator.Result`) comes from the engine
+        // snapshot: the calculator's 595ms record queue is maintained
+        // upstream across the whole playthrough, so the value ramps from
+        // 0 at the spinner's start even when rendering starts mid-spinner.
 
-        // Bonus ticks.
-        let mut bonus = 0i64;
-        let mut bonus_max = 0i64;
-        for (oi, time, large) in &game.spinner_ticks {
-            if *oi != idx {
-                continue;
-            }
-            bonus_max += if *large { 50 } else { 10 };
-            if *time <= t {
-                bonus += if *large { 50 } else { 10 };
-            }
-        }
-        if bonus != anim.bonus_score {
-            let is_max = bonus_max > 0 && bonus >= bonus_max;
+        // Bonus counter (`DrawableSpinner.CurrentBonusScore`):
+        // `score_per_tick * clamp(completedFullSpins - SpinsRequiredForBonus,
+        // 0, MaximumBonusSpins)`. `score_per_tick` is the base score of a
+        // `SpinnerBonusTick`, which is always `LargeBonus` = 50. Counting
+        // the awarded ticks instead over-counts: the first `SpinsRequired`
+        // ticks are silent `SmallBonus` (10) and the next two are the
+        // bonus gap, also 10, so the displayed total ran low.
+        // The pop is bound to `CompletedFullSpins`, not to the clamped
+        // score. Once the counter reads MAX the number stops changing,
+        // but every further whole revolution still restarts the scale,
+        // the pink flash and the fade (`BindValueChanged` fires again).
+        let is_max = obj.maximum_bonus_spins > 0 && bonus >= 50 * obj.maximum_bonus_spins;
+        let replay = is_max && rotations > anim.whole_bonus_spins;
+        if bonus != anim.bonus_score || replay {
             anim.bonus_score = bonus;
             anim.bonus_flash = Some((t, is_max));
         }
+        anim.whole_bonus_spins = rotations.max(anim.whole_bonus_spins);
 
         // Overall fade (`DrawableSpinner.UpdateHitStateTransforms`:
         // FadeOut(240) - linear). HD multiplies an EXTRA fade that only
@@ -2199,8 +2258,8 @@ impl SceneState {
                 t,
                 progress,
                 anim.complete_at,
-                anim.display_rotation,
-                anim.spm,
+                frame.display_rotation as f64,
+                frame.spm as f64,
                 anim.bonus_score,
                 anim.bonus_flash,
                 hit_time,
@@ -2241,93 +2300,178 @@ impl SceneState {
             return;
         }
 
-        // Ambient rotation (ticksContainer).
+        // Ambient rotation (ticksContainer): `RotateTo(25 * Duration / 2000,
+        // TimePreempt + Duration)` started at `StartTime - TimePreempt/2`, so
+        // it ends at `StartTime + TimePreempt/2 + Duration`.
         let ambient = value_at(
             t,
             t0 + p / 2.0,
-            t0 + p + obj.duration,
+            t0 + p * 1.5 + obj.duration,
             0.0,
             25.0 * obj.duration / 2000.0,
             Easing::Linear,
         );
 
-        // --- Draw: glow fill -----------------------------------------------------
-        // Idle 0.2 <-> tracking 0.4 via the frozen tracking interpolation,
-        // plus the complete pulse (0.6 over 60ms OutExpo, back over 250ms
-        // OutQuint per new rotation).
-        let mut fill_alpha = anim.tracking_lerp * (0.4 - 0.2) + 0.2;
-        if let Some(pt) = anim.fill_pulse {
-            let x = t - pt;
-            fill_alpha += if x < 60.0 {
-                value_at(x, 0.0, 60.0, 0.0, 0.2, Easing::OutExpo)
-            } else {
-                value_at(x, 60.0, 310.0, 0.2, 0.0, Easing::OutQuint)
-            };
-        }
-        let fill_radius = (unit * 0.5 - 8.0 * s) * anim.fill_scale * disc_scale as f32;
-        if fill_radius > 2.0 {
-            list.glow(centre, fill_radius, Colour::from_hex(0xFC618F).opacity(fill_alpha as f32 * 0.45 * a));
-            list.disc(
+        // --- Draw: ArgonSpinnerDisc ------------------------------------------
+        // `ArgonSpinnerDisc` is 384x384 gamefield units (`AspectContainer`,
+        // RelativeSizeAxes.Y inside `DrawableSpinner`). Its `disc` child is a
+        // `CircularContainer` (automatic corner radius, NOT masked); the
+        // pop-in scale is `disc.Scale`.
+        let disc = disc_scale as f32;
+
+        // `fill` sits inside a Container padded by 8, is a
+        // `CircularContainer` with `Masking` and an `EdgeEffectType.Shadow`
+        // (Colour FC618F, Radius 40). Its Box is Alpha 0, so only the shadow
+        // is visible. `drawEdgeEffect` runs BEFORE the mask is pushed, so
+        // the halo is NOT clipped to the fill: solid through the scaled
+        // circle, then `pow(1 - d/40, 2)` over 40 local px OUTSIDE it. The
+        // fill's alpha is 0.2 idle / 0.4 tracking (+ per-rotation pulse).
+        let fill_radius = (unit * 0.5 - 8.0 * s) * disc * anim.fill_scale;
+        if fill_radius > 0.5 {
+            let blur = 40.0 * s * disc * anim.fill_scale;
+            list.edge_shadow_rrect(
                 centre,
+                [fill_radius, fill_radius],
                 fill_radius,
-                Colour::from_hex(0xFC618F).opacity(fill_alpha as f32 * 0.10 * a),
-                Colour::from_hex(0xFC618F).opacity(fill_alpha as f32 * 0.10 * a),
-                Blend::Additive,
+                blur,
+                0.0,
+                Colour::from_hex(0xFC618F).opacity(fill_alpha * a),
             );
         }
 
-        // Tick marks ring (rotates with the damped display rotation, inside
-        // the ambient-rotating container; +180 on hit). Lazer places the
-        // marks at relative (0.5 + sin(t)/2*0.75, 0.5 + cos(t)/2*0.75) and
-        // a POSITIVE (clockwise) container rotation moves them to angle
-        // (t - rot) - so the ring spins the same direction as the cursor.
-        let tick_ring_rot = (ambient + end_spin + anim.display_rotation) as f32;
-        let tick_radius = unit * 0.375 * disc_scale as f32;
-        for i in 0..25u32 {
-            let ang = (i as f32 / 25.0) * std::f32::consts::TAU;
-            let rot = ang - tick_ring_rot.to_radians();
-            let (sin_a, cos_a) = rot.sin_cos();
-            let pos = [centre[0] + sin_a * tick_radius, centre[1] + cos_a * tick_radius];
-            let mark_rot = -(i as f32 / 25.0) * 360.0 - 120.0 + tick_ring_rot;
-            let half_l = 15.0 * s;
-            let (sr, cr) = mark_rot.to_radians().sin_cos();
-            let p0 = [pos[0] - cr * half_l, pos[1] - sr * half_l];
-            let p1 = [pos[0] + cr * half_l, pos[1] + sr * half_l];
-            list.capsule(p0, p1, 2.5 * s, Colour::WHITE.opacity(0.85 * a), Blend::Alpha);
+        // `ArgonSpinnerTicks`: 25 stadium outlines (30x5, CornerRadius 5
+        // clamped to 2.5, BorderThickness 2, white) each carrying a white
+        // 0.2 `EdgeEffectType.Shadow` of radius 30. Positions are relative
+        // to the padded (8) ticks container, at 0.75 of its radius, rotated
+        // by the ambient container + the rotation tracker (and +180 on hit).
+        let tick_ring_rot = (ambient + end_spin + frame.display_rotation as f64) as f32;
+        let ticks_size = (unit - 16.0 * s) * disc;
+        let tick_radius = 0.375 * ticks_size;
+        let tick_half = [15.0 * s * disc, 2.5 * s * disc];
+        let tick_corner = 2.5 * s * disc;
+        if ticks_size > 1.0 {
+            for i in 0..25u32 {
+                let ang = (i as f32 / 25.0) * std::f32::consts::TAU;
+                let rot = ang - tick_ring_rot.to_radians();
+                let (sin_a, cos_a) = rot.sin_cos();
+                let pos = [centre[0] + sin_a * tick_radius, centre[1] + cos_a * tick_radius];
+                let mark_rot = -(i as f32 / 25.0) * 360.0 - 120.0 + tick_ring_rot;
+                list.edge_shadow_rrect(
+                    pos,
+                    tick_half,
+                    tick_corner,
+                    30.0 * s * disc,
+                    mark_rot,
+                    Colour::WHITE.opacity(0.2 * a),
+                );
+                list.rrect_border(
+                    pos,
+                    tick_half,
+                    tick_corner,
+                    2.0 * s * disc,
+                    mark_rot,
+                    Colour::WHITE.opacity(a),
+                );
+            }
         }
 
-        // Ring arcs (top / bottom), scaling with the disc pop-in (they live
-        // inside the disc container in lazer).
-        let disc = disc_scale as f32;
-        let ring_r = (unit * 0.5 - 8.0 * s) * disc;
-        let ring_span = (anim.ring_progress * 360.0) as f32;
-        let half = ring_span * 0.5;
-        let ring_t = anim.ring_inner as f32 * unit * 0.5 * disc;
-        list.arc(centre, ring_r, ring_t, -90.0 - half, -90.0 + half, Colour::WHITE.opacity(0.9 * a), Blend::Alpha);
-        list.arc(centre, ring_r, ring_t, 90.0 - half, 90.0 + half, Colour::WHITE.opacity(0.9 * a), Blend::Alpha);
+        // `ArgonSpinnerRingArc` pair inside the masked `Ring` container
+        // (padded 8): `CircularProgress`, `InnerRadius` 0.02 (damped to
+        // 0.02 * 2.2 on completion), `Progress` 0.31 -> 0.5, rotated
+        // `-Progress * 180`, the second one mirrored vertically.
+        let ring_size = (unit - 16.0 * s) * disc;
+        let ring_progress = anim.ring_progress;
+        let ring_span = (ring_progress * std::f64::consts::TAU) as f32;
+        let ring_inner = anim.ring_inner as f32;
+        list.circular_progress(
+            centre,
+            ring_size,
+            ring_inner,
+            ring_progress as f32,
+            -std::f32::consts::FRAC_PI_2 - ring_span * 0.5,
+            ring_span,
+            Colour::WHITE.opacity(a),
+            Blend::Alpha,
+        );
+        list.circular_progress(
+            centre,
+            ring_size,
+            ring_inner,
+            ring_progress as f32,
+            std::f32::consts::FRAC_PI_2 - ring_span * 0.5,
+            ring_span,
+            Colour::WHITE.opacity(a),
+            Blend::Alpha,
+        );
 
-        // Side progress arcs (also inside the disc). The static background
-        // switches off INSTANTLY when the spinner completes
-        // (background.Alpha = progress >= 1 ? 0 : 1).
-        let thickness = 0.12 * (unit * 0.5) * disc;
-        let r = unit * 0.5 * disc - thickness * 0.5;
-        let bg_half = 0.15 * 360.0 * 0.5;
+        // `ArgonSpinnerProgressArc` pair in the unmasked `Sides` container:
+        // `CircularProgress`, `InnerRadius` 0.12, `RoundedCaps`. The
+        // background (Progress 0.15) hides INSTANTLY at completion. The
+        // fill damps both alpha (1 while 0 < progress < 1) and progress
+        // (0.15 * progress), and is wrapped by `ProgressFill`, whose
+        // `SpinnerGlow` shader adds the 1x107 gaussian halo.
+        let side_size = unit * disc;
+        let bg_span = 0.15 * std::f32::consts::TAU;
         if progress < 1.0 {
-            list.arc(centre, r, thickness, 180.0 - bg_half, 180.0 + bg_half, Colour::WHITE.opacity(0.25 * a), Blend::Alpha);
-            list.arc(centre, r, thickness, -bg_half, bg_half, Colour::WHITE.opacity(0.25 * a), Blend::Alpha);
+            for start in [
+                -bg_span * 0.5,
+                std::f32::consts::PI - bg_span * 0.5,
+            ] {
+                list.circular_progress(
+                    centre,
+                    side_size,
+                    0.12,
+                    0.15,
+                    start,
+                    bg_span,
+                    Colour::WHITE.opacity(0.25 * a),
+                    Blend::Alpha,
+                );
+            }
         }
-        let side_span = (anim.side_progress * 360.0) as f32;
-        if side_span > 0.5 && anim.side_alpha > 0.01 {
-            let side_half = side_span * 0.5;
-            let col = Colour::WHITE.opacity((anim.side_alpha * 0.9) as f32 * a);
-            list.arc(centre, r, thickness, 180.0 - side_half, 180.0 + side_half, col, Blend::Alpha);
-            list.arc(centre, r, thickness, -side_half, side_half, col, Blend::Alpha);
-            let glow_col = Colour::rgba_bytes(171, 255, 255, 180).opacity((anim.side_alpha * 0.4) as f32 * a);
-            list.arc(centre, r, thickness * 2.4, 180.0 - side_half, 180.0 + side_half, glow_col, Blend::Additive);
-            list.arc(centre, r, thickness * 2.4, -side_half, side_half, glow_col, Blend::Additive);
+        let side_p = anim.side_progress as f32;
+        let side_span = side_p * std::f32::consts::TAU;
+        if side_p > 0.0005 && anim.side_alpha > 0.001 {
+            let band_alpha = (anim.side_alpha as f32) * a;
+            // `SpinnerGlow`'s GlowColour is (171,255,255,180). The halo's
+            // colour is correct (r/g = 0.67), but the renderer's SDR target
+            // has no HDR tone curve, so adding the full 180/255 alpha makes
+            // the halo exactly 2x the luminance of the same glow in lazer
+            // (the white bar clips in both, but the mid-tone glow does not).
+            // 90/255 reproduces the source's on-screen halo at the bar edge
+            // ((58,86,86) vs the game's (58,86,86)).
+            let glow_col = Colour::rgba_bytes(171, 255, 255, 255)
+                .opacity(anim.side_alpha as f32 * (90.0 / 255.0) * a);
+            for start in [
+                -side_span * 0.5,
+                std::f32::consts::PI - side_span * 0.5,
+            ] {
+                list.circular_progress(
+                    centre,
+                    side_size,
+                    0.12,
+                    side_p,
+                    start,
+                    side_span,
+                    Colour::WHITE.opacity(band_alpha),
+                    Blend::Alpha,
+                );
+                list.spinner_glow(
+                    assets.atlas,
+                    centre,
+                    side_size,
+                    0.12,
+                    side_p,
+                    start,
+                    side_span,
+                    107.0 / SPINNER_DISC,
+                    glow_col,
+                );
+            }
         }
 
-        // Centre rings (size damps 80 -> 40 with tracking).
+        // Centre rings (`RingPiece(10)` at 0.8 and `RingPiece(3)` at 1.0),
+        // size damped 80 -> 40 by the tracking interpolation.
         let centre_size = (anim.tracking_lerp * (40.0 - 80.0) + 80.0) as f32;
         let cs = centre_size * s * centre_scale as f32;
         if cs > 1.0 {
@@ -2340,7 +2484,7 @@ impl SceneState {
         if let Some(started) = anim.spm_started {
             let spm_a = ((t - started) / obj.fade_in).clamp(0.0, 1.0) as f32 * a;
             let spm_pos = [centre[0], centre[1] + 60.0 * s];
-            draw_ttf_text(list, assets.atlas, assets.semibold, false, &(anim.spm.trunc() as i64).to_string(), spm_pos, 28.0 * s, Colour::WHITE.opacity(spm_a), 0.0, Blend::Alpha);
+            draw_ttf_text(list, assets.atlas, assets.semibold, false, &(frame.spm.trunc() as i64).to_string(), spm_pos, 28.0 * s, Colour::WHITE.opacity(spm_a), 0.0, Blend::Alpha);
             let label_pos = [spm_pos[0], spm_pos[1] + 30.0 * s];
             draw_ttf_text(list, assets.atlas, assets.semibold, false, "SPINS PER MINUTE", label_pos, 16.0 * s, Colour::WHITE.opacity(spm_a * 0.8), 2.0 * s, Blend::Alpha);
 
@@ -2362,7 +2506,16 @@ impl SceneState {
                     };
                     let text = if is_max { "MAX".to_string() } else { anim.bonus_score.to_string() };
                     let pos = [centre[0], centre[1] - 100.0 * s];
-                    draw_ttf_text(list, assets.atlas, assets.bold, true, &text, pos, 28.0 * s * pop, Colour::from_hex(0xFC618F).opacity(ba), 0.0, Blend::Alpha);
+                    // Default text is white. Only the MAX branch calls
+                    // `FlashColour(FC618F, 400)`, which paints the text pink
+                    // and eases it back to white.
+                    let col = if is_max {
+                        let back = value_at(x, 0.0, 400.0, 0.0, 1.0, Easing::Linear) as f32;
+                        Colour::lerp_linear(Colour::from_hex(0xFC618F), Colour::WHITE, back)
+                    } else {
+                        Colour::WHITE
+                    };
+                    draw_ttf_text(list, assets.atlas, assets.bold, true, &text, pos, 28.0 * s * pop, col.opacity(ba), 0.0, Blend::Alpha);
                 }
             }
         }
@@ -2635,9 +2788,9 @@ fn draw_circle_piece(
         // sprites OR the argon vector piece draws (`with_outer_fill` ==
         // false means this is a slider head, which prefers
         // `sliderstartcircle`).
-        // 滑条头有自己的 `sliderstartcircle` 时,缺外圈就不要去借
+        // 滑条头有自己�?`sliderstartcircle` �?缺外圈就不要去�?
         // `hitcircleoverlay`(lazer LegacyMainCirclePiece 的前缀规则)。
-        // 普通圆圈缺 `hitcircleoverlay` 时,查找会落到经典默认皮的白环。
+        // 普通圆圈缺 `hitcircleoverlay` �?查找会落到经典默认皮的白环�?
         let (pair, classic_overlay) = if with_outer_fill {
             (lg.hitcircle, true)
         } else if lg.sliderstartcircle.is_some() {
@@ -2759,7 +2912,7 @@ fn draw_circle_piece_legacy(
             draw_sprite(list, overlay, Colour::WHITE);
         } else if classic_overlay {
             // `DefaultLegacySkin` 的 hitcircleoverlay:128 画布上外沿约 118、
-            // 环宽约 9 的白圈,不吃 combo 色。皮肤没给这张图时 osu 用它。
+            // 环宽�?9 的白�?不吃 combo 色。皮肤没给这张图�?osu 用它�?
             let d = circle.display_width() * s * sprite_scale;
             let outer = d * (118.0 / 128.0) * 0.5;
             let thickness = d * (9.0 / 128.0);
@@ -3248,11 +3401,11 @@ mod tests {
     }
 
     /// break_lighten_at:前奏常亮 → gameplay 起点淡回 → break 淡入 →
-    /// break 尾(end-325)淡出 → 曲末再淡入;边沿 800ms OutQuint。
+    /// break �?end-325)淡出 �?曲末再淡�?边沿 800ms OutQuint�?
     #[test]
     fn break_lighten_edges() {
-        // 晚开的谱面:两物件 10000..10100 / 15000..15100,
-        // break [11000, 13000)(≥650 生效)。
+        // 晚开的谱�?两物�?10000..10100 / 15000..15100,
+        // break [11000, 13000)(�?50 生效)�?
         let breaks = [(11000.0, 13000.0)];
         let (first, last) = (Some(10000.0), Some(15100.0));
         let at = |t: f64| break_lighten_at(&breaks, first, last, t);
@@ -3271,8 +3424,8 @@ mod tests {
         assert_eq!(break_lighten_at(&short, first, last, 11200.0), 0.0);
     }
 
-    /// 应用方向:bg_opacity 是亮度(1 - DimLevel),休息段减淡 = 暗度减
-    /// 0.3 = 亮度**加** 0.3 封顶 —— 曾经写反成减,画面反而变暗。
+    /// 应用方向:bg_opacity 是亮�?1 - DimLevel),休息段减�?= 暗度�?
+    /// 0.3 = 亮度**�?* 0.3 封顶 —�?曾经写反成减,画面反而变暗�?
     #[test]
     fn break_lighten_brightens() {
         let full = break_lighten_at(&[(11000.0, 13000.0)], Some(10000.0), Some(15100.0), 12000.0);
@@ -3307,6 +3460,7 @@ mod tests {
             duration: spans as f64 * 250.0,
             nested: Vec::new(),
             spins_required: 0.0,
+            maximum_bonus_spins: 0,
             head_judged: None,
             body_judged: None,
             shake_times: Vec::new(),

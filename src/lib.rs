@@ -161,6 +161,9 @@ const MOD_ICON_PNGS: [&[u8]; 14] = [
 const MOD_ICON_BG_PNG: &[u8] = include_bytes!("../assets/modicons/mod-icon.png");
 const REPEAT_EDGE_PNG: &[u8] = include_bytes!("../assets/cursor/repeat-edge-piece.png");
 const APPROACH_CIRCLE_PNG: &[u8] = include_bytes!("../assets/cursor/approachcircle.png");
+/// `osu-resources` `Textures/Gameplay/osu/spinner-glow.png`: the 1x107 white
+/// ramp sampled by `sh_SpinnerGlow.fs` (the Argon spinner side-bar halo).
+const SPINNER_GLOW_PNG: &[u8] = include_bytes!("../assets/spinner/spinner-glow.png");
 
 /// Lazer `ResultsScreen.BACKGROUND_BLUR` (blur sigma) expressed in
 /// virtual 1024x768 canvas units: 10 screen px at 1080p is
@@ -372,6 +375,10 @@ pub fn build_atlas(
     {
         let (w, h, rgba) = decode_png_bytes(APPROACH_CIRCLE_PNG).expect("embedded png");
         images.push((Region::ApproachCircle, Image { width: w, height: h, rgba }));
+    }
+    {
+        let (w, h, rgba) = decode_png_bytes(SPINNER_GLOW_PNG).expect("embedded png");
+        images.push((Region::SpinnerGlow, Image { width: w, height: h, rgba }));
     }
     for (i, png) in MOD_ICON_PNGS.iter().enumerate() {
         let (w, h, rgba) = decode_png_bytes(png).expect("embedded mod icon png");

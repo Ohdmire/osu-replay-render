@@ -51,6 +51,31 @@ fn aa(sdf: f32) -> f32 {
     return clamp(sdf / 0.75 + 0.5, 0.0, 1.0);
 }
 
+// Exact `distanceToProgress` from osu-framework's
+// `sh_CircularProgressUtils.h` (`RoundedCaps = true`). `p_local` is the
+// screen-space offset from the drawable centre, `size` its square screen
+// size, and `tx` the framework `TexelSize` (1.5 / screen size).
+fn circProgressDist(p_local: vec2<f32>, size: f32, ir: f32, prog: f32, a0: f32, span: f32, tx: f32) -> f32 {
+    let path_r = 0.25 * ir;
+    let half_texel = tx * 0.5;
+    let p = p_local / size + vec2<f32>(0.5);
+    let d = length(p - vec2<f32>(0.5));
+    let centerline = 0.5 - path_r - half_texel;
+
+    var ang = atan2(p_local.y, p_local.x);
+    var rel = ang - a0;
+    let two_pi = 6.28318530718;
+    rel = rel - floor(rel / two_pi) * two_pi;
+
+    if (prog >= 1.0 || rel <= span) {
+        return abs(d - centerline) - path_r + half_texel;
+    }
+
+    let c0 = vec2<f32>(0.5) + vec2<f32>(cos(a0), sin(a0)) * centerline;
+    let c1 = vec2<f32>(0.5) + vec2<f32>(cos(a0 + span), sin(a0 + span)) * centerline;
+    return min(distance(p, c0), distance(p, c1)) + half_texel - path_r;
+}
+
 struct VsOut2 {
     @builtin(position) pos: vec4<f32>,
     @location(0) start: vec2<f32>,
@@ -158,6 +183,27 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         }
         let a = f * in.color.a;
         c = vec4<f32>(in.color.rgb * a, a);
+    } else if (mode == 14.0) {
+        // EdgeEffectType.Shadow clipped to its container. The shadow rect
+        // is inflated by aux.z; alpha is pow(min(fadeStart - dist, 1), 2)
+        // with fadeStart = 1 + radius/blur, so it is 1 at the circle's edge
+        // and 0 one blur further out. The container mask keeps only d <=
+        // radius, which leaves the interior: full in the middle, softening
+        // over the outer `blur` px.
+        let d = length(in.local);
+        let radius = in.aux.y;
+        let blur = max(in.aux.z, 0.001);
+        let dist = d / blur;
+        let fade_start = 1.0 + radius / blur;
+        // `pow(min(fadeStart - dist, 1), 2)`: 1 at the circle edge, 0 one
+        // blur further out. The container mask is a 1px smoothstep
+        // (`MaskingSmoothness` 1, `BlendRange` ≈ 1 screen px, exponent 1),
+        // so the interior stays at the shadow's own alpha and only the
+        // last pixel of the rim is feathered.
+        let factor = pow(clamp(min(fade_start - dist, 1.0), 0.0, 1.0), 2.0);
+        let mask = smoothstep(0.0, 1.0, radius - d);
+        let a = factor * mask * in.color.a;
+        c = vec4<f32>(in.color.rgb * a, a);
     } else if (mode == 4.0) {
         // Stroke band: t = aux.y in [-1..1], border for |t| > 1 - aux.z.
         let t = abs(in.aux.y);
@@ -191,6 +237,124 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // Angular soft edge (approximate AA at the caps).
         let ang_fade = min(1.0, min(rel, span - rel) * in.aux.y / 0.75);
         let a = inside * ang_fade * in.color.a;
+        c = vec4<f32>(in.color.rgb * a, a);
+    } else if (mode == 13.0) {
+        // CircularProgress with RoundedCaps: the mode-7 band, plus a disc
+        // of radius thickness/2 centred on the band at each end angle.
+        let d = length(in.local);
+        let radius = in.aux.y;
+        let thickness = in.aux.z;
+        let cap_r = thickness * 0.5;
+        let a0 = in.aux.w;
+        let a1 = in.color2.x;
+        var ang = atan2(in.local.y, in.local.x);
+        var rel = ang - a0;
+        let two_pi = 6.28318530718;
+        rel = (rel - floor(rel / two_pi) * two_pi);
+        let span = max(a1 - a0, 0.0);
+        let in_band = abs(d - radius) <= cap_r + 0.75 && rel <= span;
+        let ang_fade = min(1.0, min(rel, span - rel) * radius / 0.75);
+        let band_a = select(0.0, ang_fade, in_band);
+        let c0 = vec2<f32>(cos(a0), sin(a0)) * radius;
+        let c1 = vec2<f32>(cos(a1), sin(a1)) * radius;
+        let cap_a = max(aa(cap_r - length(in.local - c0)), aa(cap_r - length(in.local - c1)));
+        let a = max(band_a, cap_a) * in.color.a;
+        c = vec4<f32>(in.color.rgb * a, a);
+    } else if (mode == 15.0) {
+        // EdgeEffectType.Glow clipped to a round-capped arc. The arc's
+        // coverage is a signed distance (positive inside the band and the
+        // caps). Inflating by the glow radius and squaring gives the
+        // framework's `pow(min(fadeStart - dist, 1), 2)`, and multiplying
+        // by the arc's own alpha keeps the glow inside the shape: full
+        // through the band, softening over `glow` px past it.
+        let d = length(in.local);
+        let radius = in.aux.y;
+        let thickness = in.aux.z;
+        let a0 = in.aux.w;
+        let a1 = in.color2.x;
+        let glow = max(in.color2.y, 0.001);
+        let cap_r = thickness * 0.5;
+        var ang = atan2(in.local.y, in.local.x);
+        var rel = ang - a0;
+        let two_pi = 6.28318530718;
+        rel = (rel - floor(rel / two_pi) * two_pi);
+        let span = max(a1 - a0, 0.0);
+        let radial = cap_r - abs(d - radius);
+        let angular = min(rel, span - rel) * radius;
+        let band = min(radial, angular);
+        let c0 = vec2<f32>(cos(a0), sin(a0)) * radius;
+        let c1 = vec2<f32>(cos(a1), sin(a1)) * radius;
+        let caps = max(cap_r - length(in.local - c0), cap_r - length(in.local - c1));
+        let sdf = max(band, caps);
+        // Edge-effect alpha, AlphaExponent 2. The glow rect is the arc
+        // inflated by `glow`; inside the arc `fadeStart - dist` clamps to
+        // 1, and past the arc edge it falls as `(sdf + glow) / glow`.
+        //
+        // `PushMaskingInfo` REPLACES the mask, so this glow is not clipped
+        // by the arc: the halo extends the full `glow` px past the band
+        // and past each round cap. Multiplying by the arc's own
+        // `smoothstep` here deleted that halo.
+        let glow_a = pow(clamp((sdf + glow) / glow, 0.0, 1.0), 2.0);
+        let a = glow_a * in.color.a;
+        c = vec4<f32>(in.color.rgb * a, a);
+    } else if (mode == 16.0) {
+        // Exact osu-framework CircularProgress (RoundedCaps), ported from
+        // sh_CircularProgress.fs / sh_CircularProgressUtils.h.
+        let size = in.aux.y;
+        let ir = in.aux.z;
+        let prog = in.aux.w;
+        let tx = 1.5 / size;
+        let dist = circProgressDist(in.local, size, ir, prog, in.color2.x, in.color2.y, tx);
+        // progressAlphaAt: smoothstep(texelSize, 0, dist) * subAA.
+        let t = clamp(dist / tx, 0.0, 1.0);
+        let cov = 1.0 - t * t * (3.0 - 2.0 * t);
+        let sub = clamp(ir / (tx * 2.0), 0.1, 1.0);
+        let a = cov * sub * in.color.a;
+        c = vec4<f32>(in.color.rgb * a, a);
+    } else if (mode == 17.0) {
+        // Exact sh_SpinnerGlow.fs: the CircularProgress distance picks a row
+        // of the 1x107 gaussian ramp, sampled between uv.y (top) and uv.w
+        // (bottom); `getRoundedColor` is a plain v_Colour * texel here (no
+        // masking is active), then additive blending.
+        let size = in.aux.y;
+        let ir = in.aux.z;
+        let prog = in.aux.w;
+        let tx = 1.5 / size;
+        let dist = circProgressDist(in.local, size, ir, prog, in.color2.x, in.color2.y, tx);
+        let rel_h = in.color2.z + 0.25 * ir;
+        if (dist > rel_h) {
+            c = vec4<f32>(0.0);
+        } else {
+            let ty = clamp(1.0 - dist / rel_h, 0.0, 1.0);
+            let v = mix(in.uv.y, in.uv.w, ty);
+            let texel = textureSampleLevel(tex, samp, vec2<f32>(in.uv.x, v), 0.0);
+            let a = in.color.a * texel.a;
+            c = vec4<f32>(in.color.rgb * a, a);
+        }
+    } else if (mode == 18.0) {
+        // EdgeEffectType.Shadow (Mixture) of a rounded rectangle, drawn the
+        // way drawEdgeEffect does: solid inside the shape, quadratic falloff
+        // over `blur` past it, and NOT clipped to the shape.
+        let h = in.aux.yz;
+        let r = in.aux.w;
+        let blur = max(in.color2.x, 0.001);
+        let q = abs(in.local) - (h - vec2<f32>(r));
+        let d = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
+        let f = clamp(1.0 - d / blur, 0.0, 1.0);
+        let a = f * f * in.color.a;
+        c = vec4<f32>(in.color.rgb * a, a);
+    } else if (mode == 19.0) {
+        // BorderThickness band of a rounded rectangle (SpinnerTick outline).
+        let h = in.aux.yz;
+        let r = in.aux.w;
+        let t = max(in.color2.x, 0.001);
+        let q = abs(in.local) - (h - vec2<f32>(r));
+        let d = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
+        let hi = max(h - vec2<f32>(t), vec2<f32>(0.0));
+        let ri = max(r - t, 0.0);
+        let qi = abs(in.local) - (hi - vec2<f32>(ri));
+        let di = length(max(qi, vec2<f32>(0.0))) + min(max(qi.x, qi.y), 0.0) - ri;
+        let a = max(aa(-d) - aa(-di), 0.0) * in.color.a;
         c = vec4<f32>(in.color.rgb * a, a);
     } else if (mode == 8.0) {
         // Cap disc: body fill with a radial border band at the rim (slider

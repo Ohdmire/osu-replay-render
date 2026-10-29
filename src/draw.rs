@@ -235,10 +235,38 @@ pub const MODE_GLOWRING: f32 = 9.0;
 /// (local space is centred). Corner colours give the vertical gradient.
 pub const MODE_ROUNDED: f32 = 11.0;
 pub const MODE_GLOWFILL: f32 = 10.0;
+/// Clipped edge-effect shadow: aux.y = circle radius, aux.z = blur.
+/// Alpha is `pow(clamp(1 - (d - radius) / blur, 0, 1), 2)`, and the
+/// result is cut off at the circle.
+pub const MODE_SHADOW: f32 = 14.0;
+/// Additive edge-effect glow clipped to a round-capped arc.
+/// aux.y = band radius, aux.z = band thickness, aux.w = start angle.
+/// color2 = (end angle, glow radius). The glow inflates the arc and
+/// fades with `pow(coverage, 2)`; the arc's own alpha masks it, so the
+/// glow fills the band and softens over `glow radius` past its edge.
+pub const MODE_ARC_GLOW: f32 = 15.0;
 /// Storyboard atlas slot. RGB is already premultiplied; alpha is the
 /// coverage of normal-blended sprites only (additive sprites add RGB
 /// and leave alpha untouched).
 pub const MODE_PREMULT: f32 = 12.0;
+/// CircularProgress arc with round caps (`RoundedCaps`). Same band as
+/// `MODE_ARC`, plus a disc of the band's thickness at each end so a
+/// zero-progress arc is one circle and two mirrored arcs meet at the seam.
+pub const MODE_ARC_ROUND: f32 = 13.0;
+/// Exact `sh_CircularProgress.fs`: aux = (size, innerRadius, progress),
+/// color2 = (start angle, span) in radians. Screen-space `local`.
+pub const MODE_CIRC_PROGRESS: f32 = 16.0;
+/// Exact `sh_SpinnerGlow.fs` (Argon spinner side-bar halo). Same geometry
+/// as [`MODE_CIRC_PROGRESS`]; color2.z = glow size / drawable size, and
+/// the atlas ramp comes in through `uv = (u, v_top, _, v_bottom)`.
+pub const MODE_SPINNER_GLOW: f32 = 17.0;
+/// `EdgeEffectType.Shadow`, `Hollow = false`, of a rounded rectangle:
+/// aux = (halfWidth, halfHeight, cornerRadius), color2.x = blur. Alpha is
+/// `pow(clamp(1 - sdf / blur, 0, 1), 2)`; `sdf` is negative inside, so the
+/// interior is solid and the effect fades over `blur` outside the shape.
+pub const MODE_RRECT_SHADOW: f32 = 18.0;
+/// Rounded-rectangle border only (`BorderThickness`), colour2.x = width.
+pub const MODE_RRECT_BORDER: f32 = 19.0;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -629,12 +657,15 @@ impl DrawList {
         ]);
     }
 
-    /// Framework EdgeEffect glow with `Hollow = false` (e.g. lazer's
+    /// Framework EdgeEffect with `Hollow = false` (e.g. lazer's
     /// `FlashPiece`): full brightness inside `inner_radius`, then a
     /// quadratic falloff `((inner + extent - d) / extent)^2` outward to
-    /// `inner_radius + extent`. Drawn additively. This mirrors the masking
-    /// shader with `BlendRange = extent` and `AlphaExponent = 2`: the glow
-    /// FILLS the shape's interior rather than rendering as a hollow ring.
+    /// `inner_radius + extent`. Drawn additively.
+    ///
+    /// This is the opposite of an edge-effect *shadow*. A shadow inflates
+    /// the shape by `Radius` and fades from the original edge outward
+    /// (`sh_Masking.h`: `min(fadeStart - dist, 1)` then `pow(_, 2)`), so
+    /// the interior is the brightest and the rim is the glow.
     pub fn glow_fill(&mut self, center: [f32; 2], inner_radius: f32, extent: f32, colour: Colour) {
         let r = inner_radius + extent + 1.5;
         let corner = |p: [f32; 2]| Vertex {
@@ -654,11 +685,190 @@ impl DrawList {
         ]);
     }
 
+    /// `EdgeEffectType.Shadow`, `Hollow = false`, clipped by the container
+    /// that owns it (`CompositeDrawable.DrawNode.drawEdgeEffect`).
+    ///
+    /// The shadow rect is the circle inflated by `blur`. Its masking alpha
+    /// is `pow(min(1 - (d - radius) / blur, 1), 2)`: 1 at the original
+    /// edge, falling to 0 one blur-radius further out. The container then
+    /// masks that to the circle, so what remains is the inside of the disc
+    /// -full colour through the middle, softening toward the rim, and
+    /// nothing past it. The quad is clipped to the circle; the inflated
+    /// part is discarded by the mask.
+    pub fn clipped_shadow(&mut self, center: [f32; 2], radius: f32, blur: f32, colour: Colour) {
+        let r = radius + 1.5;
+        let corner = |p: [f32; 2]| Vertex {
+            pos: [center[0] + p[0], center[1] + p[1]],
+            local: p,
+            color: [colour.r, colour.g, colour.b, colour.a],
+            color2: [0.0; 4],
+            uv: [0.0; 4],
+            aux: [MODE_SHADOW, radius, blur.max(0.001), 0.0],
+        };
+        // Shadow blends with Mixture, not Additive (`EdgeEffectType.Shadow`).
+        self.set_blend(Blend::Alpha);
+        self.quad([
+            corner([-r, -r]),
+            corner([r, -r]),
+            corner([r, r]),
+            corner([-r, r]),
+        ]);
+    }
+
+    /// Exact `sh_CircularProgress.fs` band (with `RoundedCaps`), in screen
+    /// space. `size` is the drawable's screen size, `inner_radius` the
+    /// CircularProgress `InnerRadius` fraction, `progress` 0..1, and the
+    /// sector runs clockwise from `start_angle` (radians, 0 = +x) over
+    /// `span`.
+    pub fn circular_progress(
+        &mut self,
+        center: [f32; 2],
+        size: f32,
+        inner_radius: f32,
+        progress: f32,
+        start_angle: f32,
+        span: f32,
+        colour: Colour,
+        blend: Blend,
+    ) {
+        let half = size * 0.5 + 2.0;
+        self.quad_local(
+            center,
+            [half, half],
+            0.0,
+            colour,
+            [MODE_CIRC_PROGRESS, size, inner_radius, progress],
+            [start_angle, span, 0.0, 0.0],
+            [0.0; 4],
+            blend,
+        );
+    }
+
+    /// `sh_SpinnerGlow.fs` around the same CircularProgress shape: samples
+    /// the 1x107 `spinner-glow` ramp along the distance field and adds it
+    /// with `BlendingParameters.Additive`. `glow_rel` is the framework's
+    /// `Blur.KernelSize(50) / DrawSize.X`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spinner_glow(
+        &mut self,
+        atlas: &Atlas,
+        center: [f32; 2],
+        size: f32,
+        inner_radius: f32,
+        progress: f32,
+        start_angle: f32,
+        span: f32,
+        glow_rel: f32,
+        colour: Colour,
+    ) {
+        let rect = atlas.region_rect(Region::SpinnerGlow);
+        let u = (rect.x0 + rect.x1) * 0.5 / atlas.width as f32;
+        let v0 = rect.y0 / atlas.height as f32;
+        let v1 = rect.y1 / atlas.height as f32;
+        let half = size * 0.5 + glow_rel * size + 2.0;
+        self.quad_local(
+            center,
+            [half, half],
+            0.0,
+            colour,
+            [MODE_SPINNER_GLOW, size, inner_radius, progress],
+            [start_angle, span, glow_rel, 0.0],
+            [u, v0, 0.0, v1],
+            Blend::Additive,
+        );
+    }
+
+    /// `EdgeEffectType.Shadow` of a rounded rectangle (Mixture), drawn the
+    /// way `CompositeDrawableDrawNode.drawEdgeEffect` does: the shadow is
+    /// the masking shape inflated by `blur`, solid inside the original
+    /// shape and fading `pow(1 - d / blur, 2)` outward. It is NOT clipped
+    /// to the shape. `corner` = shape corner radius; for a circle pass the
+    /// radius as both half extents and corner.
+    pub fn edge_shadow_rrect(
+        &mut self,
+        center: [f32; 2],
+        half: [f32; 2],
+        corner: f32,
+        blur: f32,
+        rotation_deg: f32,
+        colour: Colour,
+    ) {
+        let blur = blur.max(0.001);
+        let pad = 1.5;
+        self.quad_local(
+            center,
+            [half[0] + blur + pad, half[1] + blur + pad],
+            rotation_deg,
+            colour,
+            [MODE_RRECT_SHADOW, half[0], half[1], corner.max(0.0)],
+            [blur, 0.0, 0.0, 0.0],
+            [0.0; 4],
+            Blend::Alpha,
+        );
+    }
+
+    /// `BorderThickness` band inside a rounded rectangle (the SpinnerTick
+    /// outline): the outer shape minus the same shape inset by `width`.
+    pub fn rrect_border(
+        &mut self,
+        center: [f32; 2],
+        half: [f32; 2],
+        corner: f32,
+        width: f32,
+        rotation_deg: f32,
+        colour: Colour,
+    ) {
+        let pad = 1.5;
+        self.quad_local(
+            center,
+            [half[0] + pad, half[1] + pad],
+            rotation_deg,
+            colour,
+            [MODE_RRECT_BORDER, half[0], half[1], corner.max(0.0)],
+            [width.max(0.001), 0.0, 0.0, 0.0],
+            [0.0; 4],
+            Blend::Alpha,
+        );
+    }
+
+    /// Quad with per-vertex local coordinates (used by the SDF modes that
+    /// need a rotation) - `local` is the unrotated offset from `center`.
+    fn quad_local(
+        &mut self,
+        center: [f32; 2],
+        half: [f32; 2],
+        rotation_deg: f32,
+        colour: Colour,
+        aux: [f32; 4],
+        color2: [f32; 4],
+        uv: [f32; 4],
+        blend: Blend,
+    ) {
+        let (s, c) = rotation_deg.to_radians().sin_cos();
+        let pt = |lx: f32, ly: f32| {
+            [center[0] + lx * c - ly * s, center[1] + lx * s + ly * c]
+        };
+        let mk = |lx: f32, ly: f32| Vertex {
+            pos: pt(lx, ly),
+            local: [lx, ly],
+            color: [colour.r, colour.g, colour.b, colour.a],
+            color2,
+            uv,
+            aux,
+        };
+        self.set_blend(blend);
+        self.quad([
+            mk(-half[0], -half[1]),
+            mk(half[0], -half[1]),
+            mk(half[0], half[1]),
+            mk(-half[0], half[1]),
+        ]);
+    }
+
     /// Capsule (thick line with round caps) between two points.
     pub fn capsule(&mut self, p0: [f32; 2], p1: [f32; 2], radius: f32, colour: Colour, blend: Blend) {
         self.capsule_gradient(p0, p1, radius, colour, colour, blend);
     }
-
     /// Capsule with a colour gradient across its local y axis (perpendicular
     /// to the segment), like a GradientVertical fill on a rotated drawable
     /// (lazer's ArgonFollowPoint chevrons).
@@ -731,6 +941,74 @@ impl DrawList {
             aux: [MODE_ARC, radius, thickness, a0.to_radians()],
         };
         self.set_blend(blend);
+        self.quad([
+            mk([-r_out, -r_out]),
+            mk([r_out, -r_out]),
+            mk([r_out, r_out]),
+            mk([-r_out, r_out]),
+        ]);
+    }
+
+    /// `CircularProgress` with `RoundedCaps`: the ring band of [`Self::arc`]
+    /// plus a disc cap (radius `thickness / 2`) centred on the band at each
+    /// end angle. A zero span draws exactly one disc, which is how the two
+    /// mirrored side bars meet at 12 o'clock and 6 o'clock.
+    pub fn arc_round(
+        &mut self,
+        center: [f32; 2],
+        radius: f32,
+        thickness: f32,
+        a0: f32,
+        a1: f32,
+        colour: Colour,
+        blend: Blend,
+    ) {
+        let r_out = radius + thickness * 0.5 + 1.5;
+        let mk = |p: [f32; 2]| Vertex {
+            pos: [center[0] + p[0], center[1] + p[1]],
+            local: p,
+            color: [colour.r, colour.g, colour.b, colour.a],
+            color2: [a1.to_radians(), 0.0, 0.0, 0.0],
+            uv: [0.0; 4],
+            aux: [MODE_ARC_ROUND, radius, thickness, a0.to_radians()],
+        };
+        self.set_blend(blend);
+        self.quad([
+            mk([-r_out, -r_out]),
+            mk([r_out, -r_out]),
+            mk([r_out, r_out]),
+            mk([-r_out, r_out]),
+        ]);
+    }
+
+    /// `EdgeEffectType.Glow` drawn around a round-capped arc and clipped by
+    /// that arc's alpha (`CompositeDrawable.DrawNode.drawEdgeEffect`).
+    ///
+    /// The effect rect is the arc inflated by `glow`. Its masking alpha is
+    /// `pow(min(fadeStart - dist, 1), 2)` measured from the inflated edge,
+    /// which is the arc's own coverage once the glow radius is subtracted.
+    /// The arc then masks the result, so the glow is full inside the band
+    /// and falls off over `glow` px past the band and past each round cap.
+    pub fn arc_glow(
+        &mut self,
+        center: [f32; 2],
+        radius: f32,
+        thickness: f32,
+        a0: f32,
+        a1: f32,
+        glow: f32,
+        colour: Colour,
+    ) {
+        let r_out = radius + thickness * 0.5 + glow + 1.5;
+        let mk = |p: [f32; 2]| Vertex {
+            pos: [center[0] + p[0], center[1] + p[1]],
+            local: p,
+            color: [colour.r, colour.g, colour.b, colour.a],
+            color2: [a1.to_radians(), glow.max(0.001), 0.0, 0.0],
+            uv: [0.0; 4],
+            aux: [MODE_ARC_GLOW, radius, thickness, a0.to_radians()],
+        };
+        self.set_blend(Blend::Additive);
         self.quad([
             mk([-r_out, -r_out]),
             mk([r_out, -r_out]),
@@ -1223,6 +1501,9 @@ pub enum Region {
     CounterX,
     CursorTrail,
     RepeatEdge,
+    /// 1x107 white gaussian ramp: Gameplay/osu/spinner-glow, sampled by
+    /// the Argon side-arc glow shader (sh_SpinnerGlow.fs).
+    SpinnerGlow,
     ApproachCircle,
     /// Full-screen beatmap background (`--bg`).
     Background,
@@ -1263,7 +1544,7 @@ pub struct Atlas {
 impl Atlas {
     /// Drop the CPU-side RGBA copy (a 4096² atlas is 64 MB). Safe once the
     /// pixels are on the GPU (Renderer's initial upload) and the host won't
-    /// call `set_atlas` — region rect / ink queries are unaffected.
+    /// call `set_atlas` -region rect / ink queries are unaffected.
     pub fn release_cpu_copy(&mut self) {
         self.rgba = Vec::new();
     }
@@ -1340,9 +1621,9 @@ fn ink_bbox(img: &Image) -> (f32, f32, f32, f32) {
 }
 
 impl Atlas {
-    /// Pack into at most `max_dim` on both axes: try widths 4096 → up to
+    /// Pack into at most `max_dim` on both axes: try widths 4096 �?up to
     /// `max_dim` (doubling), taking the first whose packed height fits.
-    /// Returns `None` when even the widest allowed layout overflows — the
+    /// Returns `None` when even the widest allowed layout overflows -the
     /// caller decides whether to downscale and retry (see `build_atlas`).
     pub fn try_build(images: &[(Region, Image)], max_dim: u32) -> Option<Atlas> {
         let mut width = 4096u32.min(max_dim);
@@ -1418,9 +1699,9 @@ fn pack(images: &[(Region, Image)], width: u32) -> Atlas {
 
 impl Atlas {
     pub fn region_rect(&self, region: Region) -> Rect {
-        // 带上具体 Region:槽位是 build_atlas 构建期预留的,这里的
-        // panic 几乎总是"重建图集时漏带槽位"(如皮肤/背景热切换漏了
-        // 故事板合成槽位),缺失项的名字直接指向出错分支。
+        // 带上具体 Region:槽位�?build_atlas 构建期预留的,这里�?
+        // panic 几乎总是"重建图集时漏带槽�?(如皮�?背景热切换漏�?
+        // 故事板合成槽�?,缺失项的名字直接指向出错分支�?
         *self.rects.get(&region).unwrap_or_else(|| {
             panic!("atlas region missing: {region:?} (slot not reserved at build time)")
         })

@@ -903,14 +903,12 @@ impl<'a> SampleResolver<'a> {
                         None
                     }
                 },
-                // 皮肤未提供该槽位:内置默认(File 槽按 normal-hitnormal,
-                // "-max" 剥回普通条目)
+                // 皮肤未提供该槽位:内置默认。File 槽按 normal-hitnormal。
+                // `spinnerbonus-max` 不剥回 `spinnerbonus`:Argon 的 MAX
+                // 音效和普通 bonus 是两条不同的采样,剥回去会让转满之后
+                // 继续响普通 bonus。皮肤查找链自己已经带了剥后缀的回退。
                 None => {
-                    let name = if filename.is_some() {
-                        "hitnormal"
-                    } else {
-                        sample.name.strip_suffix("-max").unwrap_or(sample.name)
-                    };
+                    let name = if filename.is_some() { "hitnormal" } else { sample.name };
                     sample_clip(if filename.is_some() { "normal" } else { bank }, name).map(Arc::new)
                 }
             };
@@ -987,8 +985,9 @@ pub fn resolve_sample_parts(
         }
     }
     // 3. 皮肤未提供该槽位(或非 legacy 皮肤):回退内置默认(File 槽按
-    // normal-hitnormal,"-max" 剥回普通条目)
-    let name = if filename.is_some() { "hitnormal" } else { name.strip_suffix("-max").unwrap_or(name) };
+    // normal-hitnormal)。`spinnerbonus-max` 保留原名,MAX 音效和普通
+    // bonus 是两条采样。
+    let name = if filename.is_some() { "hitnormal" } else { name };
     let bank = if filename.is_some() { "normal" } else { bank };
     sample_bytes(bank, name).map(|b| b.to_vec())
 }
