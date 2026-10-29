@@ -176,6 +176,29 @@ fn hd_fade_out(preempt: f64, start_time: f64, fade_in: f64, t: f64) -> f64 {
     )
 }
 
+/// Horizontal shake offset of a hit circle (or a slider head) at `t`, in
+/// playfield units.
+///
+/// `DrawableHitCircle.shakeContainer` sits inside `scaleContainer`, and
+/// `scaleContainer.Scale` is `OsuHitObject.Scale`. The framework's 8px
+/// magnitude is therefore multiplied by the object's scale before the
+/// playfield mapper turns it into screen pixels. `DrawableSliderHead`
+/// inherits this container.
+fn shake_dx(obj: &ObjView, t: f64) -> f32 {
+    (crate::shake::offset_at(&obj.shake_times, t) * obj.scale as f64) as f32
+}
+
+/// Horizontal shake offset of a slider's body at `t`, in playfield units.
+///
+/// `DrawableSlider.shakeContainer` is a direct child of the slider: the
+/// slider itself is never CS-scaled (`ScaleBindable` only scales the ball,
+/// and ticks/repeats/tail scale their own inner containers, which sit
+/// inside the shaken container). The 8px magnitude is already one playfield
+/// unit, so it is not multiplied by `ObjView::scale`.
+fn slider_body_shake_dx(obj: &ObjView, t: f64) -> f32 {
+    crate::shake::offset_at(&obj.shake_times, t) as f32
+}
+
 pub fn colour_for_result(result: HitResult) -> Colour {
     match result {
         HitResult::Miss | HitResult::LargeTickMiss | HitResult::IgnoreMiss => {
@@ -1127,7 +1150,7 @@ impl SceneState {
                 if self.hidden && obj.index != game.hd_first_object {
                     continue;
                 }
-                draw_approach_circle(self.legacy.as_ref(), assets, list, &self.mapper, obj, t, self.hidden);
+                draw_approach_circle(self.legacy.as_ref(), assets, list, &self.mapper, obj, t, self.hidden, shake_dx(obj, t));
             }
         }
 
@@ -1429,6 +1452,7 @@ impl SceneState {
             ht,
             t,
             self.hit_animations,
+            shake_dx(obj, t),
         );
     }
 
@@ -1470,6 +1494,15 @@ impl SceneState {
 
         let m = &self.mapper;
         let s = obj.scale * m.pf;
+        // Note-lock shake. A rejected head press calls
+        // `DrawableSliderHead.Shake`, which shakes two containers:
+        // the head's own (`DrawableHitCircle.shakeContainer`, inside the
+        // CS-scaled container) and the parent slider's
+        // (`DrawableSlider.shakeContainer`, unscaled, holding the body,
+        // ticks, repeats and tail). The ball and follow circle sit outside
+        // both, so they do not move.
+        let body_dx = slider_body_shake_dx(obj, t);
+        let head_dx = shake_dx(obj, t);
 
         // --- Follow circle animation state ---------------------------------
         let anim = &mut self.slider_anims[obj.index];
@@ -1616,7 +1649,7 @@ impl SceneState {
         } * obj.scale;
         let sub = obj.sub_path(p0, p1);
         if sub.len() >= 2 {
-            let screen_pts: Vec<[f32; 2]> = sub.iter().map(|&p| m.pf(p)).collect();
+            let screen_pts: Vec<[f32; 2]> = sub.iter().map(|&p| m.pf([p[0] + body_dx, p[1]])).collect();
             // ArgonSliderBody: the whole path fades with the slider; the
             // BORDER colour is the plain accent while only the body accent
             // gets BodyAlpha (0.92 pro / 0.98 normal, applied to
@@ -1709,6 +1742,7 @@ impl SceneState {
                 n.judged,
                 t,
                 self.hidden,
+                body_dx,
             );
         }
 
@@ -1728,6 +1762,7 @@ impl SceneState {
                 let at_end = n.path_progress >= 0.999;
                 let frozen = matches!(n.judged, Some((jt, r)) if jt <= t && hit_result_ext::is_hit(r));
                 let (pos, aim) = repeat_anchor(obj, p0, p1, at_end, frozen);
+                let pos = [pos[0] + body_dx, pos[1]];
                 let anim_start = if ri == 0 {
                     obj.start_time - obj.preempt
                 } else {
@@ -1815,6 +1850,7 @@ impl SceneState {
                 h_time,
                 t,
                 self.hit_animations,
+                head_dx,
             );
         }
 
@@ -2592,6 +2628,7 @@ fn draw_circle_piece(
     ht: f64,
     t: f64,
     hit_animations: bool,
+    dx: f32,
 ) {
     if let Some(lg) = legacy {
         // SkinnableDrawable fallback semantics: a legacy skin serves the
@@ -2626,12 +2663,13 @@ fn draw_circle_piece(
                 circle,
                 overlay,
                 classic_overlay,
+                dx,
             );
             return;
         }
     }
     let _ = hit_animations; // only the legacy piece branches on it
-    draw_circle_piece_argon(assets, list, m, obj, accent, alpha, number, with_outer_fill, judged, hit, ht, t)
+    draw_circle_piece_argon(assets, list, m, obj, accent, alpha, number, with_outer_fill, judged, hit, ht, t, dx)
 }
 
 /// `LegacyMainCirclePiece`: tinted `hitcircle` sprite, `hitcircleoverlay`,
@@ -2657,8 +2695,9 @@ fn draw_circle_piece_legacy(
     circle: SkinTexture,
     overlay: Option<SkinTexture>,
     classic_overlay: bool,
+    dx: f32,
 ) {
-    let centre = m.pf(obj.position);
+    let centre = m.pf([obj.position[0] + dx, obj.position[1]]);
     let s = obj.scale * m.pf;
     let x = t - ht;
 
@@ -2750,8 +2789,9 @@ fn draw_circle_piece_argon(
     hit: bool,
     ht: f64,
     t: f64,
+    dx: f32,
 ) {
-    let centre = m.pf(obj.position);
+    let centre = m.pf([obj.position[0] + dx, obj.position[1]]);
     let s = obj.scale * m.pf; // 128-space -> screen px
     let x = t - ht;
 
@@ -2854,6 +2894,7 @@ fn draw_slider_tick(
     judged: Option<(f64, HitResult)>,
     t: f64,
     hidden: bool,
+    dx: f32,
 ) {
     let span_duration = obj.duration / obj.span_count.max(1) as f64;
     let offset = if span_index > 0 { 200.0 } else { obj.preempt * 0.66 };
@@ -2888,7 +2929,7 @@ fn draw_slider_tick(
         return;
     }
 
-    let pos = m.pf(position);
+    let pos = m.pf([position[0] + dx, position[1]]);
     // Legacy: `sliderscorepoint` sprite at its authored size.
     if let Some(lg) = legacy
         && let Some(tex) = lg.scorepoint
@@ -3268,7 +3309,25 @@ mod tests {
             spins_required: 0.0,
             head_judged: None,
             body_judged: None,
+            shake_times: Vec::new(),
         }
+    }
+
+    /// `DrawableHitCircle.shakeContainer` sits inside the CS-scaled
+    /// container, so the 8px waveform is multiplied by the object's
+    /// `Scale`. `DrawableSlider.shakeContainer` does not: the body, ticks,
+    /// repeats and tail move the raw 8 playfield units.
+    #[test]
+    fn note_lock_shake_scales_head_not_body() {
+        let mut obj = test_slider(1);
+        obj.shake_times = vec![1000.0];
+        obj.scale = 0.5;
+        assert!((shake_dx(&obj, 1000.0) - 0.0).abs() < 1e-6);
+        assert!((shake_dx(&obj, 1015.0) - 4.0).abs() < 1e-6);
+        assert!((shake_dx(&obj, 1045.0) + 4.0).abs() < 1e-6);
+        assert!((shake_dx(&obj, 1120.0) - 0.0).abs() < 1e-6);
+        assert!((slider_body_shake_dx(&obj, 1015.0) - 8.0).abs() < 1e-6);
+        assert!((slider_body_shake_dx(&obj, 1045.0) + 8.0).abs() < 1e-6);
     }
 
     /// Hidden mod windows, locked against `OsuModHidden`:
@@ -3870,6 +3929,7 @@ fn draw_approach_circle(
     obj: &ObjView,
     t: f64,
     hd: bool,
+    dx: f32,
 ) {
     let appear = obj.start_time - obj.preempt;
     if t < appear || t > obj.start_time {
@@ -3902,7 +3962,7 @@ fn draw_approach_circle(
     // Official approachcircle texture: 128 box * (128/118), scaled 4 -> 1
     // over the preempt, tinted with the combo colour (DisallowZeroAlpha).
     let scale = value_at(t, appear, obj.start_time, 4.0, 1.0, Easing::Linear) as f32;
-    let centre = m.pf(obj.position);
+    let centre = m.pf([obj.position[0] + dx, obj.position[1]]);
     let c = obj.colour;
     let col = Colour::rgb(c.r.max(0.05), c.g.max(0.05), c.b.max(0.05)).opacity(alpha as f32);
 

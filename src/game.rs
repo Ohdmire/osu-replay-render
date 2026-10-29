@@ -73,6 +73,9 @@ pub struct ObjView {
     /// Timeline events: head judgement (slider), body/final judgement.
     pub head_judged: Option<(f64, HitResult)>,
     pub body_judged: Option<(f64, HitResult)>,
+    /// Press times at which the note lock rejected a click on this object
+    /// (`ClickAction.Shake`). Sorted; drives [`crate::shake`].
+    pub shake_times: Vec<f64>,
 }
 
 impl ObjView {
@@ -565,7 +568,7 @@ pub fn load_autoplay_content(osu_text: &str, mods_bits: u32, hidden: bool, with_
     Ok(data)
 }
 
-fn build(
+pub fn build(
     mods: Mods,
     classic: bool,
     map_colours: Vec<[u8; 3]>,
@@ -661,7 +664,21 @@ fn build(
             spins_required,
             head_judged: None,
             body_judged: None,
+            shake_times: Vec::new(),
         });
+    }
+
+    // Note-lock shakes: rejected presses shake their target hit object.
+    // A slider-head press shakes two containers (`DrawableSliderHead.Shake`
+    // calls both its own and `DrawableSlider.Shake`), but both start at the
+    // same time, so one list drives both offsets.
+    for shake in &engine.shakes {
+        if let Some(obj) = objects.get_mut(shake.object_index) {
+            obj.shake_times.push(shake.time);
+        }
+    }
+    for obj in &mut objects {
+        obj.shake_times.sort_by(|a, b| a.total_cmp(b));
     }
 
     // Full score state timeline.

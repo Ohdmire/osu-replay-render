@@ -595,7 +595,8 @@ impl HitStat {
 /// custom avatar image.
 pub struct ResultsView<'a> {
     pub game: &'a GameData,
-    /// Show the classic (stable) score total instead of standardised.
+    /// Show the lazer `ScoringMode.Classic` display total (the standardised
+    /// score converted through `ScoreInfoExtensions`), not stable ScoreV1.
     pub classic_score: bool,
     /// The atlas carries the (pre-blurred) beatmap background.
     pub has_bg: bool,

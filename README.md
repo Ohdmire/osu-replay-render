@@ -25,7 +25,7 @@ osu_replay_render <beatmap.osu> [replay.osr] [options]
 | `--size <WxH>` | 输出分辨率，默认 1920x1080 |
 | `--fps <n>` | 输出帧率 1..480，默认 60（与游戏帧一一对应；其他帧率对光标做插值采样） |
 | `--start <ms>` / `--end <ms>` | 渲染回放时间区间（毫秒） |
-| `--score classic` | HUD 显示经典分（默认 standardised） |
+| `--score classic` | HUD 显示经典分（默认 standardised）。按 lazer `ScoringMode.Classic` 的 `GetDisplayScore`：把 standardised 总分经 `ScoreInfoExtensions.convertStandardisedToClassic` 换算（osu!std: `(objectCount² × 32.57 + 100000) × total / 1e6`），**不是** stable 的 ScoreV1。spinner 的 bonus tick（standardised 10/50）本来就在总分里，所以也会被换算（每个 tick 只增加很小的换算分，示例中约 +1）；stable 的 100/1000 直接加分没有实现 |
 | `--skin <argon\|argon-pro\|dir>` | 皮肤变体,默认 `argon-pro`(无 GREAT/PERFECT 判定文字、滑条身体透明度 0.92);传**皮肤目录**(解包的 .osk / 游戏 `Skins/<name>`)即启用该皮肤:玩法元素之外,**HUD 的分数/准确率/连击计数器、HP 血条(scorebar-\*,新旧两种样式)与按键计数(inputoverlay-\*)**也换用皮肤自己的贴图(lazer `LegacyScoreCounter`/`LegacyAccuracyCounter`/`LegacyDefaultComboCounter`/`LegacyHealthDisplay`/`LegacyKeyCounterDisplay` 的移植;皮肤缺哪块就回退哪块的 argon 实现,UR 条始终用本渲染器的实现) |
 | `--argon-hud` | 有皮肤目录时仍强制 Argon HUD(默认皮肤提供哪块 HUD 元素就用哪块) |
 | `--skin-colours` | **强制用皮肤 combo 色**覆盖谱面 `[Colours]`（stable 行为，= lazer 关闭「Beatmap skins」设定）。默认相反：谱面自带 `[Colours]` 时优先谱面色（lazer 默认行为，`LegacyBeatmapSkin` 先应答查找），皮肤 combo 色仅在谱面未配色时生效 |
@@ -155,6 +155,19 @@ if renderer.pending_len() > 0 {
 - **判定**：文字（GREAT/OK/MEH/MISS…，lazer Argon 单词风格、结果色、
   加色混合、miss 下落旋转）、环形爆炸粒子（按结果数量/距离缩放）、
   slider break 小圆点。
+- **Note lock 抖动**（`ShakeContainer` / `DrawableExtensions.Shake`）：
+  按下被 hit policy 拒绝（`ClickAction.Shake`：上一个物件还没判完、或
+  点击落在 400ms miss 窗口之外）时物件左右抖动。判定端在
+  `Engine.shakes` 记录 `(时间, 物件, 是否滑条头)`；渲染端按物件时间轴
+  求偏移：`ShakeContainer.ShakeDuration = 30`、`8px`，120ms 五段
+  `+8 OutSine → −8 → +8 → −8 InOutSine → 0 InSine`；同一物件在抖动中
+  再次被拒会从当前偏移重新开始（framework `MoveToX` 绝对目标 + 新
+  transform 截断旧序列的语义）。圆的 `ShakeContainer` 在 CS 缩放容器内，
+  偏移乘物件 `Scale`，震动圆身/描边/combo 数字/approach circle。滑条头
+  同时抖两个容器（`DrawableSliderHead.Shake` 再调
+  `DrawableSlider.Shake`）：头部同样乘 `Scale`；body/tick/repeat/tail
+  的容器没有 CS 缩放，偏移就是 8 个 playfield 单位。球与 follow circle
+  在两个容器之外，不抖。
 - **Follow points**（`ArgonFollowPoint` 逐元素复刻）：间距 32u 的
   双 chevron——前箭头 `GradientVertical(#FC618F→#BB1A41)` 加色混合,
   后箭头为其 `Gray(0.2)` 乘入渐变（每通道 ×0.2,近似不可见的深色
@@ -456,12 +469,10 @@ UR、光标轨迹、按键显示全部走既有回放路径,无需 .osr 文件�
 
 - Rust (`cargo build --release`)
 - ffmpeg 在 PATH（`--out` 模式需要;库/surface 路径不需要）
-- 判定引擎：`osu-replay-judge`（git dependency，master 分支）。本地
-  checkout（`../osu-replay-judge`，v0.3.0：HP 处理器双路径 + break 解析）
-  经 Cargo.toml 的 `[patch]` 段优先生效——judge 推送后可移除该段
+- 判定引擎：`osu-replay-judge`（git dependency，master 分支；HP 处理器
+  双路径 + break 解析 + note-lock `Engine::shakes`）
 - PP 计算：`rosu-pp`（[Apeuriox fork](https://github.com/Apeuriox/rosu-pp)
-  的 `pp-rework-202607` 分支，lazer 难度/表现计算器的 Rust 移植），同样
-  经 `[patch]` 指向本地 `../rosu-pp` checkout
+  的 `pp-rework-202607` 分支，lazer 难度/表现计算器的 Rust 移植）
 - 作为库嵌入时:宿主窗口需提供原生窗口句柄(当前为 Win32 HWND;
   `raw-window-handle` 0.6)
 
@@ -472,7 +483,7 @@ UR、光标轨迹、按键显示全部走既有回放路径,无需 .osr 文件�
   letterbox blit,实时预览用）、`game.rs`（judge 输出 → 渲染
   视图 + UR/HP 时间轴）、`autoplay.rs`（lazer `OsuAutoGenerator`
   的逐行移植,`--autoplay` 谱面预览）、`scene.rs`（Argon 皮肤全部
-  视觉逻辑）、`hud.rs`（计数器/血条/UR 条）、`draw.rs`（SDF
+  视觉逻辑）、`shake.rs`（note-lock 抖动波形）、`hud.rs`（计数器/血条/UR 条）、`draw.rs`（SDF
   图元/缓动/字体/图集）、`render.rs`（wgpu 离屏渲染器 + WGSL
   shader + readback 流水线）。
 - 所有动画时序均以 osu!lazer 源码（`osu.Game.Rulesets.Osu/Skinning/Argon/`

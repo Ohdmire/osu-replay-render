@@ -11,6 +11,10 @@ pub mod pp;
 pub mod render;
 pub mod results;
 pub mod scene;
+/// Note-lock shake (`ShakeContainer` / `DrawableExtensions.Shake`): 30ms
+/// per swing, 8px, five segments — visual only, driven by the judge's
+/// `ClickAction.Shake` events.
+pub mod shake;
 /// Beatmap storyboard layer (`.osu` Events + shared `.osb`): rendered by
 /// the osu-storyboard-render library into two offscreen composites
 /// (below/above the playfield) and GPU-copied into atlas slots each frame.

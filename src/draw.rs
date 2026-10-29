@@ -134,6 +134,7 @@ pub enum Easing {
     OutQuint,
     InSine,
     OutSine,
+    InOutSine,
     InExpo,
     OutExpo,
     OutElasticHalf,
@@ -166,6 +167,7 @@ impl Easing {
             }
             Easing::InSine => 1.0 - (time * std::f64::consts::PI * 0.5).cos(),
             Easing::OutSine => (time * std::f64::consts::PI * 0.5).sin(),
+            Easing::InOutSine => 0.5 * (1.0 - (time * std::f64::consts::PI).cos()),
             Easing::InExpo => 2.0f64.powf(10.0 * (time - 1.0)),
             Easing::OutExpo => 1.0 - 2.0f64.powf(-10.0 * time),
             Easing::OutElasticHalf => {
