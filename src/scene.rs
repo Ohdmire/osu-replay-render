@@ -466,6 +466,19 @@ struct LegacyDigits {
     overlap: f32,
 }
 
+/// Beatmap `[Colours]` lookup for the legacy skin cache (`SliderBorder`,
+/// `SliderTrackOverride`, `SliderBall`, `SpinnerBackground`, ...). Later
+/// duplicates win, matching `Beatmap::custom_colour`, and the beatmap beats
+/// the user skin (lazer's `BeatmapSkinProvidingContainer` with beatmap
+/// colours enabled). Opaque: beatmap colours have no alpha component.
+fn beatmap_colour(custom_colours: &[(String, [u8; 3])], key: &str) -> Option<Colour> {
+    custom_colours
+        .iter()
+        .rev()
+        .find(|(k, _)| k == key)
+        .map(|(_, c)| Colour::rgba_bytes(c[0], c[1], c[2], 255))
+}
+
 /// Everything the legacy rendering paths need, resolved from the skin on
 /// first use. Elements the skin does not provide stay `None` and the
 /// argon vector visuals take over for that element (lazer's
@@ -553,15 +566,21 @@ fn judgement_index(result: HitResult) -> Option<usize> {
 }
 
 impl LegacyCache {
-    fn new(skin: &skin::ResolvedSkin) -> LegacyCache {
+    fn new(skin: &skin::ResolvedSkin, custom_colours: &[(String, [u8; 3])]) -> LegacyCache {
         let generic_bool = |key: &str, default: bool| {
             skin.get_config(skin_lookup_generic(key))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(default)
         };
+        // Beatmap `[Colours]` first (lazer's beatmap skin has priority while
+        // "Beatmap colours" is on), user skin as the fallback.
         let custom_colour = |key: &str| -> Option<Colour> {
-            skin.get_config(skin::SkinLookup::CustomColour(skin::SkinCustomColourLookup(key.to_string())))
+            beatmap_colour(custom_colours, key).or_else(|| {
+                skin.get_config(skin::SkinLookup::CustomColour(skin::SkinCustomColourLookup(
+                    key.to_string(),
+                )))
                 .and_then(|v| v.as_colour())
+            })
         };
 
         let version = skin
@@ -976,7 +995,7 @@ impl SceneState {
         // Resolve the legacy sprite set on the first frame a legacy skin
         // is active (missing elements keep their argon fallbacks).
         if self.legacy.is_none() && assets.skin.is_legacy() {
-            self.legacy = Some(LegacyCache::new(assets.skin));
+            self.legacy = Some(LegacyCache::new(assets.skin, &game.custom_colours));
         }
 
         // Cursor expand animation. `CursorExpand: 0` skins disable the pop
@@ -3386,6 +3405,25 @@ fn repeat_anchor(obj: &ObjView, p0: f64, p1: f64, at_end: bool, frozen: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn beatmap_custom_colour_last_wins_and_beats_skin() {
+        let customs = vec![
+            ("SliderBorder".to_string(), [1, 2, 3]),
+            ("SliderBorder".to_string(), [4, 5, 6]),
+            ("SliderTrackOverride".to_string(), [7, 8, 9]),
+        ];
+        assert_eq!(
+            beatmap_colour(&customs, "SliderBorder"),
+            Some(Colour::rgba_bytes(4, 5, 6, 255))
+        );
+        assert_eq!(
+            beatmap_colour(&customs, "SliderTrackOverride"),
+            Some(Colour::rgba_bytes(7, 8, 9, 255))
+        );
+        // Not in `[Colours]` -> the caller falls back to the user skin.
+        assert_eq!(beatmap_colour(&customs, "SpinnerBackground"), None);
+    }
 
     #[test]
     fn results_fade_in_starts_only_after_gameplay_is_gone() {

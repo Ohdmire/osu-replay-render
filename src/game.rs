@@ -328,6 +328,12 @@ pub struct GameData {
     /// `LegacyBeatmapSkin` lookup hits, so the user skin's combo colours
     /// are never reached).
     pub has_beatmap_colours: bool,
+    /// `[Colours]` entries that are not `Combo1..8` (`SliderBorder`,
+    /// `SliderTrackOverride`, `SliderBall`, `SpinnerBackground`, ...) from
+    /// `osu_parse::beatmap::Beatmap::custom_colours`. The legacy skin cache
+    /// gives them priority over the user skin (lazer
+    /// `BeatmapSkinProvidingContainer`); `--skin-colours` clears them.
+    pub custom_colours: Vec<(String, [u8; 3])>,
     /// `[Events]` break periods `(start, end)` in gameplay-clock ms —
     /// the break-time source for the scene's break background
     /// lightening (lazer `BreakTracker`).
@@ -466,7 +472,7 @@ pub fn load_with_pp(map_path: &str, replay_path: &str, with_pp: bool) -> Result<
     let mut engine = Engine::new(processed, &mods);
     engine.run(&rep.frames);
 
-    let mut data = build(mods, classic, map.combo_colours, MapMeta::from_metadata(&map.metadata), &engine)?;
+    let mut data = build(mods, classic, map.combo_colours, map.custom_colours.clone(), MapMeta::from_metadata(&map.metadata), &engine)?;
     data.breaks = breaks;
     data.player = rep.header.player_name.clone();
     data.played_at_ticks = Some(rep.header.timestamp);
@@ -546,7 +552,7 @@ pub fn load_autoplay_content(osu_text: &str, mods_bits: u32, hidden: bool, with_
     let mut engine = Engine::new(processed, &mods);
     engine.run(&frames);
 
-    let mut data = build(mods.clone(), classic, map.combo_colours, MapMeta::from_metadata(&map.metadata), &engine)?;
+    let mut data = build(mods.clone(), classic, map.combo_colours, map.custom_colours.clone(), MapMeta::from_metadata(&map.metadata), &engine)?;
     data.breaks = breaks;
     // lazer's autoplay attribution.
     data.player = "osu!".to_string();
@@ -575,6 +581,7 @@ pub fn build(
     mods: Mods,
     classic: bool,
     map_colours: Vec<[u8; 3]>,
+    map_custom_colours: Vec<(String, [u8; 3])>,
     map_meta: MapMeta,
     engine: &Engine,
 ) -> Result<GameData, String> {
@@ -949,6 +956,7 @@ pub fn build(
         snapshots: with_lead_in(engine.snapshots.clone(), mods.rate),
         combo_colours,
         has_beatmap_colours: !map_colours.is_empty(),
+        custom_colours: map_custom_colours,
         breaks: Vec::new(),
         rate: mods.rate,
         nightcore: mods.nightcore,
@@ -1087,6 +1095,11 @@ pub fn health_at(game: &GameData, t: f64) -> f64 {
 /// toggle without the previous mapping sticking.
 pub fn apply_skin_combo_colours(game: &mut GameData, skin: &crate::skin::ResolvedSkin, force: bool) {
     use crate::skin::Skin as _;
+    // `--skin-colours` is the renderer's "Beatmap colours: off": combo AND
+    // custom `[Colours]` (SliderBorder etc.) both fall back to the user skin.
+    if force {
+        game.custom_colours.clear();
+    }
     let skin_colours = skin
         .get_config(crate::skin::SkinLookup::GlobalColour(
             crate::skin::GlobalSkinColours::ComboColours,
