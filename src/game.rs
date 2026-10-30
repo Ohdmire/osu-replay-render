@@ -65,6 +65,21 @@ pub struct ObjView {
     /// Slider: full piecewise-linear path in playfield coords (relative to
     /// the slider position, i.e. ready to add to `position`).
     pub slider_points: Vec<[f32; 2]>,
+    /// Cumulative arc length of `slider_points` (same length; `[0] == 0`).
+    /// Lets `position_at_path` / `sub_path` binary-search instead of walking
+    /// the whole path on every call.
+    pub slider_cum: Vec<f32>,
+    pub slider_len: f32,
+    /// Slider body path, built once: `slider_points` with pathological
+    /// "scribble" paths (length >> bounding box, e.g. seven thousand points
+    /// zig-zagging inside 2 px) simplified away. Empty when the exact path is
+    /// already small enough (the body then slices `slider_points` directly).
+    pub body_points: Vec<[f32; 2]>,
+    /// Cumulative arc length of `body_points` (empty together with it).
+    pub body_cum: Vec<f32>,
+    /// Arc length of the effective body path (`slider_len` when not
+    /// simplified).
+    pub body_len: f32,
     pub slider_distance: f64,
     pub span_count: usize,
     pub duration: f64,
@@ -95,90 +110,81 @@ impl ObjView {
     }
 
     pub fn position_at_path(&self, progress: f64) -> [f32; 2] {
-        // Walk the polyline to the distance fraction.
-        let target = progress.clamp(0.0, 1.0) as f32 * self.path_length();
         let pts = &self.slider_points;
-        if pts.is_empty() {
+        if pts.len() < 2 || self.slider_len <= 1e-6 {
             return self.position;
         }
-        let mut acc = 0.0f32;
-        for i in 0..pts.len() - 1 {
-            let dx = pts[i + 1][0] - pts[i][0];
-            let dy = pts[i + 1][1] - pts[i][1];
-            let len = (dx * dx + dy * dy).sqrt();
-            if acc + len >= target {
-                let t = if len > 1e-6 { (target - acc) / len } else { 0.0 };
-                return [
-                    self.position[0] + pts[i][0] + dx * t,
-                    self.position[1] + pts[i][1] + dy * t,
-                ];
-            }
-            acc += len;
-        }
+        let target = progress.clamp(0.0, 1.0) as f32 * self.slider_len;
+        let i = self
+            .slider_cum
+            .partition_point(|&c| c <= target)
+            .saturating_sub(1)
+            .min(pts.len() - 2);
+        let seg_start = self.slider_cum[i];
+        let seg_end = self.slider_cum[i + 1];
+        let t = if seg_end > seg_start {
+            ((target - seg_start) / (seg_end - seg_start)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let (a, b) = (pts[i], pts[i + 1]);
         [
-            self.position[0] + pts[pts.len() - 1][0],
-            self.position[1] + pts[pts.len() - 1][1],
+            self.position[0] + a[0] + (b[0] - a[0]) * t,
+            self.position[1] + a[1] + (b[1] - a[1]) * t,
         ]
     }
 
-    fn path_length(&self) -> f32 {
-        let pts = &self.slider_points;
-        let mut acc = 0.0f32;
-        for i in 0..pts.len().saturating_sub(1) {
-            let dx = pts[i + 1][0] - pts[i][0];
-            let dy = pts[i + 1][1] - pts[i][1];
-            acc += (dx * dx + dy * dy).sqrt();
-        }
-        acc
-    }
-
     /// Sub-path (playfield coords, absolute) between path progress p0..p1.
+    /// Binary search on the cached arc lengths; only the points inside the
+    /// range are copied.
     pub fn sub_path(&self, p0: f64, p1: f64) -> Vec<[f32; 2]> {
         let (mut p0, mut p1) = (p0.clamp(0.0, 1.0), p1.clamp(0.0, 1.0));
         if p0 > p1 {
             std::mem::swap(&mut p0, &mut p1);
         }
         let pts = &self.slider_points;
-        if pts.len() < 2 {
+        if pts.len() < 2 || self.slider_len <= 1e-6 {
             return Vec::new();
         }
-        let total = self.path_length();
-        if total <= 1e-6 {
-            return Vec::new();
-        }
-        let d0 = (p0 as f32 * total) as f32;
-        let d1 = (p1 as f32 * total) as f32;
+        let d0 = p0 as f32 * self.slider_len;
+        let d1 = p1 as f32 * self.slider_len;
 
-        let mut out: Vec<[f32; 2]> = Vec::new();
-        let mut acc = 0.0f32;
-        let mut started = false;
-        for i in 0..pts.len() - 1 {
-            let dx = pts[i + 1][0] - pts[i][0];
-            let dy = pts[i + 1][1] - pts[i][1];
-            let len = (dx * dx + dy * dy).sqrt();
-            let seg_start = acc;
-            let seg_end = acc + len;
+        let last = pts.len() - 2;
+        let i0 = self.slider_cum.partition_point(|&c| c <= d0).saturating_sub(1).min(last);
+        // `d0 == d1` exactly on a vertex leaves `i1` one segment *before*
+        // `i0`: `cum[k]` belongs to segment k for `i0` (`c <= d0`), but the
+        // strict `c < d1` scan stops at k-1. Clamp so the capacity/loop below
+        // can never underflow.
+        let i1 = self
+            .slider_cum
+            .partition_point(|&c| c < d1)
+            .saturating_sub(1)
+            .min(last)
+            .max(i0);
 
-            let lerp_at = |d: f32| -> [f32; 2] {
-                let t = if len > 1e-6 { ((d - seg_start) / len).clamp(0.0, 1.0) } else { 0.0 };
-                [pts[i][0] + dx * t, pts[i][1] + dy * t]
+        let lerp_at = |i: usize, d: f32| -> [f32; 2] {
+            let seg_start = self.slider_cum[i];
+            let seg_end = self.slider_cum[i + 1];
+            let t = if seg_end > seg_start {
+                ((d - seg_start) / (seg_end - seg_start)).clamp(0.0, 1.0)
+            } else {
+                0.0
             };
+            let a = pts[i];
+            let b = pts[i + 1];
+            [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
+        };
 
-            if !started && seg_end >= d0 {
-                out.push(lerp_at(d0));
-                started = true;
+        let mut out: Vec<[f32; 2]> = Vec::with_capacity(i1 - i0 + 2);
+        out.push(lerp_at(i0, d0));
+        for i in i0..=i1 {
+            let seg_end = self.slider_cum[i + 1];
+            if seg_end < d1 {
+                out.push(pts[i + 1]);
             }
-            if started && seg_end <= d1 {
-                out.push([pts[i + 1][0], pts[i + 1][1]]);
-            } else if started {
-                out.push(lerp_at(d1));
-                break;
-            }
-            acc = seg_end;
         }
-        if out.len() == 1 {
-            out.push(out[0]);
-        }
+        out.push(lerp_at(i1, d1));
+
         // Drop consecutive duplicates: zero-length segments degenerate the
         // stroke strip (path_to_progress can emit the boundary vertex twice).
         let mut dedup: Vec<[f32; 2]> = Vec::with_capacity(out.len());
@@ -195,6 +201,217 @@ impl ObjView {
         }
         dedup.into_iter().map(|p| [self.position[0] + p[0], self.position[1] + p[1]]).collect()
     }
+
+    /// Slider body capsules for path progress `p0..p1` (absolute playfield
+    /// coords). Slices the body path cached at build time instead of walking
+    /// the exact path (`sub_path`) every frame: two binary searches plus a
+    /// handful of lerps, so degenerate paths cost nothing per frame.
+    pub fn body_segments(&self, p0: f64, p1: f64) -> Vec<([f32; 2], [f32; 2])> {
+        let (pts, cum, total) = self.body_path();
+        if pts.len() < 2 || total <= 1e-6 {
+            return Vec::new();
+        }
+
+        let (mut p0, mut p1) = (p0.clamp(0.0, 1.0), p1.clamp(0.0, 1.0));
+        if p0 > p1 {
+            std::mem::swap(&mut p0, &mut p1);
+        }
+
+        let d0 = p0 as f32 * total;
+        let d1 = p1 as f32 * total;
+
+        let last = pts.len() - 2;
+        let i0 = cum.partition_point(|&c| c <= d0).saturating_sub(1).min(last);
+        // Same vertex-boundary guard as `sub_path`.
+        let i1 = cum
+            .partition_point(|&c| c < d1)
+            .saturating_sub(1)
+            .min(last)
+            .max(i0);
+
+        let mut out = Vec::with_capacity(i1 - i0 + 1);
+        for i in i0..=i1 {
+            let seg_start = cum[i];
+            let seg_end = cum[i + 1];
+            if seg_end <= seg_start {
+                continue;
+            }
+            let a = lerp_segment(pts, cum, i, d0.max(seg_start));
+            let b = lerp_segment(pts, cum, i, d1.min(seg_end));
+            out.push((
+                [self.position[0] + a[0], self.position[1] + a[1]],
+                [self.position[0] + b[0], self.position[1] + b[1]],
+            ));
+        }
+
+        if out.is_empty() {
+            // Zero-length slice (snake just started): emit a point capsule so
+            // the body still shows a dot at the head.
+            let a = lerp_segment(pts, cum, i0, d0);
+            let p = [self.position[0] + a[0], self.position[1] + a[1]];
+            out.push((p, p));
+        }
+
+        out
+    }
+
+    /// Effective body path: the simplified one when it exists, otherwise the
+    /// exact slider path with its cached arc lengths.
+    fn body_path(&self) -> (&[[f32; 2]], &[f32], f32) {
+        if self.body_points.is_empty() {
+            (&self.slider_points, &self.slider_cum, self.slider_len)
+        } else {
+            (&self.body_points, &self.body_cum, self.body_len)
+        }
+    }
+}
+
+/// Linear interpolation on segment `i` of a cached polyline at arc length
+/// `distance`.
+fn lerp_segment(pts: &[[f32; 2]], cum: &[f32], i: usize, distance: f32) -> [f32; 2] {
+    let seg_start = cum[i];
+    let seg_end = cum[i + 1];
+    let t = if seg_end > seg_start {
+        ((distance - seg_start) / (seg_end - seg_start)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let a = pts[i];
+    let b = pts[i + 1];
+    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
+}
+
+/// Upper bound for the cached body path. Normal sliders are far below this;
+/// only pathological (Aspire) paths exceed it.
+const MAX_BODY_POINTS: usize = 4096;
+
+fn dist2(a: [f32; 2], b: [f32; 2]) -> f32 {
+    let dx = b[0] - a[0];
+    let dy = b[1] - a[1];
+    dx * dx + dy * dy
+}
+
+/// Builds the cached body path: drop consecutive duplicates, then simplify
+/// paths that are either huge or "scribbles" (walk a tiny box thousands of
+/// times - the classic Aspire pattern). The simplification tolerance is
+/// derived from the path's own bounding box so a 2 px zig-zag collapses to
+/// the few points that actually define its shape.
+fn build_body_path(points: &[[f32; 2]]) -> (Vec<[f32; 2]>, Vec<f32>) {
+    let mut pts: Vec<[f32; 2]> = Vec::with_capacity(points.len());
+    for &p in points {
+        if let Some(l) = pts.last() {
+            if dist2(*l, p) < 1e-6 {
+                continue;
+            }
+        }
+        pts.push(p);
+    }
+
+    let mut simplified: Vec<[f32; 2]> = Vec::new();
+
+    if pts.len() >= 8 {
+        let mut min = [f32::MAX, f32::MAX];
+        let mut max = [f32::MIN, f32::MIN];
+        let mut total = 0.0f32;
+        for (i, p) in pts.iter().enumerate() {
+            min[0] = min[0].min(p[0]);
+            min[1] = min[1].min(p[1]);
+            max[0] = max[0].max(p[0]);
+            max[1] = max[1].max(p[1]);
+            if i > 0 {
+                total += dist2(pts[i - 1], *p).sqrt();
+            }
+        }
+        let extent = (max[0] - min[0]).max(max[1] - min[1]);
+        // "Scribble": the path walks a tiny box thousands of times (the
+        // classic Aspire pattern), so its length dwarfs its bounding box. A
+        // tolerance relative to that extent keeps the blob's silhouette (for
+        // XNOR's 2 px zig-zag: three points) while staying far below the
+        // 64 px body radius for anything legitimate.
+        let scribble = total > 16.0 * extent.max(1.0);
+        if scribble || pts.len() > MAX_BODY_POINTS {
+            let eps = if scribble { (extent * 0.4).clamp(0.4, 2.0) } else { 0.25 };
+            let candidate = simplify_rdp(&pts, eps);
+            if candidate.len() < pts.len() {
+                simplified = candidate;
+            }
+        }
+    }
+
+    if simplified.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let cum = cumulative(&simplified);
+    (simplified, cum)
+}
+
+/// Prefix sums of segment lengths (`cum[0] == 0`, `cum[i]` is the arc length
+/// up to point `i`).
+fn cumulative(points: &[[f32; 2]]) -> Vec<f32> {
+    let mut cum = Vec::with_capacity(points.len());
+    let mut len = 0.0f32;
+    if !points.is_empty() {
+        cum.push(0.0);
+    }
+    for i in 1..points.len() {
+        len += dist2(points[i - 1], points[i]).sqrt();
+        cum.push(len);
+    }
+    cum
+}
+
+/// Iterative Ramer-Douglas-Peucker (a 27k-point path would blow a recursive
+/// implementation's stack).
+fn simplify_rdp(points: &[[f32; 2]], eps: f32) -> Vec<[f32; 2]> {
+    if points.len() < 3 {
+        return points.to_vec();
+    }
+
+    let mut keep = vec![false; points.len()];
+    keep[0] = true;
+    keep[points.len() - 1] = true;
+
+    let mut stack = vec![(0usize, points.len() - 1)];
+    let eps2 = eps * eps;
+
+    while let Some((first, last)) = stack.pop() {
+        if last <= first + 1 {
+            continue;
+        }
+        let a = points[first];
+        let b = points[last];
+        let ab = dist2(a, b);
+
+        let mut best = -1.0f32;
+        let mut best_index = first;
+        for (i, p) in points.iter().enumerate().take(last).skip(first + 1) {
+            let d2 = if ab <= 1e-12 {
+                dist2(a, *p)
+            } else {
+                let t = (((p[0] - a[0]) * (b[0] - a[0]) + (p[1] - a[1]) * (b[1] - a[1])) / ab)
+                    .clamp(0.0, 1.0);
+                let q = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+                dist2(q, *p)
+            };
+            if d2 > best {
+                best = d2;
+                best_index = i;
+            }
+        }
+
+        if best > eps2 {
+            keep[best_index] = true;
+            stack.push((first, best_index));
+            stack.push((best_index, last));
+        }
+    }
+
+    points
+        .iter()
+        .zip(keep)
+        .filter_map(|(p, k)| k.then_some(*p))
+        .collect()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -614,6 +831,15 @@ pub fn build(
             }
         };
 
+        let slider_cum = cumulative(&slider_points);
+        let slider_len = slider_cum.last().copied().unwrap_or(0.0);
+        let (body_points, body_cum) = build_body_path(&slider_points);
+        let body_len = if body_points.is_empty() {
+            slider_len
+        } else {
+            body_cum.last().copied().unwrap_or(0.0)
+        };
+
         let mut nested: Vec<NestedView> = Vec::new();
         if let Some(nl) = nested_raw {
             for n in nl {
@@ -664,6 +890,11 @@ pub fn build(
             number: obj.index_in_current_combo + 1,
             combo_colour_index: obj.combo_index_with_offsets as u32,
             slider_points,
+            slider_cum,
+            slider_len,
+            body_points,
+            body_cum,
+            body_len,
             slider_distance: match &obj.kind {
                 ProcKind::Slider { path, .. } => path.distance(),
                 _ => 0.0,
@@ -1225,5 +1456,245 @@ SliderTickRate:1
         );
         assert_eq!(game.objects[0].colour, expected);
         assert_ne!(game.objects[0].colour, beatmap_colour);
+    }
+
+    #[test]
+    fn scribble_body_path_collapses_to_its_silhouette() {
+        // 3000 points oscillating inside 2 px - the XNOR intro slider shape.
+        // The body must keep the 2 px silhouette (3 points: 430, 428, 430)
+        // instead of tessellating thousands of overlapping capsules.
+        let mut pts = Vec::new();
+        for i in 0..=3000 {
+            pts.push([0.0, if i % 2 == 0 { 430.0 } else { 428.0 }]);
+        }
+
+        let (body, cum) = build_body_path(&pts);
+        let len = cum.last().copied().unwrap_or(0.0);
+
+        assert!(body.len() <= 4, "body points = {}", body.len());
+        assert_eq!(body.len(), cum.len());
+        assert!((len - 4.0).abs() < 0.01, "len = {len}");
+        let (mut min_y, mut max_y) = (f32::MAX, f32::MIN);
+        for p in &body {
+            min_y = min_y.min(p[1]);
+            max_y = max_y.max(p[1]);
+        }
+        assert!((max_y - min_y - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn long_normal_body_path_keeps_subpixel_shape() {
+        // A 20k-point sine must simplify, keep both endpoints and stay within
+        // 0.3 px of the original polyline.
+        let pts: Vec<[f32; 2]> = (0..20_000)
+            .map(|i| {
+                let x = i as f32 * 0.01;
+                [x, (x * 0.05).sin() * 40.0]
+            })
+            .collect();
+
+        let (body, cum) = build_body_path(&pts);
+
+        assert!(body.len() < pts.len(), "not simplified: {}", body.len());
+        assert!(body.len() > 2);
+        assert_eq!(body.len(), cum.len());
+        assert_eq!(body[0], pts[0]);
+        assert_eq!(*body.last().unwrap(), *pts.last().unwrap());
+
+        let mut worst = 0.0f32;
+        let mut j = 0usize;
+        for p in &pts {
+            while j + 2 < body.len() && body[j + 1][0] < p[0] {
+                j += 1;
+            }
+            let a = body[j];
+            let b = body[j + 1];
+            let ab = [b[0] - a[0], b[1] - a[1]];
+            let len2 = ab[0] * ab[0] + ab[1] * ab[1];
+            let t = if len2 > 1e-9 {
+                (((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / len2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let q = [a[0] + ab[0] * t, a[1] + ab[1] * t];
+            worst = worst.max(dist2(q, *p).sqrt());
+        }
+        assert!(worst < 0.3, "worst deviation = {worst}");
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    fn slider_view(points: Vec<[f32; 2]>) -> ObjView {
+        let slider_cum = cumulative(&points);
+        let slider_len = slider_cum.last().copied().unwrap_or(0.0);
+        let (body_points, body_cum) = build_body_path(&points);
+        let body_len = if body_points.is_empty() {
+            slider_len
+        } else {
+            body_cum.last().copied().unwrap_or(0.0)
+        };
+        ObjView {
+            index: 0,
+            kind: ObjKind::Slider,
+            start_time: 0.0,
+            end_time: 1000.0,
+            position: [0.0, 0.0],
+            end_position: [0.0, 0.0],
+            radius: 36.0,
+            scale: 1.0,
+            preempt: 450.0,
+            fade_in: 400.0,
+            new_combo: true,
+            colour: Colour::WHITE,
+            combo_colour_index: 0,
+            number: 1,
+            slider_points: points,
+            slider_cum,
+            slider_len,
+            body_points,
+            body_cum,
+            body_len,
+            slider_distance: slider_len as f64,
+            span_count: 1,
+            duration: 1000.0,
+            nested: Vec::new(),
+            spins_required: 0.0,
+            maximum_bonus_spins: 0,
+            head_judged: None,
+            body_judged: None,
+            shake_times: Vec::new(),
+        }
+    }
+
+    /// Straight linear walk over the polyline: the reference the cached
+    /// prefix-sum + binary-search implementation must match.
+    fn linear_reference(points: &[[f32; 2]], progress: f32) -> [f32; 2] {
+        let mut lengths = Vec::with_capacity(points.len().saturating_sub(1));
+        let mut total = 0.0f32;
+        for w in points.windows(2) {
+            let l = dist2(w[0], w[1]).sqrt();
+            lengths.push(l);
+            total += l;
+        }
+        let target = progress.clamp(0.0, 1.0) * total;
+        let mut acc = 0.0f32;
+        for (i, l) in lengths.iter().enumerate() {
+            if acc + l >= target {
+                let t = if *l > 1e-6 { (target - acc) / l } else { 0.0 };
+                return [
+                    points[i][0] + (points[i + 1][0] - points[i][0]) * t,
+                    points[i][1] + (points[i + 1][1] - points[i][1]) * t,
+                ];
+            }
+            acc += l;
+        }
+        *points.last().unwrap()
+    }
+
+    fn wavy_path(n: usize) -> Vec<[f32; 2]> {
+        (0..n)
+            .map(|i| {
+                let x = i as f32 * 2.0;
+                [x, (x * 0.05).sin() * 40.0 + (x * 0.013).cos() * 15.0]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn position_at_path_matches_linear_reference() {
+        let points = wavy_path(400);
+        let view = slider_view(points.clone());
+
+        for k in 0..=400 {
+            let progress = k as f32 / 400.0;
+            let got = view.position_at_path(progress as f64);
+            let want = linear_reference(&points, progress);
+            assert!(
+                (got[0] - want[0]).abs() < 1e-2 && (got[1] - want[1]).abs() < 1e-2,
+                "p={progress}: got {got:?} want {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sub_path_hits_both_ends_and_clips() {
+        let points = wavy_path(200);
+        let view = slider_view(points.clone());
+
+        let full = view.sub_path(0.0, 1.0);
+        assert!(full.len() >= 2);
+        let first = full[0];
+        let last = *full.last().unwrap();
+        assert!((first[0] - points[0][0]).abs() < 1e-2 && (first[1] - points[0][1]).abs() < 1e-2);
+        assert!(
+            (last[0] - points.last().unwrap()[0]).abs() < 1e-2
+                && (last[1] - points.last().unwrap()[1]).abs() < 1e-2
+        );
+
+        // A narrow slice stays inside the full path's bounding range.
+        let mid = view.sub_path(0.4, 0.6);
+        assert!(mid.len() >= 2);
+        let d0 = view.position_at_path(0.4);
+        let d1 = view.position_at_path(0.6);
+        assert!((mid[0][0] - d0[0]).abs() < 1e-2 && (mid[0][1] - d0[1]).abs() < 1e-2);
+        let m_last = *mid.last().unwrap();
+        assert!((m_last[0] - d1[0]).abs() < 1e-2 && (m_last[1] - d1[1]).abs() < 1e-2);
+
+        // Reversed range swaps instead of returning empty.
+        let rev = view.sub_path(0.6, 0.4);
+        assert_eq!(rev.len(), mid.len());
+    }
+
+    #[test]
+    fn zero_length_sub_path_on_a_vertex_does_not_underflow() {
+        // cum = [0, 100, 200]: p = 0.5 lands exactly on the middle vertex, so
+        // the `c <= d0` and `c < d1` scans disagree by one segment.
+        let view = slider_view(vec![[0.0, 0.0], [100.0, 0.0], [100.0, 100.0]]);
+
+        let p = view.sub_path(0.5, 0.5);
+        assert_eq!(p.len(), 2);
+        assert!((p[0][0] - 100.0).abs() < 1e-3 && (p[0][1] - 0.0).abs() < 1e-3);
+
+        let caps = view.body_segments(0.5, 0.5);
+        assert_eq!(caps.len(), 1);
+        assert!((caps[0].0[0] - 100.0).abs() < 1e-3);
+
+        // Degenerate ends (snake start / full body) stay safe too.
+        assert!(!view.sub_path(0.0, 0.0).is_empty());
+        assert!(!view.sub_path(1.0, 1.0).is_empty());
+        assert!(!view.body_segments(0.0, 0.0).is_empty());
+        assert!(!view.body_segments(1.0, 1.0).is_empty());
+    }
+
+    #[test]
+    fn body_segments_cover_the_full_path() {
+        let points = wavy_path(64);
+        let view = slider_view(points.clone());
+
+        let capsules = view.body_segments(0.0, 1.0);
+        assert_eq!(capsules.len(), points.len() - 1);
+        assert!((capsules[0].0[0] - points[0][0]).abs() < 1e-2);
+        let tail = capsules.last().unwrap().1;
+        assert!((tail[0] - points.last().unwrap()[0]).abs() < 1e-2);
+
+        // Snaking slice: every capsule stays inside [i0, i1].
+        let partial = view.body_segments(0.25, 0.75);
+        assert!(partial.len() < capsules.len());
+        assert!(!partial.is_empty());
+    }
+
+    #[test]
+    fn scribble_body_segments_are_few() {
+        let mut points = Vec::new();
+        for i in 0..=5000 {
+            points.push([0.0, if i % 2 == 0 { 430.0 } else { 428.0 }]);
+        }
+        let view = slider_view(points);
+
+        let capsules = view.body_segments(0.0, 1.0);
+        assert!(capsules.len() <= 4, "capsules = {}", capsules.len());
     }
 }

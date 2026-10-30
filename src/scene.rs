@@ -1696,9 +1696,20 @@ impl SceneState {
             Some(_) => 64.0, // OsuHitObject.OBJECT_RADIUS
             None => OUTER_GRADIENT_SIZE / 2.0,
         } * obj.scale;
-        let sub = obj.sub_path(p0, p1);
-        if sub.len() >= 2 {
-            let screen_pts: Vec<[f32; 2]> = sub.iter().map(|&p| m.pf([p[0] + body_dx, p[1]])).collect();
+        // Cached body path (built once in `GameData`): no per-frame
+        // `sub_path` walk, no re-tessellation of the exact path. The slice is
+        // two binary searches over the cached arc lengths.
+        let body_capsules = obj.body_segments(p0, p1);
+        if !body_capsules.is_empty() {
+            let screen_segments: Vec<([f32; 2], [f32; 2])> = body_capsules
+                .iter()
+                .map(|(a, b)| {
+                    (
+                        m.pf([a[0] + body_dx, a[1]]),
+                        m.pf([b[0] + body_dx, b[1]]),
+                    )
+                })
+                .collect();
             // ArgonSliderBody: the whole path fades with the slider; the
             // BORDER colour is the plain accent while only the body accent
             // gets BodyAlpha (0.92 pro / 0.98 normal, applied to
@@ -1756,12 +1767,8 @@ impl SceneState {
                     )
                 }
             };
-            let mut segments = Vec::with_capacity(screen_pts.len() - 1);
-            for i in 0..screen_pts.len() - 1 {
-                segments.push((screen_pts[i], screen_pts[i + 1]));
-            }
             list.bodies.push(crate::draw::BodyDraw {
-                segments,
+                segments: screen_segments,
                 radius: cap_r,
                 border: cap_border,
                 body: body_col,
@@ -3493,6 +3500,11 @@ mod tests {
             combo_colour_index: 0,
             number: 1,
             slider_points: vec![[0.0, 0.0], [100.0, 0.0], [100.0, 100.0]],
+            slider_cum: vec![0.0, 100.0, 200.0],
+            slider_len: 200.0,
+            body_points: Vec::new(),
+            body_cum: Vec::new(),
+            body_len: 200.0,
             slider_distance: 200.0,
             span_count: spans,
             duration: spans as f64 * 250.0,
