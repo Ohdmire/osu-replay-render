@@ -282,8 +282,15 @@ fn lerp_segment(pts: &[[f32; 2]], cum: &[f32], i: usize, distance: f32) -> [f32;
 }
 
 /// Upper bound for the cached body path. Normal sliders are far below this;
-/// only pathological (Aspire) paths exceed it.
+/// only pathological (Aspire) paths exceed it. It also bounds the per-frame
+/// capsule count and the RDP work, so loading can never degrade into a
+/// quadratic simplification.
 const MAX_BODY_POINTS: usize = 4096;
+/// Paths that stay inside this box while walking many times their extent are
+/// "scribbles" (the classic Aspire pattern). At screen resolution their shape
+/// carries no information, so a handful of chords is enough.
+const SCRIBBLE_EXTENT: f32 = 8.0;
+const SCRIBBLE_POINTS: usize = 96;
 
 fn dist2(a: [f32; 2], b: [f32; 2]) -> f32 {
     let dx = b[0] - a[0];
@@ -292,10 +299,16 @@ fn dist2(a: [f32; 2], b: [f32; 2]) -> f32 {
 }
 
 /// Builds the cached body path: drop consecutive duplicates, then simplify
-/// paths that are either huge or "scribbles" (walk a tiny box thousands of
-/// times - the classic Aspire pattern). The simplification tolerance is
-/// derived from the path's own bounding box so a 2 px zig-zag collapses to
-/// the few points that actually define its shape.
+/// paths that are either huge or "scribbles".
+///
+/// `body_cum` keeps the **exact** arc length of every kept vertex (measured
+/// on the unsimplified path). Simplifying shortens the polyline, and mapping
+/// snake progress by the shortened length made the body trail/lead the ball
+/// on complex sliders, so the body's distance axis stays the exact one.
+///
+/// The RDP input is capped by a uniform arc-length pre-pass: without it a
+/// 160k-point path made `simplify_rdp` quadratic (Flashbacklog's 1:07 slider
+/// hung the loader for minutes).
 fn build_body_path(points: &[[f32; 2]]) -> (Vec<[f32; 2]>, Vec<f32>) {
     let mut pts: Vec<[f32; 2]> = Vec::with_capacity(points.len());
     for &p in points {
@@ -306,44 +319,71 @@ fn build_body_path(points: &[[f32; 2]]) -> (Vec<[f32; 2]>, Vec<f32>) {
         }
         pts.push(p);
     }
-
-    let mut simplified: Vec<[f32; 2]> = Vec::new();
-
-    if pts.len() >= 8 {
-        let mut min = [f32::MAX, f32::MAX];
-        let mut max = [f32::MIN, f32::MIN];
-        let mut total = 0.0f32;
-        for (i, p) in pts.iter().enumerate() {
-            min[0] = min[0].min(p[0]);
-            min[1] = min[1].min(p[1]);
-            max[0] = max[0].max(p[0]);
-            max[1] = max[1].max(p[1]);
-            if i > 0 {
-                total += dist2(pts[i - 1], *p).sqrt();
-            }
-        }
-        let extent = (max[0] - min[0]).max(max[1] - min[1]);
-        // "Scribble": the path walks a tiny box thousands of times (the
-        // classic Aspire pattern), so its length dwarfs its bounding box. A
-        // tolerance relative to that extent keeps the blob's silhouette (for
-        // XNOR's 2 px zig-zag: three points) while staying far below the
-        // 64 px body radius for anything legitimate.
-        let scribble = total > 16.0 * extent.max(1.0);
-        if scribble || pts.len() > MAX_BODY_POINTS {
-            let eps = if scribble { (extent * 0.4).clamp(0.4, 2.0) } else { 0.25 };
-            let candidate = simplify_rdp(&pts, eps);
-            if candidate.len() < pts.len() {
-                simplified = candidate;
-            }
-        }
-    }
-
-    if simplified.is_empty() {
+    if pts.len() < 8 {
         return (Vec::new(), Vec::new());
     }
 
-    let cum = cumulative(&simplified);
-    (simplified, cum)
+    let cum = cumulative(&pts);
+    let total = *cum.last().unwrap();
+
+    // Bounding box plus the indices of its extreme points: a scribble's
+    // silhouette is defined by those, and the uniform pre-pass alone can skip
+    // them (e.g. every sample landing on the "high" leg of a 2 px zig-zag).
+    let (mut min, mut max) = ([f32::MAX; 2], [f32::MIN; 2]);
+    let mut ext = [0usize; 4];
+    for (i, p) in pts.iter().enumerate() {
+        if p[0] < min[0] {
+            min[0] = p[0];
+            ext[0] = i;
+        }
+        if p[0] > max[0] {
+            max[0] = p[0];
+            ext[1] = i;
+        }
+        if p[1] < min[1] {
+            min[1] = p[1];
+            ext[2] = i;
+        }
+        if p[1] > max[1] {
+            max[1] = p[1];
+            ext[3] = i;
+        }
+    }
+    let extent = (max[0] - min[0]).max(max[1] - min[1]);
+
+    let scribble = extent <= SCRIBBLE_EXTENT && total > 16.0 * extent.max(1.0);
+    if !scribble && pts.len() <= MAX_BODY_POINTS {
+        return (Vec::new(), Vec::new());
+    }
+
+    let limit = if scribble { SCRIBBLE_POINTS } else { MAX_BODY_POINTS };
+    let mut sub: Vec<usize> = if pts.len() > limit {
+        uniform_indices(&cum, limit)
+    } else {
+        (0..pts.len()).collect()
+    };
+    if scribble {
+        sub.extend_from_slice(&ext);
+        sub.sort_unstable();
+        sub.dedup();
+    }
+    let sub_pts: Vec<[f32; 2]> = sub.iter().map(|&i| pts[i]).collect();
+
+    let eps = if scribble { (extent * 0.4).clamp(0.4, 2.0) } else { 0.25 };
+    let kept = simplify_rdp_indices(&sub_pts, eps);
+
+    let idx: Vec<usize> = if kept.len() < sub.len() {
+        kept.iter().map(|&j| sub[j]).collect()
+    } else {
+        sub
+    };
+    if idx.len() >= pts.len() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let body_points = idx.iter().map(|&i| pts[i]).collect();
+    let body_cum = idx.iter().map(|&i| cum[i]).collect();
+    (body_points, body_cum)
 }
 
 /// Prefix sums of segment lengths (`cum[0] == 0`, `cum[i]` is the arc length
@@ -361,11 +401,33 @@ fn cumulative(points: &[[f32; 2]]) -> Vec<f32> {
     cum
 }
 
-/// Iterative Ramer-Douglas-Peucker (a 27k-point path would blow a recursive
-/// implementation's stack).
-fn simplify_rdp(points: &[[f32; 2]], eps: f32) -> Vec<[f32; 2]> {
+/// Evenly spaced (by arc length) vertex indices, endpoints included. Caps the
+/// RDP input so its worst case stays linear-ish instead of quadratic.
+fn uniform_indices(cum: &[f32], limit: usize) -> Vec<usize> {
+    let n = cum.len();
+    if n <= 2 || limit < 3 {
+        return vec![0, n.saturating_sub(1)];
+    }
+    let total = cum[n - 1];
+    let step = (total / (limit - 1) as f32).max(1e-6);
+    let mut out = Vec::with_capacity(limit);
+    out.push(0);
+    let mut next = step;
+    for i in 1..n - 1 {
+        if cum[i] >= next {
+            out.push(i);
+            next = cum[i] + step;
+        }
+    }
+    out.push(n - 1);
+    out
+}
+
+/// Iterative Ramer-Douglas-Peucker (a recursive implementation would blow the
+/// stack on long paths). Returns the indices of the kept vertices.
+fn simplify_rdp_indices(points: &[[f32; 2]], eps: f32) -> Vec<usize> {
     if points.len() < 3 {
-        return points.to_vec();
+        return (0..points.len()).collect();
     }
 
     let mut keep = vec![false; points.len()];
@@ -407,11 +469,7 @@ fn simplify_rdp(points: &[[f32; 2]], eps: f32) -> Vec<[f32; 2]> {
         }
     }
 
-    points
-        .iter()
-        .zip(keep)
-        .filter_map(|(p, k)| k.then_some(*p))
-        .collect()
+    (0..points.len()).filter(|&i| keep[i]).collect()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1473,7 +1531,12 @@ SliderTickRate:1
 
         assert!(body.len() <= 4, "body points = {}", body.len());
         assert_eq!(body.len(), cum.len());
-        assert!((len - 4.0).abs() < 0.01, "len = {len}");
+        // `cum` holds the *exact* arc length (2 px * 3000 legs) so the body's
+        // snake maps onto the same distance axis as the ball; the simplified
+        // silhouette itself is only 4 px long, checked through the points.
+        assert!((len - 6000.0).abs() < 1.0, "exact len = {len}");
+        assert_eq!(cum[0], 0.0);
+        assert!(cum.windows(2).all(|w| w[1] >= w[0]));
         let (mut min_y, mut max_y) = (f32::MAX, f32::MIN);
         for p in &body {
             min_y = min_y.min(p[1]);
@@ -1684,6 +1747,32 @@ mod path_tests {
         let partial = view.body_segments(0.25, 0.75);
         assert!(partial.len() < capsules.len());
         assert!(!partial.is_empty());
+    }
+
+    #[test]
+    fn body_tip_follows_the_ball_on_a_simplified_path() {
+        // Simplification shortens the polyline; mapping snake progress over
+        // the shortened length put the body behind the ball (the Flashbacklog
+        // 1:07 lag). The body must stay on the ball's exact-distance axis.
+        let points: Vec<[f32; 2]> = (0..20_000)
+            .map(|i| {
+                let x = i as f32 * 0.01;
+                [x, (x * 0.05).sin() * 40.0]
+            })
+            .collect();
+        let view = slider_view(points.clone());
+        assert!(!view.body_points.is_empty(), "test premise: path must be simplified");
+
+        let mut worst = 0.0f32;
+        for k in 0..=200 {
+            let p = k as f32 / 200.0;
+            let ball = view.position_at_path(p as f64);
+            let caps = view.body_segments(p as f64, p as f64);
+            assert!(!caps.is_empty());
+            let tip = caps[0].0;
+            worst = worst.max((tip[0] - ball[0]).abs().max((tip[1] - ball[1]).abs()));
+        }
+        assert!(worst < 0.5, "body tip vs ball = {worst}");
     }
 
     #[test]
