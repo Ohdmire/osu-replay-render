@@ -801,6 +801,14 @@ impl Renderer {
         &self.atlas_view
     }
 
+    /// 当前场景渲染目标纹理。
+    ///
+    /// 给宿主做 dmabuf 零拷贝输出用:之前只能 `target_view()` 拿到 view,
+    /// 拿不到底层纹理句柄,外部分配/导出无从下手。
+    pub fn target_texture(&self) -> &wgpu::Texture {
+        &self.target
+    }
+
     pub fn target_view(&self) -> wgpu::TextureView {
         self.target.create_view(&Default::default())
     }
