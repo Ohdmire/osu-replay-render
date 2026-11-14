@@ -64,6 +64,10 @@ const TRAIL_FADE_EXPONENT: f32 = 4.0;
 const SPINNER_DISC: f32 = 384.0; // playfield units
 const FOLLOW_POINT_SPACING: f32 = 32.0;
 const FOLLOW_POINT_PREEMPT: f64 = 800.0;
+/// `FollowPointConnection`: fade-in, fade-out, move and scale all run a
+/// fixed 400ms (`const float duration = 400`), NOT the hit object's
+/// `TimeFadeIn` (the comment there says so explicitly).
+const FOLLOW_POINT_FADE: f64 = 400.0;
 
 // ---------------------------------------------------------------------------
 // Hidden mod (`OsuModHidden`). HD changes no judgement; it only rewrites the
@@ -3866,14 +3870,14 @@ fn draw_follow_points(
             let fade_out = start_time + fraction as f64 * duration;
             let fade_in = fade_out - preempt;
 
-            if t >= fade_in && t <= fade_out + end.fade_in {
-                let alpha = value_at(t, fade_in, fade_in + end.fade_in, 0.0, 1.0, Easing::Linear)
-                    * value_at(t, fade_out, fade_out + end.fade_in, 1.0, 0.0, Easing::Linear);
+            if t >= fade_in && t <= fade_out + FOLLOW_POINT_FADE {
+                let alpha = value_at(t, fade_in, fade_in + FOLLOW_POINT_FADE, 0.0, 1.0, Easing::Linear)
+                    * value_at(t, fade_out, fade_out + FOLLOW_POINT_FADE, 1.0, 0.0, Easing::Linear);
                 if alpha > 0.003 {
-                    let move_t = value_at(t, fade_in, fade_in + end.fade_in, 0.0, 1.0, Easing::Out);
+                    let move_t = value_at(t, fade_in, fade_in + FOLLOW_POINT_FADE, 0.0, 1.0, Easing::Out);
                     let f = fraction as f64 - 0.1 + 0.1 * move_t;
                     let pos = [start_pos[0] + dv[0] * f as f32, start_pos[1] + dv[1] * f as f32];
-                    let scale = value_at(t, fade_in, fade_in + end.fade_in, 1.5, 1.0, Easing::Out);
+                    let scale = value_at(t, fade_in, fade_in + FOLLOW_POINT_FADE, 1.5, 1.0, Easing::Out);
                     let sp = m.pf(pos);
 
                     // Legacy: the skin's `followpoint` animation, phased
@@ -3903,11 +3907,17 @@ fn draw_follow_points(
                     let bottom = Colour::from_hex(0xBB1A41).opacity(alpha as f32);
                     let shadow_top = top.darken(4.0);
                     let shadow_bottom = bottom.darken(4.0);
+                    // `ArgonFollowPoint` is 12 wide (two 8-wide icons, the
+                    // second at X=4) and `SkinnableDrawable` centres it, so
+                    // the chevron centres sit at -2/+2 from the follow
+                    // point, not 0/+4. `size` is the 8-unit icon in screen
+                    // px, so 2 units = `size * 0.25`.
                     let (sr, cr) = rotation.to_radians().sin_cos();
-                    let off = size * 0.5;
+                    let off = size * 0.25;
+                    let p1 = [sp[0] - cr * off, sp[1] - sr * off];
                     let p2 = [sp[0] + cr * off, sp[1] + sr * off];
                     // Dim pink back chevron + bright front chevron.
-                    draw_chevron(list, sp, rotation, size, thickness, shadow_top, shadow_bottom, Blend::Additive);
+                    draw_chevron(list, p1, rotation, size, thickness, shadow_top, shadow_bottom, Blend::Additive);
                     draw_chevron(list, p2, rotation, size, thickness, top, bottom, Blend::Additive);
                 }
             }
